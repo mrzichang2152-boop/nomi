@@ -1,0 +1,115 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Nomi Personal Assistant</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <section id="loginPanel" class="login-panel">
+        <form id="loginForm" class="login-box">
+          <h1>Nomi</h1>
+          <input id="passwordInput" type="password" autocomplete="current-password" autofocus placeholder="访问密码" />
+          <button type="submit">进入</button>
+          <p id="loginError" class="error"></p>
+        </form>
+      </section>
+
+      <section id="appPanel" class="app-panel hidden">
+        <aside class="sidebar">
+          <div>
+            <h1>Nomi</h1>
+            <p>私有个人助理</p>
+          </div>
+          <nav class="nav-actions" aria-label="工作台导航">
+            <button class="nav-button active" data-view="chatView" type="button">对话</button>
+            <button class="nav-button" data-view="searchView" type="button">搜索</button>
+            <button class="nav-button" data-view="governanceView" type="button">治理</button>
+            <button class="nav-button" data-view="suggestionsView" type="button">建议</button>
+            <button class="nav-button" data-view="collectorsView" type="button">采集</button>
+            <button class="nav-button" data-view="toolsView" type="button">工具</button>
+          </nav>
+        </aside>
+
+        <section class="workspace">
+          <section id="chatView" class="view active">
+            <div id="messages" class="messages"></div>
+            <form id="chatForm" class="composer">
+              <textarea id="messageInput" rows="2" placeholder="发消息给你的个人助理"></textarea>
+              <button type="submit">发送</button>
+            </form>
+          </section>
+
+          <section id="searchView" class="view">
+            <header class="view-header">
+              <h2>个人搜索</h2>
+            </header>
+            <form id="searchForm" class="toolbar">
+              <input id="searchInput" type="search" placeholder="搜索长期记忆、事件、关系" />
+              <button type="submit">搜索</button>
+            </form>
+            <div id="searchContent" class="content-list"></div>
+          </section>
+
+          <section id="governanceView" class="view">
+            <header class="view-header">
+              <h2>记忆治理</h2>
+              <button id="refreshGovernance" type="button">刷新</button>
+            </header>
+            <form id="governanceFilters" class="toolbar">
+              <input id="governanceQuery" type="search" placeholder="筛选关键词" />
+              <select id="governanceSource">
+                <option value="">全部来源</option>
+                <option value="gmail">Gmail</option>
+                <option value="whatsapp">WhatsApp</option>
+                <option value="telegram">Telegram</option>
+                <option value="calendar">Calendar</option>
+                <option value="search">Search</option>
+                <option value="bookmark">Bookmark</option>
+              </select>
+              <select id="governanceSensitive">
+                <option value="">全部敏感状态</option>
+                <option value="true">仅敏感</option>
+                <option value="false">非敏感</option>
+              </select>
+              <button type="submit">应用</button>
+            </form>
+            <div id="governanceContent" class="content-list"></div>
+          </section>
+
+          <section id="suggestionsView" class="view">
+            <header class="view-header">
+              <h2>主动建议</h2>
+              <button id="refreshSuggestions" type="button">刷新</button>
+            </header>
+            <div id="suggestionsContent" class="content-list"></div>
+          </section>
+
+          <section id="collectorsView" class="view">
+            <header class="view-header">
+              <h2>采集状态</h2>
+              <button id="refreshCollectors" type="button">刷新</button>
+            </header>
+            <div id="collectorsContent" class="content-list"></div>
+          </section>
+
+          <section id="toolsView" class="view">
+            <header class="view-header">
+              <h2>工具目录</h2>
+              <button id="refreshTools" type="button">刷新</button>
+            </header>
+            <form id="toolRouteForm" class="toolbar">
+              <input id="toolRouteInput" type="search" placeholder="输入一个任务，看看 Nomi 会走哪个 Pipeline 或工具" />
+              <button type="submit">路由</button>
+            </form>
+            <div id="toolRouteResult" class="content-list route-result"></div>
+            <div id="toolsContent" class="content-list"></div>
+          </section>
+        </section>
+      </section>
+    </main>
+    <script src="/static/app.js"></script>
+  </body>
+</html>

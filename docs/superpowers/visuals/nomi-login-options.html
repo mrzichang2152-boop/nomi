@@ -1,0 +1,337 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Nomi 登录入口方案</title>
+    <style>
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        background: #f4f7f6;
+        color: #14213d;
+      }
+      .page {
+        width: 1180px;
+        max-width: 100%;
+        margin: 0 auto;
+        padding: 28px;
+      }
+      h1 {
+        margin: 0 0 8px;
+        font-size: 28px;
+        letter-spacing: 0;
+      }
+      .intro {
+        margin: 0 0 24px;
+        color: #64748b;
+        line-height: 1.6;
+      }
+      .grid {
+        display: grid;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        gap: 18px;
+      }
+      .option {
+        background: #ffffff;
+        border: 1px solid #d8e4e0;
+        border-radius: 8px;
+        overflow: hidden;
+        box-shadow: 0 12px 28px rgba(15, 23, 42, 0.08);
+      }
+      .option header {
+        padding: 16px 18px;
+        min-height: 92px;
+        background: #10202f;
+        color: #fff;
+      }
+      .option h2 {
+        margin: 0 0 8px;
+        font-size: 18px;
+        letter-spacing: 0;
+      }
+      .option header p {
+        margin: 0;
+        color: #c9d7df;
+        line-height: 1.5;
+        font-size: 13px;
+      }
+      .phone {
+        position: relative;
+        width: 100%;
+        aspect-ratio: 9 / 16;
+        background: #eef3f2;
+        border-top: 1px solid #d8e4e0;
+        overflow: hidden;
+      }
+      .status {
+        height: 32px;
+        background: rgba(9, 18, 33, 0.72);
+        color: #d6dee6;
+        font-size: 12px;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        padding: 0 16px;
+      }
+      .panel {
+        position: absolute;
+        left: 18px;
+        right: 18px;
+        top: 82px;
+        background: #fff;
+        border: 1px solid #d7e1df;
+        border-radius: 8px;
+        padding: 16px;
+      }
+      .panel-title {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        margin-bottom: 12px;
+        font-weight: 700;
+      }
+      .close {
+        width: 28px;
+        height: 28px;
+        border-radius: 99px;
+        display: grid;
+        place-items: center;
+        background: #e7efec;
+        color: #10202f;
+      }
+      .nomi {
+        position: absolute;
+        left: 18px;
+        top: 300px;
+        width: 64px;
+        height: 64px;
+        border-radius: 50%;
+        background: #0f766e;
+        box-shadow: 0 10px 18px rgba(15, 118, 110, 0.24);
+      }
+      .nomi::before {
+        content: "";
+        position: absolute;
+        left: 18px;
+        top: 13px;
+        width: 28px;
+        height: 28px;
+        border-radius: 50%;
+        background: #eefdf8;
+      }
+      .nomi::after {
+        content: "";
+        position: absolute;
+        left: 16px;
+        top: 40px;
+        width: 32px;
+        height: 14px;
+        border-radius: 18px 18px 10px 10px;
+        background: #dff8ef;
+      }
+      .badge {
+        position: absolute;
+        right: -4px;
+        top: -4px;
+        background: #ef4444;
+        color: #fff;
+        min-width: 22px;
+        height: 22px;
+        border-radius: 99px;
+        display: grid;
+        place-items: center;
+        font-size: 11px;
+        border: 2px solid #fff;
+      }
+      .button {
+        height: 42px;
+        border-radius: 8px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        margin-top: 10px;
+        font-weight: 700;
+      }
+      .primary { background: #0f766e; color: #fff; }
+      .secondary { background: #dff8ef; color: #14534d; }
+      .outline { border: 1px solid #cbd5e1; color: #334155; background: #fff; }
+      .account {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        padding: 10px 0;
+        border-bottom: 1px solid #edf2f0;
+      }
+      .account:last-child { border-bottom: 0; }
+      .icon {
+        width: 32px;
+        height: 32px;
+        border-radius: 9px;
+        display: grid;
+        place-items: center;
+        background: #e6f4f1;
+        color: #0f766e;
+        font-weight: 800;
+      }
+      .account div:nth-child(2) { flex: 1; }
+      .account strong {
+        display: block;
+        font-size: 14px;
+      }
+      .account span {
+        color: #64748b;
+        font-size: 12px;
+      }
+      .pill {
+        padding: 4px 8px;
+        border-radius: 999px;
+        font-size: 11px;
+        background: #fee2e2;
+        color: #991b1b;
+      }
+      .ok { background: #dcfce7; color: #166534; }
+      .chat {
+        display: grid;
+        gap: 10px;
+      }
+      .bubble {
+        padding: 10px 12px;
+        border-radius: 12px;
+        background: #eef7f4;
+        color: #1f3f3b;
+        line-height: 1.45;
+        font-size: 13px;
+      }
+      .bubble.user {
+        margin-left: 44px;
+        background: #10202f;
+        color: #fff;
+      }
+      .browser {
+        height: 150px;
+        border: 1px solid #d8e4e0;
+        border-radius: 8px;
+        overflow: hidden;
+        background: #f8fafc;
+      }
+      .bar {
+        height: 26px;
+        background: #e2e8f0;
+        display: flex;
+        align-items: center;
+        gap: 5px;
+        padding: 0 8px;
+      }
+      .dot {
+        width: 7px;
+        height: 7px;
+        border-radius: 50%;
+        background: #94a3b8;
+      }
+      .browser-main {
+        padding: 20px;
+        color: #475569;
+        font-size: 13px;
+      }
+      .footer {
+        padding: 14px 18px 18px;
+        color: #475569;
+        line-height: 1.55;
+        font-size: 13px;
+      }
+      .recommend {
+        margin-top: 22px;
+        padding: 18px 20px;
+        border: 1px solid #b7d7d1;
+        border-radius: 8px;
+        background: #ecfbf6;
+        color: #164e48;
+        line-height: 1.65;
+      }
+      @media (max-width: 980px) {
+        .grid { grid-template-columns: 1fr; }
+        .page { padding: 18px; }
+      }
+    </style>
+  </head>
+  <body>
+    <main class="page">
+      <h1>Nomi 悬浮球账号登录入口：3 个方案</h1>
+      <p class="intro">目标：用户在 Android 上点开 Nomi，就能进入私有云服务器上的受管浏览器，登录 Gmail、WhatsApp、购物平台等账号。登录动作仍由用户自己完成，Nomi 负责打开正确入口、展示状态、提醒重新登录。</p>
+
+      <section class="grid">
+        <article class="option">
+          <header>
+            <h2>A. 快速入口</h2>
+            <p>面板里加一个“登录账号”按钮，直接打开 noVNC 远程浏览器。</p>
+          </header>
+          <div class="phone">
+            <div class="status"><span>3:26</span><span>● ● ●</span></div>
+            <div class="panel">
+              <div class="panel-title">Nomi <span class="close">×</span></div>
+              <div class="bubble">我可以继续采集你已登录账号的信息。</div>
+              <div class="button primary">登录账号</div>
+              <div class="button secondary">打开完整工作台</div>
+              <div class="button outline">发送消息</div>
+            </div>
+            <div class="nomi"><span class="badge">2</span></div>
+          </div>
+          <div class="footer">优点：最容易做，路径短。缺点：用户不知道哪些账号已登录、哪些需要登录。</div>
+        </article>
+
+        <article class="option">
+          <header>
+            <h2>B. 账号清单</h2>
+            <p>点开 Nomi 后看到账号状态，选择某个平台后打开远程浏览器到对应页面。</p>
+          </header>
+          <div class="phone">
+            <div class="status"><span>3:26</span><span>● ● ●</span></div>
+            <div class="panel">
+              <div class="panel-title">账号登录 <span class="close">×</span></div>
+              <div class="account"><div class="icon">G</div><div><strong>Gmail</strong><span>邮件、订单、验证码提醒</span></div><span class="pill ok">正常</span></div>
+              <div class="account"><div class="icon">W</div><div><strong>WhatsApp Web</strong><span>聊天预览、历史、新消息</span></div><span class="pill">待登录</span></div>
+              <div class="account"><div class="icon">T</div><div><strong>Telegram Web</strong><span>聊天列表和可见消息</span></div><span class="pill">待登录</span></div>
+              <div class="account"><div class="icon">C</div><div><strong>Google Calendar</strong><span>日程、会议、提醒</span></div><span class="pill ok">正常</span></div>
+              <div class="account"><div class="icon">S</div><div><strong>Google Search</strong><span>搜索记录和页面信号</span></div><span class="pill ok">正常</span></div>
+              <div class="account"><div class="icon">B</div><div><strong>Chrome Bookmarks</strong><span>服务器浏览器书签</span></div><span class="pill ok">本地</span></div>
+              <div class="account"><div class="icon">F</div><div><strong>浏览行为</strong><span>点击、滚动、输入焦点</span></div><span class="pill ok">本地</span></div>
+              <div class="account"><div class="icon">E</div><div><strong>购物/电商</strong><span>通过邮件和浏览器间接支持</span></div><span class="pill">间接</span></div>
+              <div class="button primary">打开选中账号</div>
+              <div class="button outline">管理采集状态</div>
+            </div>
+            <div class="nomi"><span class="badge">1</span></div>
+          </div>
+          <div class="footer">优点：信息清晰，适合长期使用。缺点：需要后端提供更细的账号/采集状态。</div>
+        </article>
+
+        <article class="option">
+          <header>
+            <h2>C. 对话式引导</h2>
+            <p>用户告诉 Nomi 想登录什么，Nomi 再给出登录入口和状态提示。</p>
+          </header>
+          <div class="phone">
+            <div class="status"><span>3:26</span><span>● ● ●</span></div>
+            <div class="panel">
+              <div class="panel-title">Nomi <span class="close">×</span></div>
+              <div class="chat">
+                <div class="bubble">你想登录哪个账号？我可以带你打开服务器上的浏览器。</div>
+                <div class="bubble user">登录 WhatsApp</div>
+                <div class="bubble">好的，我会打开 WhatsApp Web。扫码完成后我会检测采集是否恢复。</div>
+              </div>
+              <div class="button primary">继续登录 WhatsApp</div>
+              <div class="button outline">查看全部账号</div>
+            </div>
+            <div class="nomi"></div>
+          </div>
+          <div class="footer">优点：拟人化强，符合 Nomi。缺点：第一次使用时不如清单直观。</div>
+        </article>
+      </section>
+
+      <section class="recommend">
+        <strong>我的推荐：</strong>第一版采用 B「账号清单」作为主入口，同时保留一个 A 风格的“打开远程浏览器”快捷按钮。这样既能让用户明确知道 Gmail/WhatsApp/购物平台的登录状态，也能快速进入 noVNC 完成真实网页登录。C 的对话式引导可以作为后续增强，等 Nomi 的任务理解和账号状态更稳定后再做。
+      </section>
+    </main>
+  </body>
+</html>

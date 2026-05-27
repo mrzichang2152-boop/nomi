@@ -1,0 +1,175 @@
+x-default-logging: &default-logging
+  driver: "json-file"
+  options:
+    max-size: "20m"
+    max-file: "5"
+
+x-model-cache-env: &model-cache-env
+  HF_HOME: /models/huggingface
+  XDG_CACHE_HOME: /models/cache
+  FASTEMBED_CACHE_DIR: /models/fastembed
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    restart: unless-stopped
+    cpus: "1.00"
+    mem_limit: 1536m
+    logging: *default-logging
+    environment:
+      POSTGRES_DB: par
+      POSTGRES_USER: par
+      POSTGRES_PASSWORD: par_dev_password
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./db/init.sql:/docker-entrypoint-initdb.d/001-init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U par -d par"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    cpus: "0.25"
+    mem_limit: 256m
+    logging: *default-logging
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  runtime-api:
+    build:
+      context: ./runtime_api
+    restart: unless-stopped
+    cpus: "1.00"
+    mem_limit: 1280m
+    logging: *default-logging
+    environment:
+      <<: *model-cache-env
+      DATABASE_URL: postgresql://par:par_dev_password@postgres:5432/par
+      REDIS_URL: redis://redis:6379/0
+      MODEL_MODE: standard
+      MODEL_BASE_URL: ${MODEL_BASE_URL:-http://localhost:9161}
+      MODEL_NAME: ${MODEL_NAME:-qwen3.6}
+      APP_PASSWORD: ${APP_PASSWORD:-par-dev}
+      RAW_DATA_ENCRYPTION_KEY: ${RAW_DATA_ENCRYPTION_KEY:-}
+      COMPOSIO_API_KEY: ${COMPOSIO_API_KEY:-}
+      COMPOSIO_API_BASE_URL: ${COMPOSIO_API_BASE_URL:-https://backend.composio.dev}
+      EMBEDDING_PROVIDER: ${EMBEDDING_PROVIDER:-fastembed}
+      FASTEMBED_MODEL: ${FASTEMBED_MODEL:-sentence-transformers/all-MiniLM-L6-v2}
+      ENABLE_DAILY_MAINTENANCE: ${ENABLE_DAILY_MAINTENANCE:-true}
+      DAILY_MAINTENANCE_HOUR_UTC: ${DAILY_MAINTENANCE_HOUR_UTC:-19}
+      RAW_RETENTION_DAYS: ${RAW_RETENTION_DAYS:-30}
+      LOW_VALUE_RAW_RETENTION_DAYS: ${LOW_VALUE_RAW_RETENTION_DAYS:-7}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    expose:
+      - "8080"
+    volumes:
+      - model_cache:/models
+
+  worker:
+    build:
+      context: ./worker
+    restart: unless-stopped
+    cpus: "1.00"
+    mem_limit: 1280m
+    logging: *default-logging
+    environment:
+      <<: *model-cache-env
+      DATABASE_URL: postgresql://par:par_dev_password@postgres:5432/par
+      REDIS_URL: redis://redis:6379/0
+      MODEL_MODE: standard
+      MODEL_ROUTER_URL: http://model-router:8090
+      MODEL_BASE_URL: ${MODEL_BASE_URL:-http://localhost:9161}
+      MODEL_NAME: ${MODEL_NAME:-qwen3.6}
+      REDIS_START_ID: ${REDIS_START_ID:-$}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      EMBEDDING_PROVIDER: ${EMBEDDING_PROVIDER:-fastembed}
+      FASTEMBED_MODEL: ${FASTEMBED_MODEL:-sentence-transformers/all-MiniLM-L6-v2}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      model-router:
+        condition: service_healthy
+    volumes:
+      - model_cache:/models
+
+  model-router:
+    build:
+      context: ./model_router
+    restart: unless-stopped
+    cpus: "0.25"
+    mem_limit: 256m
+    logging: *default-logging
+    environment:
+      MODEL_BASE_URL: ${MODEL_BASE_URL:-http://localhost:9161}
+      MODEL_NAME: ${MODEL_NAME:-qwen3.6}
+      FASTEMBED_MODEL: ${FASTEMBED_MODEL:-sentence-transformers/all-MiniLM-L6-v2}
+    healthcheck:
+      test: ["CMD-SHELL", "python - <<'PY'\nimport urllib.request\nurllib.request.urlopen('http://127.0.0.1:8090/health', timeout=2).read()\nPY"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    expose:
+      - "8090"
+
+  chromium-runtime:
+    build:
+      context: ./chromium_runtime
+    restart: unless-stopped
+    cpus: "1.50"
+    mem_limit: 2304m
+    logging: *default-logging
+    environment:
+      RUNTIME_API_URL: http://runtime-api:8080
+      RUNTIME_API_PASSWORD: ${APP_PASSWORD:-par-dev}
+      DISPLAY: :99
+      SCREEN_WIDTH: "1920"
+      SCREEN_HEIGHT: "1080"
+      CHROMIUM_WINDOW_WIDTH: "1920"
+      CHROMIUM_WINDOW_HEIGHT: "1080"
+      CHROMIUM_HEADLESS: "false"
+      CHROMIUM_CDP_URL: http://127.0.0.1:9222
+      GMAIL_AUTO_OPEN: ${GMAIL_AUTO_OPEN:-true}
+      CHROMIUM_AUTO_OPEN_SOURCES: ${CHROMIUM_AUTO_OPEN_SOURCES:-gmail,whatsapp,calendar,telegram,search}
+      WHATSAPP_HISTORY_SYNC: ${WHATSAPP_HISTORY_SYNC:-true}
+      VNC_PASSWORD: ${VNC_PASSWORD:-par-dev-vnc}
+    shm_size: "1gb"
+    volumes:
+      - chromium_profile:/app/user_profile
+    depends_on:
+      - runtime-api
+    ports:
+      - "6080:6080"
+
+  nginx:
+    image: nginx:1.27-alpine
+    restart: unless-stopped
+    cpus: "0.25"
+    mem_limit: 128m
+    logging: *default-logging
+    volumes:
+      - ./nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      - runtime-api
+    ports:
+      - "80:80"
+
+volumes:
+  postgres_data:
+  redis_data:
+  chromium_profile:
+  model_cache:
