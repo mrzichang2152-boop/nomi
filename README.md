@@ -23,6 +23,22 @@ curl -X POST http://localhost:8080/event \
   -d '{"source":"search","event_type":"search","raw_data":{"query":"东京酒店"}}'
 ```
 
+## Android Build
+
+The Android app expects Android SDK 35 and JDK 17.
+
+Create a local SDK pointer that is not committed:
+
+```bash
+echo "sdk.dir=/path/to/android-sdk" > android_app/local.properties
+```
+
+Build the debug APK:
+
+```bash
+JAVA_HOME=/path/to/jdk-17 gradle -p android_app :shared:test :app:assembleDebug
+```
+
 ## Server Deployment
 
 The server entrypoint is nginx on port `80`.
