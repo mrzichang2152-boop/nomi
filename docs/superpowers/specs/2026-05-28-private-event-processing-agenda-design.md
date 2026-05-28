@@ -6,12 +6,14 @@
 
 ## Goal
 
-Nomi must process every private user signal, such as WhatsApp messages, emails, browser-visible account activity, and future connected tools, into durable local memory while also deciding whether the signal should create or update an agenda item, produce a proactive suggestion, or wait silently.
+Nomi must process every private user signal, such as WhatsApp messages, emails, browser-visible account activity, the user's direct conversations with Nomi, and future connected tools, into durable local memory while also deciding whether the signal should create or update an agenda item, produce a proactive suggestion, or wait silently.
 
 The key product behavior is:
 
 - Every private event is stored locally as memory.
+- Every user-Nomi conversation turn is also stored locally as memory.
 - Storage and semantic judgment happen in parallel after normalization.
+- Semantic judgment uses a bounded conversation-context pack, not only the current message or email.
 - Internal agenda creation and updates do not require user confirmation when the evidence is strong enough.
 - External effects, such as sending messages, writing to third-party calendars, buying items, booking rides, or contacting people, require explicit user action and confirmation.
 - Proactive suggestions should appear as actionable cards or Android floating-ball bubbles, with actions such as `查路线`, `帮我打车`, `稍后提醒`.
@@ -24,16 +26,19 @@ The key product behavior is:
 
 ## Core Architecture
 
-Nomi should treat each incoming signal as a private event. A private event is first normalized and appended to a local event ledger. After that, independent processors run in parallel:
+Nomi should treat each incoming signal as a private event. A private event is first normalized and appended to a local event ledger. Direct user conversations with Nomi are private events too, including user messages, assistant responses, user corrections, suggestion clicks, dismissals, and task outcomes.
+
+After ledger append, independent processors run in parallel:
 
 - Memory ingestion writes the event into long-term memory.
 - Event understanding classifies what the event means.
 - Privacy and sensitivity classification marks what can be sent to a model, what must stay local, and what requires redaction.
 - Deduplication and identity resolution link the event to a source account, conversation, contact, email thread, order, or calendar-like object.
 - Embedding and retrieval indexes are updated for later semantic search.
+- Conversation-context indexing updates active user intent, active tasks, recent Nomi dialogue, and user corrections.
 - Source health and sync state are updated.
 
-The semantic result then flows into agenda, relationship, proactive suggestion, and future tool-intent systems.
+Before semantic judgment that needs reasoning, Nomi builds a bounded context pack. The context pack combines the current event with relevant recent Nomi conversation, active agenda items, active tasks, scoped memory, user preferences, recent corrections, and current UI/session state. The semantic result then flows into agenda, relationship, proactive suggestion, and future tool-intent systems.
 
 ```mermaid
 flowchart TD
@@ -45,7 +50,12 @@ flowchart TD
     C --> D4["Dedupe and identity resolution"]
     C --> D5["Embedding and search indexing"]
     C --> D6["Source health update"]
+    C --> D7["Conversation-context indexing"]
 
+    D7 --> X["Build bounded context pack"]
+    D1 --> X
+    D4 --> X
+    X --> D2
     D2 --> E1["Agenda resolver"]
     D2 --> E2["Relationship/contact updater"]
     D2 --> E3["Long-term memory candidate"]
@@ -80,6 +90,9 @@ Each event may receive multiple labels with confidence scores. The primary label
 - `shopping`: item to buy, order status, delivery, return, price, or cart intent.
 - `relationship_signal`: preference, conflict, trust signal, sentiment, birthday, sensitive interpersonal information.
 - `important_fact`: durable user/contact/project fact that is not necessarily actionable now.
+- `user_instruction`: direct instruction from the user to Nomi.
+- `preference_update`: user preference, habit, threshold, or policy learned from conversation.
+- `user_feedback`: correction, dismissal, approval, rating, or implicit signal from user action.
 - `low_value`: noise, duplicate notification, spam-like content, or content not worth surfacing.
 
 The classifier must produce:
@@ -94,9 +107,59 @@ The classifier must produce:
 - `required_actions`: possible actions the user may need.
 - `risk_flags`: sensitive relationship, money, health, legal, account security, or external-effect risk.
 
+## Nomi Conversation Context
+
+The user's direct conversation with Nomi is a first-class memory source. It is not just transient chat history.
+
+Nomi must store:
+
+- user messages to Nomi
+- Nomi responses
+- streamed response final content
+- suggestion cards shown to the user
+- suggestion actions clicked by the user
+- suggestions dismissed or ignored
+- user corrections, such as "不是这个人", "这件事不重要", or "以后别提醒这个"
+- task plans proposed by Nomi
+- tool calls requested, confirmed, canceled, and completed
+- final task outcomes
+
+This conversation context matters because later private events may only make sense when combined with what the user already told Nomi. For example:
+
+- If the user told Nomi "帮我盯一下周末和 Alex 见面的事", and later WhatsApp only says "那就周日吧", Nomi should connect the message to the active fuzzy agenda item.
+- If the user told Nomi "这件事不用提醒我", a later email about the same low-risk topic should not create a proactive interruption.
+- If the user corrected "不是公司 Alex，是健身房 Alex", future entity resolution should use that correction.
+- If the user clicked `帮我打车` but canceled at confirmation, Nomi should remember that the user considered the trip but did not book.
+
+### Context Pack
+
+The context pack is the bounded context used by event understanding, agenda resolution, proactive scoring, and tool routing.
+
+It should include:
+
+- current event
+- recent direct Nomi conversation turns relevant to the same task, contact, topic, or account
+- active agenda items with matching participants, time windows, locations, or topics
+- active suggestions and their user responses
+- user preferences and policies learned from prior Nomi conversations
+- recent user corrections
+- scoped memory from KV, knowledge graph, and RAG
+- current UI/session state when available
+
+The context pack must not become an unbounded chat transcript. It should be built by relevance and scope:
+
+- prefer current task/session context
+- include recent direct Nomi conversation only when it is relevant
+- include global user preferences when they apply
+- include contact-scoped or thread-scoped memories only when the current event is in that scope
+- exclude unrelated third-party private information by default
+- keep source ids so every inferred action can be traced
+
+Context is allowed to influence judgment, but it should not override strong source evidence without recording a reason. If current private evidence and prior Nomi conversation conflict, the system should lower confidence or create a clarification suggestion instead of silently choosing one.
+
 ## Mandatory Memory Write
 
-Memory write is mandatory for every normalized private event. Classification does not decide whether memory is written; it only decides how the memory is indexed, scoped, summarized, and later retrieved.
+Memory write is mandatory for every normalized private event, including user-Nomi conversation turns. Classification does not decide whether memory is written; it only decides how the memory is indexed, scoped, summarized, and later retrieved.
 
 Memory should keep three layers:
 
@@ -116,9 +179,12 @@ The memory system must prevent embarrassing or unsafe cross-contact leakage.
 
 Every memory item and event must carry scope metadata:
 
-- `source_type`: WhatsApp, Gmail, browser, manual, tool, system.
+- `source_type`: WhatsApp, Gmail, browser, Nomi chat, manual, tool, system.
 - `source_account_id`: local account identifier.
 - `conversation_id`: chat, email thread, page session, or task session.
+- `assistant_session_id`: direct Nomi conversation session when the source is Nomi chat.
+- `active_task_id`: task or workflow being discussed when available.
+- `suggestion_id`: proactive suggestion connected to the event when available.
 - `counterparty_ids`: contacts involved.
 - `topic_ids`: project, trip, household, finance, work, shopping, health, or custom topic.
 - `visibility_scope`: `global_user`, `contact_scoped`, `thread_scoped`, `topic_scoped`, or `private_third_party`.
@@ -130,6 +196,7 @@ Default retrieval rules:
 - Do not retrieve contact B's private negative opinions about contact A unless the user explicitly asks for that history or the information was promoted into a neutral global fact.
 - Relationship-signal memories are high-risk by default and require stricter relevance before surfacing.
 - Proactive suggestions should cite neutral evidence, not reveal hidden third-party judgments.
+- Direct Nomi conversation memories can be retrieved broadly only when they represent user preferences, policies, explicit instructions, or active tasks. Ordinary chat with Nomi remains session/task-scoped by default.
 
 ## Agenda System
 
@@ -272,6 +339,9 @@ The following tables or equivalent persistent collections are required.
 | --- | --- | --- |
 | `event_ledger` | Immutable local source event history | `id`, `source_type`, `source_account_id`, `conversation_id`, `raw_ref`, `normalized_text`, `occurred_at`, `ingested_at`, `hash`, `sensitivity_level` |
 | `semantic_events` | Event understanding output | `id`, `event_id`, `labels`, `primary_label`, `confidence`, `actors`, `time_expressions`, `place_expressions`, `required_actions`, `risk_flags`, `evidence_event_ids` |
+| `assistant_conversations` | User-Nomi conversation sessions | `id`, `client_type`, `started_at`, `last_active_at`, `active_task_id`, `scope`, `status` |
+| `assistant_turns` | User and assistant turns stored as memory-backed events | `id`, `conversation_id`, `role`, `content`, `event_id`, `suggestion_id`, `tool_call_id`, `created_at`, `finalized_at` |
+| `context_snapshots` | Bounded context used for a judgment | `id`, `event_id`, `context_type`, `included_event_ids`, `included_memory_ids`, `included_agenda_ids`, `reason`, `created_at` |
 | `memory_items` | KV, graph, and RAG memory references | `id`, `memory_type`, `content`, `scope`, `source_event_ids`, `embedding_id`, `confidence`, `sensitivity_level` |
 | `knowledge_entities` | People, places, accounts, projects, items, organizations | `id`, `entity_type`, `canonical_name`, `aliases`, `scope`, `confidence` |
 | `knowledge_edges` | Entity relationships | `id`, `from_entity_id`, `to_entity_id`, `edge_type`, `source_event_ids`, `confidence`, `valid_from`, `valid_to` |
@@ -292,6 +362,8 @@ The UI and Android client should use these API surfaces or equivalent routes:
 - `POST /api/proactive/suggestions/{id}/action`: record user action and trigger the next task flow.
 - `POST /api/events/ingest`: ingest normalized events from collectors.
 - `GET /api/events/{id}/trace`: inspect why a memory, agenda item, or suggestion exists.
+- `POST /api/chat/messages`: store user-Nomi turns and trigger context-aware response generation.
+- `GET /api/chat/conversations/{id}/trace`: inspect which memories, agenda items, suggestions, and tool decisions influenced a Nomi response.
 - `POST /api/tools/route`: route user-approved tool requests.
 
 The Android floating-ball channel should receive real-time suggestion events over the existing WebSocket path, not high-frequency polling.
@@ -305,7 +377,10 @@ The following work can run in parallel after the event ledger append:
 - dedupe and identity resolution
 - embedding/search indexing
 - event understanding
+- conversation-context indexing
 - source health update
+
+Context-pack building can run in parallel with lightweight local scoring, but any model-backed event understanding must wait for the relevant context pack when the event is ambiguous, task-related, or connected to active agenda items.
 
 The following work can run in parallel after event understanding:
 
@@ -340,13 +415,16 @@ The following work can run in parallel after the user chooses an action:
 - retrieve agenda item and version history
 - retrieve contact/profile context
 - retrieve current screen/session context
+- retrieve recent relevant Nomi conversation context
 - retrieve tool candidates
 - run risk classifier
 
 Serial gates:
 
 - The raw event ledger append must happen before derived processing.
+- User-Nomi conversation turns must be written before they are used as context for later judgments.
 - Agenda resolution waits for semantic event output.
+- Ambiguous semantic judgments wait for a bounded context pack.
 - Proactive decision waits for candidate scores.
 - External tool execution waits for user action.
 - High-risk external execution waits for final confirmation.
@@ -371,6 +449,9 @@ Validation must inspect:
 - whether every source event appears in the local ledger
 - whether memory scope is correct
 - whether labels match the actual content
+- whether user-Nomi conversation turns are stored as memory
+- whether ambiguous judgments use relevant dialogue context
+- whether unrelated dialogue context is excluded from the judgment
 - whether agenda items do not invent missing exact time or location
 - whether reschedules and cancellations update the right item
 - whether proactive suggestions are useful and not noisy
@@ -380,26 +461,29 @@ Validation must inspect:
 
 ## Implementation Phases
 
-### Phase 1: Event Pipeline Split
+### Phase 1: Event and Dialogue Pipeline Split
 
-Separate raw event ingestion, ledger append, normalization, memory write, semantic classification, and indexing into clear processing stages.
+Separate raw event ingestion, direct Nomi dialogue ingestion, ledger append, normalization, memory write, semantic classification, context indexing, and search indexing into clear processing stages.
 
 Acceptance criteria:
 
 - A sample WhatsApp message writes to the event ledger.
-- The same message writes to memory.
+- A sample direct user-Nomi message writes to the event ledger.
+- Both samples write to memory.
 - A semantic event is created with labels and evidence ids.
-- The pipeline can show a trace from source event to memory and semantic output.
+- The pipeline can show a trace from source event to memory, context, and semantic output.
 
-### Phase 2: Scoped Memory Retrieval
+### Phase 2: Context Pack and Scoped Memory Retrieval
 
-Add scope metadata and retrieval filters for contact, thread, topic, and global facts.
+Add scope metadata, retrieval filters, and bounded context-pack construction for contact, thread, topic, direct Nomi conversation, and global facts.
 
 Acceptance criteria:
 
 - A query in contact A context does not retrieve private contact B relationship signals by default.
 - Global user preferences remain available across contexts.
 - Source evidence is still available when explicitly requested by the user.
+- A WhatsApp message like "那就周日吧" can connect to an active Nomi-discussed fuzzy agenda item when the context supports it.
+- A user correction in Nomi chat changes later entity resolution.
 
 ### Phase 3: Agenda Resolver
 
@@ -443,17 +527,19 @@ Acceptance criteria:
 - The evaluation report includes the output of each stage, not only pass/fail status.
 - Incorrect or unreasonable labels, agenda updates, retrieval results, or suggestions are flagged.
 - At least one test proves contact-scoped retrieval prevents cross-contact leakage.
+- At least one test proves direct Nomi conversation context improves a later ambiguous event judgment.
+- At least one test proves unrelated Nomi dialogue is not included in the context pack.
 
 ## Product Behavior Summary
 
 Nomi should feel like a private assistant who quietly keeps track of the user's life, but asks before acting in the outside world.
 
-For every message or email:
+For every message, email, browser-visible event, or direct Nomi conversation turn:
 
 1. Remember it locally.
-2. Understand what kind of event it is.
-3. Update agenda and relationships when warranted.
-4. Decide whether the user should be interrupted.
-5. Show a concise suggestion with direct actions when useful.
-6. Execute tools only after the user chooses an action and confirms high-risk effects.
-
+2. Build a bounded context pack when judgment needs context.
+3. Understand what kind of event it is.
+4. Update agenda and relationships when warranted.
+5. Decide whether the user should be interrupted.
+6. Show a concise suggestion with direct actions when useful.
+7. Execute tools only after the user chooses an action and confirms high-risk effects.
