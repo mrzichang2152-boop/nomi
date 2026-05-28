@@ -53,7 +53,7 @@ DEFAULT_COMPOSIO_READONLY_TOOLKITS = [
     "googledocs",
     "googlesheets",
     "googletasks",
-    "googlemaps",
+    "google_maps",
     "github",
     "slack",
     "notion",

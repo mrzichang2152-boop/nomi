@@ -443,7 +443,7 @@ function renderComposioPanel(status, connections) {
     "googledocs",
     "googlesheets",
     "googletasks",
-    "googlemaps",
+    "google_maps",
   ]).slice(0, 10);
   node.innerHTML = `
     <time>Composio Connect · ${configuredText}</time>

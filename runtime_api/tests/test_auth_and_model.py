@@ -1685,7 +1685,8 @@ def test_composio_connect_creates_manual_authorization_link_and_persists_without
     assert "test-key" not in json.dumps(payload)
     assert captured["create"]["user_id"] == "nomi_owner"
     assert captured["create"]["manage_connections"] is False
-    assert captured["create"]["toolkits"]["enable"]
+    assert "google_maps" in captured["create"]["toolkits"]["enable"]
+    assert "googlemaps" not in captured["create"]["toolkits"]["enable"]
     assert captured["create"]["tags"]["disable"] == ["destructiveHint"]
     assert captured["authorize"]["toolkit_slug"] == "gmail"
     assert any("INSERT INTO composio_sessions" in sql for sql, _ in executed)
