@@ -171,6 +171,33 @@ def test_suggestion_to_realtime_message_preserves_source_and_body():
     assert message["open_view"] == "chat"
 
 
+def test_suggestion_to_realtime_message_exposes_action_cards_top_level():
+    from app.main import suggestion_to_realtime_message
+
+    message = suggestion_to_realtime_message(
+        {
+            "id": "s1",
+            "source_event_id": "e1",
+            "title": "跟进近期安排",
+            "body": "Alex 约你周日去武康路见面。",
+            "priority": 0.88,
+            "metadata": {
+                "suggestion_type": "social_followup",
+                "source": "whatsapp",
+                "actions": [
+                    {"id": "route_lookup", "label": "查路线", "risk": "read_only"},
+                    {"id": "ride_prepare", "label": "帮我打车", "risk": "external_execution"},
+                    {"id": "snooze", "label": "稍后提醒", "risk": "local_only"},
+                ],
+            },
+            "created_at": "2026-05-27T09:00:00+00:00",
+        }
+    )
+
+    assert [item["label"] for item in message["actions"]] == ["查路线", "帮我打车", "稍后提醒"]
+    assert message["actions"][1]["risk"] == "external_execution"
+
+
 def test_build_reasoning_context_layers_sources():
     from app.main import build_reasoning_context
 

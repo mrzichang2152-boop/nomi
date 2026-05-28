@@ -98,7 +98,45 @@ def compute_importance(source: str, event_type: str, raw_data: dict[str, Any], b
     return round(min(max(score, 0), 1), 3)
 
 
+def rule_extract_nomi_chat_semantics(event_type: str, raw_data: dict[str, Any]) -> dict[str, Any]:
+    role = str(raw_data.get("role") or "user").strip()
+    text = str(raw_data.get("content") or raw_data.get("message") or raw_data.get("text") or "").strip()
+    lowered = text.lower()
+    intent = "conversation_memory"
+    importance = 0.5 if role == "user" else 0.34
+    if role == "user" and any(marker in text for marker in ["别提醒", "不用提醒", "忽略", "不重要", "以后别"]):
+        intent = "user_feedback"
+        importance = 0.84
+    elif role == "user" and any(marker in text for marker in ["以后", "喜欢", "偏好", "记住", "习惯"]):
+        intent = "preference_update"
+        importance = 0.78
+    elif role == "user" and any(marker in text for marker in ["帮我", "提醒", "盯一下", "安排", "查", "找", "处理"]):
+        intent = "user_instruction"
+        importance = 0.76
+    elif role == "assistant":
+        intent = "assistant_response"
+    return {
+        "intent": intent,
+        "entities": {
+            "source": "nomi_chat",
+            "event_type": event_type,
+            "person": role,
+            "role": role,
+            "text": text,
+            "conversation_id": raw_data.get("conversation_id"),
+            "client_type": raw_data.get("client_type"),
+            "contains_negative_feedback": any(marker in text or marker in lowered for marker in ["别提醒", "不用提醒", "ignore"]),
+        },
+        "importance": importance,
+        "summary": f"{role} said to Nomi: {text}"[:500],
+        "model_version": f"{MODEL_MODE}:nomi-chat-rules-v0",
+    }
+
+
 def rule_extract_semantics(source: str, event_type: str, raw_data: dict[str, Any]) -> dict[str, Any]:
+    if source == "nomi_chat":
+        return rule_extract_nomi_chat_semantics(event_type, raw_data)
+
     if source == "longmemeval_conversation" and event_type == "conversation_turn":
         speaker = str(raw_data.get("speaker") or raw_data.get("role") or "unknown").strip()
         text = str(raw_data.get("text") or raw_data.get("content") or "").strip()
@@ -277,6 +315,74 @@ def extract_semantics(source: str, event_type: str, raw_data: dict[str, Any]) ->
         return fallback
 
 
+def suggestion_actions_for_event(intent: str, source: str, suggestion_type: str, summary: str) -> list[dict[str, Any]]:
+    text = f"{intent} {source} {suggestion_type} {summary}".lower()
+    if intent in {"social_plan", "schedule"} or any(marker in text for marker in ["见面", "路线", "street", "road"]):
+        return [
+            {
+                "id": "route_lookup",
+                "label": "查路线",
+                "kind": "tool_intent",
+                "risk": "read_only",
+                "requires_confirmation": False,
+                "next_step": "route_lookup",
+            },
+            {
+                "id": "ride_prepare",
+                "label": "帮我打车",
+                "kind": "tool_intent",
+                "risk": "external_execution",
+                "requires_confirmation": True,
+                "next_step": "prepare_ride_request",
+            },
+            {
+                "id": "snooze",
+                "label": "稍后提醒",
+                "kind": "local",
+                "risk": "local_only",
+                "requires_confirmation": False,
+                "next_step": "snooze_suggestion",
+            },
+        ]
+    if source == "gmail" or intent in {"payment_reminder", "email_verification", "task_request"}:
+        return [
+            {
+                "id": "add_reminder",
+                "label": "稍后提醒",
+                "kind": "local",
+                "risk": "local_only",
+                "requires_confirmation": False,
+                "next_step": "create_local_reminder",
+            },
+            {
+                "id": "open_source",
+                "label": "查看原邮件",
+                "kind": "source_review",
+                "risk": "read_only",
+                "requires_confirmation": False,
+                "next_step": "open_source_event",
+            },
+        ]
+    return [
+        {
+            "id": "snooze",
+            "label": "稍后提醒",
+            "kind": "local",
+            "risk": "local_only",
+            "requires_confirmation": False,
+            "next_step": "snooze_suggestion",
+        },
+        {
+            "id": "dismiss",
+            "label": "忽略",
+            "kind": "feedback",
+            "risk": "local_only",
+            "requires_confirmation": False,
+            "next_step": "dismiss_suggestion",
+        },
+    ]
+
+
 def suggestion_for_event(event_id: str, semantic: dict[str, Any]) -> Optional[dict[str, Any]]:
     summary = semantic["summary"].strip()
     display_summary = summary.rstrip("。.!！?？")
@@ -327,6 +433,7 @@ def suggestion_for_event(event_id: str, semantic: dict[str, Any]) -> Optional[di
             "confidence": round(confidence, 3),
             "dedupe_key": dedupe_key,
             "expires_at": expires_at,
+            "actions": suggestion_actions_for_event(intent, source, suggestion_type, summary),
         },
     }
 
@@ -476,6 +583,14 @@ def vector_content_for_event(source: str, event_type: str, semantic: dict[str, A
                 str(raw_data.get("message") or ""),
             ]
         )
+    elif source == "nomi_chat":
+        pieces.extend(
+            [
+                str(raw_data.get("role") or ""),
+                str(raw_data.get("content") or ""),
+                str(raw_data.get("conversation_id") or ""),
+            ]
+        )
     elif source == "bookmark":
         pieces.extend([str(raw_data.get("title") or ""), str(raw_data.get("url") or ""), str(raw_data.get("folder_path") or "")])
     elif source == "search":
@@ -489,6 +604,7 @@ def vector_content_for_event(source: str, event_type: str, semantic: dict[str, A
 
 def realtime_message_for_suggestion(suggestion: dict[str, Any]) -> dict[str, Any]:
     metadata = suggestion.get("metadata") if isinstance(suggestion.get("metadata"), dict) else {}
+    actions = metadata.get("actions") if isinstance(metadata.get("actions"), list) else []
     return {
         "type": "proactive_message",
         "id": str(suggestion["id"]),
@@ -499,6 +615,7 @@ def realtime_message_for_suggestion(suggestion: dict[str, Any]) -> dict[str, Any
         "priority": suggestion["priority"],
         "source": metadata.get("source") or metadata.get("collector") or "unknown",
         "metadata": metadata,
+        "actions": actions,
         "open_view": "chat",
     }
 
@@ -792,6 +909,286 @@ def ensure_relationship_metadata_column(conn: psycopg.Connection) -> None:
     conn.execute("ALTER TABLE relationships ADD COLUMN IF NOT EXISTS metadata JSONB NOT NULL DEFAULT '{}'::jsonb")
 
 
+def ensure_agenda_schema(conn: psycopg.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS agenda_items (
+          id UUID PRIMARY KEY,
+          type TEXT NOT NULL,
+          title TEXT NOT NULL,
+          status TEXT NOT NULL DEFAULT 'scheduled',
+          certainty TEXT NOT NULL DEFAULT 'exact',
+          time_window JSONB NOT NULL DEFAULT '{}'::jsonb,
+          place TEXT,
+          participants JSONB NOT NULL DEFAULT '[]'::jsonb,
+          missing_fields JSONB NOT NULL DEFAULT '[]'::jsonb,
+          needs_clarification BOOLEAN NOT NULL DEFAULT FALSE,
+          confidence DOUBLE PRECISION NOT NULL DEFAULT 0,
+          source_event_ids UUID[] NOT NULL DEFAULT ARRAY[]::UUID[],
+          metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+          updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS agenda_item_versions (
+          id UUID PRIMARY KEY,
+          agenda_item_id UUID REFERENCES agenda_items(id) ON DELETE CASCADE,
+          operation TEXT NOT NULL,
+          previous_value JSONB NOT NULL DEFAULT '{}'::jsonb,
+          new_value JSONB NOT NULL DEFAULT '{}'::jsonb,
+          reason TEXT NOT NULL DEFAULT '',
+          source_event_ids UUID[] NOT NULL DEFAULT ARRAY[]::UUID[],
+          confidence DOUBLE PRECISION NOT NULL DEFAULT 0,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        )
+        """
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS agenda_items_status_idx ON agenda_items(status, updated_at DESC)")
+    conn.execute("CREATE INDEX IF NOT EXISTS agenda_items_metadata_dedupe_idx ON agenda_items ((metadata->>'dedupe_key'))")
+
+
+def semantic_text(semantic: dict[str, Any]) -> str:
+    raw_data = semantic.get("raw_data") if isinstance(semantic.get("raw_data"), dict) else {}
+    pieces = [
+        semantic.get("summary"),
+        raw_data.get("message"),
+        raw_data.get("body"),
+        raw_data.get("text"),
+        raw_data.get("content"),
+        raw_data.get("subject"),
+        raw_data.get("title"),
+    ]
+    return "\n".join(str(piece) for piece in pieces if piece)
+
+
+def agenda_operation_for_text(text: str) -> str:
+    if any(marker in text for marker in ["取消", "不去了", "不用去了", "cancel", "canceled", "cancelled"]):
+        return "cancel"
+    if any(marker in text for marker in ["改到", "改成", "换到", "推迟", "提前", "reschedule"]):
+        return "reschedule"
+    return "create"
+
+
+def agenda_type_for_semantic(semantic: dict[str, Any], text: str) -> Optional[str]:
+    intent = str(semantic.get("intent") or "")
+    if intent in {"social_plan", "schedule"} or any(marker in text for marker in ["见面", "吃饭", "约", "会议", "开会", "碰面"]):
+        return "appointment"
+    if intent in {"payment_reminder"} or any(marker in text for marker in ["付款", "支付", "账单", "发票", "还款"]):
+        return "payment"
+    if intent in {"task_request", "user_instruction"} or any(marker in text for marker in ["待办", "帮我", "提醒", "处理"]):
+        return "todo"
+    if any(marker in text for marker in ["截止", "deadline", "due", "到期"]):
+        return "deadline"
+    return None
+
+
+def extract_agenda_participants(raw_data: dict[str, Any], semantic: dict[str, Any]) -> list[str]:
+    entities = semantic.get("entities") if isinstance(semantic.get("entities"), dict) else {}
+    candidates = [
+        raw_data.get("chat_name"),
+        raw_data.get("sender"),
+        raw_data.get("from"),
+        entities.get("person"),
+        entities.get("subject"),
+    ]
+    participants = raw_data.get("participants")
+    if isinstance(participants, list):
+        candidates.extend(participants)
+    cleaned = []
+    for candidate in candidates:
+        value = str(candidate or "").strip()
+        if value and value.lower() not in {"user", "unknown", "nomi_chat", "gmail", "whatsapp"}:
+            cleaned.append(value)
+    return list(dict.fromkeys(cleaned))[:8]
+
+
+def extract_place(text: str, raw_data: dict[str, Any]) -> str:
+    explicit = str(raw_data.get("place") or raw_data.get("location") or "").strip()
+    if explicit:
+        return explicit
+    match = re.search(r"(?:在|去)([\u4e00-\u9fffA-Za-z0-9·.\- ]{2,40}(?:路|街|店|站|机场|酒店|咖啡|餐厅|mall|plaza))", text, re.I)
+    return match.group(1).strip() if match else ""
+
+
+def agenda_certainty_and_missing(text: str, place: str, agenda_type: str, operation: str) -> tuple[str, list[str], dict[str, Any]]:
+    has_exact_time = bool(re.search(r"\d{1,2}[:：点]\d{0,2}|上午|下午|晚上|中午|早上", text))
+    has_fuzzy_time = any(marker in text for marker in ["周末", "下周", "周日", "周六", "改天", "找时间", "有空", "明后天"])
+    missing_fields: list[str] = []
+    if operation == "cancel":
+        missing_fields = []
+    elif not has_exact_time:
+        missing_fields.append("exact_time")
+    if agenda_type == "appointment" and operation != "cancel" and not place:
+        missing_fields.append("exact_place")
+    certainty = "fuzzy" if has_fuzzy_time or missing_fields else "exact"
+    time_window = {
+        "raw_text": text[:240],
+        "has_exact_time": has_exact_time,
+        "has_fuzzy_time": has_fuzzy_time,
+    }
+    return certainty, missing_fields, time_window
+
+
+def agenda_candidate_from_semantic(event_id: str, timestamp: str, semantic: dict[str, Any]) -> Optional[dict[str, Any]]:
+    raw_data = semantic.get("raw_data") if isinstance(semantic.get("raw_data"), dict) else {}
+    text = semantic_text(semantic)
+    agenda_type = agenda_type_for_semantic(semantic, text)
+    if not agenda_type:
+        return None
+    place = extract_place(text, raw_data)
+    participants = extract_agenda_participants(raw_data, semantic)
+    operation = agenda_operation_for_text(text)
+    certainty, missing_fields, time_window = agenda_certainty_and_missing(text, place, agenda_type, operation)
+    status = "canceled" if operation == "cancel" else "scheduled"
+    title = str(semantic.get("summary") or text or agenda_type).strip()[:180]
+    source = str((semantic.get("entities") or {}).get("source") or raw_data.get("source") or "")
+    conversation_key = normalize_entity_name(
+        str(
+            raw_data.get("conversation_id")
+            or raw_data.get("chat_id")
+            or raw_data.get("thread_id")
+            or raw_data.get("chat_name")
+            or raw_data.get("subject")
+            or ",".join(participants)
+            or source
+            or agenda_type
+        )
+    )
+    dedupe_seed = ":".join([agenda_type, source or "unknown", conversation_key])
+    return {
+        "type": agenda_type,
+        "title": title,
+        "status": status,
+        "certainty": certainty,
+        "time_window": time_window,
+        "place": place,
+        "participants": participants,
+        "missing_fields": missing_fields,
+        "needs_clarification": bool(missing_fields),
+        "confidence": min(max(float(semantic.get("importance") or 0.2), 0), 1),
+        "source_event_ids": [event_id],
+        "operation": operation,
+        "metadata": {
+            "source": source,
+            "dedupe_key": f"agenda:{dedupe_seed}",
+            "created_from": "semantic_event",
+            "event_timestamp": timestamp,
+        },
+    }
+
+
+def persist_agenda(conn: psycopg.Connection, event_id: str, timestamp: str, semantic: dict[str, Any]) -> None:
+    ensure_agenda_schema(conn)
+    candidate = agenda_candidate_from_semantic(event_id, timestamp, semantic)
+    if not candidate:
+        return
+    dedupe_key = candidate["metadata"]["dedupe_key"]
+    existing_cursor = conn.execute(
+        "SELECT id FROM agenda_items WHERE metadata->>'dedupe_key' = %s ORDER BY updated_at DESC LIMIT 1",
+        (dedupe_key,),
+    )
+    existing = existing_cursor.fetchone() if hasattr(existing_cursor, "fetchone") else None
+    agenda_id = existing[0] if existing else uuid.uuid4()
+    previous_value: dict[str, Any] = {}
+    new_value = {
+        key: candidate[key]
+        for key in [
+            "type",
+            "title",
+            "status",
+            "certainty",
+            "time_window",
+            "place",
+            "participants",
+            "missing_fields",
+            "needs_clarification",
+            "confidence",
+        ]
+    }
+    if existing:
+        conn.execute(
+            """
+            UPDATE agenda_items
+            SET title = %s,
+                status = %s,
+                certainty = %s,
+                time_window = %s,
+                place = %s,
+                participants = %s,
+                missing_fields = %s,
+                needs_clarification = %s,
+                confidence = GREATEST(confidence, %s),
+                source_event_ids = (
+                  SELECT ARRAY(SELECT DISTINCT unnest(agenda_items.source_event_ids || ARRAY[%s]::UUID[]))
+                ),
+                metadata = %s,
+                updated_at = now()
+            WHERE id = %s
+            """,
+            (
+                candidate["title"],
+                candidate["status"],
+                candidate["certainty"],
+                json.dumps(candidate["time_window"], ensure_ascii=False),
+                candidate["place"] or None,
+                json.dumps(candidate["participants"], ensure_ascii=False),
+                json.dumps(candidate["missing_fields"], ensure_ascii=False),
+                candidate["needs_clarification"],
+                candidate["confidence"],
+                event_id,
+                json.dumps(candidate["metadata"], ensure_ascii=False),
+                agenda_id,
+            ),
+        )
+    else:
+        cursor = conn.execute(
+            """
+            INSERT INTO agenda_items
+              (id, title, type, status, certainty, time_window, participants, missing_fields,
+               needs_clarification, confidence, source_event_ids, metadata, place, updated_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, ARRAY[%s]::UUID[], %s, %s, now())
+            RETURNING id
+            """,
+            (
+                agenda_id,
+                candidate["title"],
+                candidate["type"],
+                candidate["status"],
+                candidate["certainty"],
+                json.dumps(candidate["time_window"], ensure_ascii=False),
+                json.dumps(candidate["participants"], ensure_ascii=False),
+                json.dumps(candidate["missing_fields"], ensure_ascii=False),
+                candidate["needs_clarification"],
+                candidate["confidence"],
+                event_id,
+                json.dumps(candidate["metadata"], ensure_ascii=False),
+                candidate["place"] or None,
+            ),
+        )
+        returned = cursor.fetchone() if hasattr(cursor, "fetchone") else None
+        agenda_id = returned[0] if returned else agenda_id
+    conn.execute(
+        """
+        INSERT INTO agenda_item_versions
+          (id, agenda_item_id, operation, previous_value, new_value, reason, source_event_ids, confidence)
+        VALUES (%s, %s, %s, %s, %s, %s, ARRAY[%s]::UUID[], %s)
+        """,
+        (
+            uuid.uuid4(),
+            agenda_id,
+            candidate["operation"] if existing else "create",
+            json.dumps(previous_value, ensure_ascii=False),
+            json.dumps(new_value, ensure_ascii=False),
+            f"{candidate['operation']} agenda from semantic event: {candidate['title']}",
+            event_id,
+            candidate["confidence"],
+        ),
+    )
+
+
 def persist_semantics(conn: psycopg.Connection, event_id: str, timestamp: str, semantic: dict[str, Any], redis_client: Any = None) -> None:
     semantic_id = uuid.uuid4()
     cursor = conn.execute(
@@ -822,6 +1219,7 @@ def persist_semantics(conn: psycopg.Connection, event_id: str, timestamp: str, s
     event_type = source_row[1] if source_row else "unknown"
     persist_fact_graph_and_state(conn, event_id, timestamp, semantic)
     persist_vector(conn, event_id, source, event_type, semantic)
+    persist_agenda(conn, event_id, timestamp, semantic)
     persist_suggestion(conn, event_id, semantic, redis_client=redis_client)
     if semantic["importance"] >= 0.7:
         conn.execute(

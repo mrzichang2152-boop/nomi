@@ -75,6 +75,167 @@ def test_persist_semantics_writes_vector_and_suggestion_for_new_event():
     assert "INSERT INTO memory_states" in sql_statements
 
 
+def test_rule_extract_semantics_marks_nomi_user_instruction_and_feedback():
+    from app.worker import rule_extract_semantics
+
+    instruction = rule_extract_semantics(
+        "nomi_chat",
+        "user_message",
+        {
+            "role": "user",
+            "content": "帮我盯一下周末和 Alex 见面的事",
+            "conversation_id": "conv-1",
+        },
+    )
+    feedback = rule_extract_semantics(
+        "nomi_chat",
+        "user_message",
+        {
+            "role": "user",
+            "content": "这件事不用提醒我，以后别提醒优惠券",
+            "conversation_id": "conv-1",
+        },
+    )
+
+    assert instruction["intent"] == "user_instruction"
+    assert instruction["entities"]["conversation_id"] == "conv-1"
+    assert "周末和 Alex" in instruction["summary"]
+    assert instruction["importance"] >= 0.72
+    assert feedback["intent"] == "user_feedback"
+    assert "别提醒" in feedback["summary"]
+    assert feedback["importance"] >= 0.8
+
+
+def test_agenda_candidate_for_fuzzy_social_plan_has_missing_exact_time_and_place():
+    from app.worker import agenda_candidate_from_semantic
+
+    candidate = agenda_candidate_from_semantic(
+        "11111111-1111-1111-1111-111111111111",
+        "2026-05-28T09:00:00+00:00",
+        {
+            "intent": "social_plan",
+            "summary": "Alex 说那就周日见。",
+            "importance": 0.82,
+            "entities": {"source": "whatsapp", "event_type": "whatsapp_message"},
+            "raw_data": {"chat_name": "Alex", "sender": "Alex", "message": "那就周日吧"},
+        },
+    )
+
+    assert candidate is not None
+    assert candidate["type"] == "appointment"
+    assert candidate["certainty"] == "fuzzy"
+    assert candidate["status"] == "scheduled"
+    assert "exact_time" in candidate["missing_fields"]
+    assert "exact_place" in candidate["missing_fields"]
+    assert candidate["needs_clarification"] is True
+    assert candidate["participants"] == ["Alex"]
+    assert candidate["source_event_ids"] == ["11111111-1111-1111-1111-111111111111"]
+
+
+def test_agenda_dedupe_key_links_reschedule_to_original_conversation():
+    from app.worker import agenda_candidate_from_semantic
+
+    original = agenda_candidate_from_semantic(
+        "11111111-1111-1111-1111-111111111111",
+        "2026-05-28T09:00:00+00:00",
+        {
+            "intent": "social_plan",
+            "summary": "Alex 说那就周日见。",
+            "importance": 0.82,
+            "entities": {"source": "whatsapp", "event_type": "whatsapp_message"},
+            "raw_data": {"chat_name": "Alex", "chat_id": "wa-alex", "sender": "Alex", "message": "那就周日吧"},
+        },
+    )
+    reschedule = agenda_candidate_from_semantic(
+        "22222222-2222-2222-2222-222222222222",
+        "2026-05-28T10:00:00+00:00",
+        {
+            "intent": "social_plan",
+            "summary": "Alex 把见面改到周六。",
+            "importance": 0.86,
+            "entities": {"source": "whatsapp", "event_type": "whatsapp_message"},
+            "raw_data": {"chat_name": "Alex", "chat_id": "wa-alex", "sender": "Alex", "message": "改到周六吧"},
+        },
+    )
+
+    assert original is not None
+    assert reschedule is not None
+    assert reschedule["operation"] == "reschedule"
+    assert reschedule["metadata"]["dedupe_key"] == original["metadata"]["dedupe_key"]
+
+
+def test_persist_agenda_writes_item_and_version_with_reason():
+    from app.worker import persist_agenda
+
+    executed = []
+
+    class Cursor:
+        rowcount = 1
+
+        def __init__(self, rows=None):
+            self.rows = rows or []
+
+        def fetchone(self):
+            return self.rows[0] if self.rows else None
+
+    class Conn:
+        def execute(self, sql, params=()):
+            executed.append((sql, params))
+            normalized = " ".join(sql.split())
+            if "SELECT id FROM agenda_items" in normalized:
+                return Cursor()
+            if "INSERT INTO agenda_items" in normalized:
+                return Cursor([("22222222-2222-2222-2222-222222222222",)])
+            return Cursor()
+
+    persist_agenda(
+        Conn(),
+        "11111111-1111-1111-1111-111111111111",
+        "2026-05-28T09:00:00+00:00",
+        {
+            "intent": "social_plan",
+            "summary": "Alex 说那就周日见。",
+            "importance": 0.82,
+            "entities": {"source": "whatsapp", "event_type": "whatsapp_message"},
+            "raw_data": {"chat_name": "Alex", "sender": "Alex", "message": "那就周日吧"},
+        },
+    )
+
+    agenda_sql, agenda_params = next(item for item in executed if "INSERT INTO agenda_items" in item[0])
+    version_sql, version_params = next(item for item in executed if "INSERT INTO agenda_item_versions" in item[0])
+    assert "certainty" in agenda_sql
+    assert "missing_fields" in agenda_sql
+    assert agenda_params[2] == "appointment"
+    assert agenda_params[4] == "fuzzy"
+    assert "exact_time" in agenda_params[7]
+    assert "exact_place" in agenda_params[7]
+    assert "Alex" in agenda_params[6]
+    assert "INSERT INTO agenda_item_versions" in version_sql
+    assert version_params[2] == "create"
+    assert "Alex 说那就周日见" in version_params[5]
+
+
+def test_suggestion_for_social_plan_includes_route_ride_and_snooze_actions():
+    from app.worker import suggestion_for_event
+
+    suggestion = suggestion_for_event(
+        "11111111-1111-1111-1111-111111111111",
+        {
+            "intent": "social_plan",
+            "summary": "Alex 约你周日去武康路见面。",
+            "importance": 0.86,
+            "entities": {"source": "whatsapp", "event_type": "whatsapp_message"},
+        },
+    )
+
+    assert suggestion is not None
+    actions = suggestion["metadata"]["actions"]
+    labels = [item["label"] for item in actions]
+    assert labels == ["查路线", "帮我打车", "稍后提醒"]
+    assert actions[1]["risk"] == "external_execution"
+    assert actions[1]["requires_confirmation"] is True
+
+
 def test_persist_semantics_does_not_write_stable_semantic_memory_directly():
     from app.worker import persist_semantics
 

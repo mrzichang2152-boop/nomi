@@ -63,6 +63,7 @@ async def lifespan(app: FastAPI):
     ensure_collector_settings_schema()
     ensure_event_private_storage_schema()
     ensure_memory_governance_schema()
+    ensure_assistant_context_schema()
     text_embedding_with_provider("startup embedding warmup")
     task = None
     if ENABLE_DAILY_MAINTENANCE:
@@ -109,6 +110,8 @@ class LoginIn(BaseModel):
 class ChatIn(BaseModel):
     message: str = Field(min_length=1, max_length=4000)
     limit: int = Field(default=12, ge=1, le=30)
+    conversation_id: Optional[str] = None
+    client_type: str = Field(default="web", max_length=40)
 
 
 class ToolRouteIn(BaseModel):
@@ -826,6 +829,71 @@ def ensure_memory_governance_schema() -> None:
         )
 
 
+def ensure_assistant_context_schema() -> None:
+    with db() as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS assistant_conversations (
+              id UUID PRIMARY KEY,
+              client_type TEXT NOT NULL DEFAULT 'web',
+              started_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+              last_active_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+              active_task_id TEXT,
+              scope JSONB NOT NULL DEFAULT '{}'::jsonb,
+              status TEXT NOT NULL DEFAULT 'active'
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS assistant_turns (
+              id UUID PRIMARY KEY,
+              conversation_id UUID REFERENCES assistant_conversations(id) ON DELETE CASCADE,
+              role TEXT NOT NULL,
+              content TEXT NOT NULL,
+              event_id UUID UNIQUE REFERENCES events(event_id) ON DELETE CASCADE,
+              suggestion_id UUID,
+              tool_call_id TEXT,
+              created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+              finalized_at TIMESTAMPTZ
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS context_snapshots (
+              id UUID PRIMARY KEY,
+              event_id UUID REFERENCES events(event_id) ON DELETE CASCADE,
+              context_type TEXT NOT NULL,
+              included_event_ids TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[],
+              included_memory_ids TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[],
+              included_agenda_ids TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[],
+              reason TEXT NOT NULL DEFAULT '',
+              payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+              created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS assistant_turns_conversation_idx
+            ON assistant_turns(conversation_id, created_at DESC)
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS assistant_turns_event_idx
+            ON assistant_turns(event_id)
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS context_snapshots_event_idx
+            ON context_snapshots(event_id, created_at DESC)
+            """
+        )
+
+
 def default_collector_settings() -> list[str]:
     return ["bookmark", "calendar", "focus", "gmail", "search", "telegram", "whatsapp"]
 
@@ -1089,33 +1157,129 @@ def login(body: LoginIn) -> dict[str, bool]:
     return {"ok": True}
 
 
-@app.post("/event")
-def create_event(event: EventIn) -> dict[str, str]:
-    event_id = uuid.uuid4()
-    ts = event.timestamp or datetime.now(timezone.utc)
-    protected_raw_data = protect_private_payload(event.raw_data)
-    private_raw_data = encrypt_private_raw_data(event.raw_data)
+def parse_uuid_or_new(value: Optional[str]) -> uuid.UUID:
+    if value:
+        try:
+            return uuid.UUID(str(value))
+        except ValueError:
+            pass
+    return uuid.uuid4()
 
-    with db() as conn:
-        ensure_collector_event_allowed(conn, event.source)
-        conn.execute(
-            """
-            INSERT INTO events (event_id, timestamp, source, event_type, raw_data, raw_data_private)
-            VALUES (%s, %s, %s, %s, %s, %s)
-            """,
-            (event_id, ts, event.source, event.event_type, json.dumps(protected_raw_data), json.dumps(private_raw_data)),
-        )
 
-    redis_client().xadd(
+def enqueue_raw_event(
+    redis_obj: Any,
+    event_id: uuid.UUID,
+    ts: datetime,
+    source: str,
+    event_type: str,
+    protected_raw_data: dict[str, Any],
+) -> None:
+    if redis_obj is None or not hasattr(redis_obj, "xadd"):
+        return
+    redis_obj.xadd(
         "events:raw",
         {
             "event_id": str(event_id),
             "timestamp": ts.isoformat(),
-            "source": event.source,
-            "event_type": event.event_type,
+            "source": source,
+            "event_type": event_type,
             "raw_data": json.dumps(protected_raw_data, ensure_ascii=False),
         },
     )
+
+
+def insert_private_event(
+    conn: psycopg.Connection,
+    source: str,
+    event_type: str,
+    raw_data: dict[str, Any],
+    ts: Optional[datetime] = None,
+) -> tuple[uuid.UUID, datetime, dict[str, Any]]:
+    event_id = uuid.uuid4()
+    timestamp = ts or datetime.now(timezone.utc)
+    protected_raw_data = protect_private_payload(raw_data)
+    private_raw_data = encrypt_private_raw_data(raw_data)
+    conn.execute(
+        """
+        INSERT INTO events (event_id, timestamp, source, event_type, raw_data, raw_data_private)
+        VALUES (%s, %s, %s, %s, %s, %s)
+        """,
+        (event_id, timestamp, source, event_type, json.dumps(protected_raw_data), json.dumps(private_raw_data)),
+    )
+    return event_id, timestamp, protected_raw_data
+
+
+def persist_assistant_turn(
+    conn: psycopg.Connection,
+    redis_obj: Any,
+    role: str,
+    content: str,
+    conversation_id: Optional[str] = None,
+    client_type: str = "web",
+    suggestion_id: Optional[str] = None,
+    tool_call_id: Optional[str] = None,
+) -> dict[str, str]:
+    if role not in {"user", "assistant", "system"}:
+        raise ValueError("role must be user, assistant, or system")
+    conversation_uuid = parse_uuid_or_new(conversation_id)
+    turn_id = uuid.uuid4()
+    raw_data = {
+        "role": role,
+        "content": content,
+        "conversation_id": str(conversation_uuid),
+        "client_type": client_type,
+        "suggestion_id": suggestion_id,
+        "tool_call_id": tool_call_id,
+    }
+    conn.execute(
+        """
+        INSERT INTO assistant_conversations (id, client_type, last_active_at, scope, status)
+        VALUES (%s, %s, now(), %s, 'active')
+        ON CONFLICT (id) DO UPDATE SET
+          client_type = EXCLUDED.client_type,
+          last_active_at = now(),
+          status = 'active'
+        """,
+        (conversation_uuid, client_type, json.dumps({"source": "nomi_chat", "client_type": client_type})),
+    )
+    event_type = f"{role}_message"
+    event_id, ts, protected_raw_data = insert_private_event(conn, "nomi_chat", event_type, raw_data)
+    conn.execute(
+        """
+        INSERT INTO assistant_turns
+          (id, conversation_id, role, content, event_id, suggestion_id, tool_call_id, created_at, finalized_at)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+        """,
+        (
+            turn_id,
+            conversation_uuid,
+            role,
+            content,
+            event_id,
+            suggestion_id,
+            tool_call_id,
+            ts,
+            ts if role == "assistant" else None,
+        ),
+    )
+    enqueue_raw_event(redis_obj, event_id, ts, "nomi_chat", event_type, protected_raw_data)
+    return {
+        "conversation_id": str(conversation_uuid),
+        "turn_id": str(turn_id),
+        "event_id": str(event_id),
+        "role": role,
+    }
+
+
+@app.post("/event")
+def create_event(event: EventIn) -> dict[str, str]:
+    ts = event.timestamp or datetime.now(timezone.utc)
+
+    with db() as conn:
+        ensure_collector_event_allowed(conn, event.source)
+        event_id, ts, protected_raw_data = insert_private_event(conn, event.source, event.event_type, event.raw_data, ts)
+
+    enqueue_raw_event(redis_client(), event_id, ts, event.source, event.event_type, protected_raw_data)
     return {"event_id": str(event_id), "status": "queued"}
 
 
@@ -1270,6 +1434,7 @@ def search_layer_explanation(layer: str) -> str:
         "entity_graph": "知识图谱：实体、关系或事实匹配",
         "bm25_recall": "关键词召回：字面关键词匹配的历史内容",
         "vector_recall": "向量召回：语义相近的历史内容",
+        "assistant_dialogue": "Nomi 对话上下文：用户指令、纠正、偏好和任务反馈",
     }
     return explanations.get(layer, "个人记忆：相关历史上下文")
 
@@ -1818,6 +1983,151 @@ def run_daily_memory_maintenance(
     }
 
 
+def relevant_assistant_dialogue_items(
+    query: str,
+    assistant_context: list[dict[str, Any]],
+    conversation_id: Optional[str] = None,
+    limit: int = 6,
+) -> list[dict[str, Any]]:
+    tokens = set(query_tokens(query))
+    selected: list[dict[str, Any]] = []
+    for item in assistant_context:
+        item_conversation_id = str(item.get("conversation_id") or "")
+        content = str(item.get("content") or "")
+        content_tokens = set(query_tokens(content))
+        same_conversation = bool(conversation_id and item_conversation_id == str(conversation_id))
+        is_user_correction = any(marker in content for marker in ["不是", "别提醒", "不用提醒", "以后", "记住", "纠正"])
+        overlaps = bool(tokens and tokens.intersection(content_tokens))
+        if same_conversation or overlaps or is_user_correction:
+            selected.append(item)
+        if len(selected) >= limit:
+            break
+    return selected
+
+
+def collect_context_ids(items: list[dict[str, Any]]) -> list[str]:
+    ids: list[str] = []
+    for item in items:
+        event_id = item.get("event_id")
+        if event_id:
+            ids.append(str(event_id))
+        for source_id in item.get("source_event_ids") or []:
+            ids.append(str(source_id))
+    return list(dict.fromkeys(ids))
+
+
+def build_context_pack(
+    message: str,
+    base_context: list[dict[str, Any]],
+    assistant_context: Optional[list[dict[str, Any]]] = None,
+    conversation_id: Optional[str] = None,
+    max_dialogue_items: int = 6,
+) -> dict[str, Any]:
+    assistant_context = assistant_context or []
+    selected_dialogue = relevant_assistant_dialogue_items(
+        message,
+        assistant_context,
+        conversation_id=conversation_id,
+        limit=max_dialogue_items,
+    )
+    included_event_ids = collect_context_ids(selected_dialogue) + collect_context_ids(base_context)
+    included_event_ids = list(dict.fromkeys(included_event_ids))
+    return {
+        "query": message,
+        "conversation_id": conversation_id,
+        "memory_context": base_context,
+        "assistant_dialogue": selected_dialogue,
+        "included_event_ids": included_event_ids,
+        "included_memory_ids": [],
+        "included_agenda_ids": [],
+        "reason": "bounded context pack: active conversation, relevant assistant dialogue, scoped memory, and source ids",
+    }
+
+
+def retrieve_assistant_dialogue_context(
+    query: str,
+    conversation_id: Optional[str] = None,
+    limit: int = 8,
+) -> list[dict[str, Any]]:
+    patterns = token_patterns(query, max_tokens=4)
+    conditions = []
+    params: list[Any] = []
+    if conversation_id:
+        try:
+            conversation_uuid = uuid.UUID(str(conversation_id))
+            conditions.append("t.conversation_id = %s")
+            params.append(conversation_uuid)
+        except ValueError:
+            pass
+    for pattern in patterns:
+        conditions.append("t.content ILIKE %s")
+        params.append(pattern)
+    where = f"WHERE {' OR '.join(conditions)}" if conditions else ""
+    try:
+        with db() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT t.event_id, t.conversation_id, t.role, t.content, t.created_at, e.raw_data
+                FROM assistant_turns t
+                LEFT JOIN events e ON e.event_id = t.event_id
+                {where}
+                ORDER BY t.created_at DESC
+                LIMIT %s
+                """,
+                (*params, limit),
+            ).fetchall()
+    except psycopg.Error:
+        return []
+    return [
+        {
+            "layer": "assistant_dialogue",
+            "event_id": str(row[0]),
+            "conversation_id": str(row[1]),
+            "role": row[2],
+            "content": row[3],
+            "created_at": row[4].isoformat() if hasattr(row[4], "isoformat") else row[4],
+            "raw_data": row[5] or {},
+        }
+        for row in rows
+    ]
+
+
+def transient_assistant_turn(role: str, conversation_id: Optional[str] = None) -> dict[str, str]:
+    conversation_uuid = parse_uuid_or_new(conversation_id)
+    return {
+        "conversation_id": str(conversation_uuid),
+        "turn_id": str(uuid.uuid4()),
+        "event_id": str(uuid.uuid4()),
+        "role": role,
+        "persisted": "false",
+    }
+
+
+def persist_context_snapshot(
+    conn: psycopg.Connection,
+    event_id: str,
+    context_type: str,
+    context_pack: dict[str, Any],
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO context_snapshots
+          (id, event_id, context_type, included_event_ids, included_memory_ids, included_agenda_ids, reason, payload)
+        VALUES (%s, %s, %s, %s::TEXT[], %s::TEXT[], %s::TEXT[], %s, %s)
+        """,
+        (
+            uuid.uuid4(),
+            event_id,
+            context_type,
+            [str(item) for item in context_pack.get("included_event_ids") or []],
+            [str(item) for item in context_pack.get("included_memory_ids") or []],
+            [str(item) for item in context_pack.get("included_agenda_ids") or []],
+            str(context_pack.get("reason") or ""),
+            json.dumps(context_pack, ensure_ascii=False, default=str),
+        ),
+    )
+
+
 def retrieve_context(query: str, limit: int) -> list[dict[str, Any]]:
     pattern = f"%{query}%"
     graph_pattern = normalize_retrieval_pattern(query)
@@ -1918,13 +2228,55 @@ def retrieve_context(query: str, limit: int) -> list[dict[str, Any]]:
 @app.post("/api/chat")
 async def chat(body: ChatIn, x_par_password: Optional[str] = Header(default=None)) -> dict[str, Any]:
     require_password(x_par_password)
+    redis_obj = redis_client()
+    with db() as conn:
+        user_turn = persist_assistant_turn(
+            conn,
+            redis_obj,
+            role="user",
+            content=body.message,
+            conversation_id=body.conversation_id,
+            client_type=body.client_type,
+        )
     context = retrieve_context(body.message, body.limit)
-    messages = build_chat_messages(body.message, context)
+    assistant_context = retrieve_assistant_dialogue_context(
+        body.message,
+        conversation_id=user_turn["conversation_id"],
+        limit=8,
+    )
+    context_pack = build_context_pack(
+        body.message,
+        context,
+        assistant_context=assistant_context,
+        conversation_id=user_turn["conversation_id"],
+    )
+    with db() as conn:
+        persist_context_snapshot(conn, user_turn["event_id"], "chat_response", context_pack)
+    messages = build_chat_messages(body.message, context_pack)
     answer = await QwenClient(MODEL_BASE_URL, MODEL_NAME).chat(messages)
-    return {"answer": answer, "sources": decorate_context_sources(context)}
+    with db() as conn:
+        persist_assistant_turn(
+            conn,
+            redis_obj,
+            role="assistant",
+            content=answer,
+            conversation_id=user_turn["conversation_id"],
+            client_type=body.client_type,
+        )
+    return {
+        "answer": answer,
+        "sources": decorate_context_sources(context),
+        "conversation_id": user_turn["conversation_id"],
+        "context_pack": {
+            "included_event_ids": context_pack["included_event_ids"],
+            "assistant_dialogue_count": len(context_pack["assistant_dialogue"]),
+            "memory_context_count": len(context_pack["memory_context"]),
+            "reason": context_pack["reason"],
+        },
+    }
 
 
-def build_chat_messages(message: str, context: list[dict[str, Any]]) -> list[dict[str, str]]:
+def build_chat_messages(message: str, context: list[dict[str, Any]] | dict[str, Any]) -> list[dict[str, str]]:
     context_text = json.dumps(context, ensure_ascii=False, default=str)
     return [
         {
@@ -1934,6 +2286,7 @@ def build_chat_messages(message: str, context: list[dict[str, Any]]) -> list[dic
                 "如果证据不足，明确说明不确定。不要编造私人事实。回答要简洁、可执行。"
                 "当用户要回复某个联系人、发消息或写邮件时，不能泄露第三方私下评价、抱怨、负面观点或敏感信息。"
                 "如果某条上下文只适合用户私下分析，不要把它写进对外回复草稿。"
+                "上下文可能包含 bounded context pack；优先使用相关的 Nomi 对话纠正、用户偏好和当前任务，但不要使用无关对话。"
             ),
         },
         {
@@ -1954,7 +2307,13 @@ async def websocket_realtime(websocket: WebSocket, password: Optional[str] = Non
         while True:
             data = await websocket.receive_json()
             if data.get("type") == "chat_message":
-                await stream_chat_to_websocket(websocket, str(data.get("message") or ""), int(data.get("limit") or 12))
+                await stream_chat_to_websocket(
+                    websocket,
+                    str(data.get("message") or ""),
+                    int(data.get("limit") or 12),
+                    conversation_id=data.get("conversation_id"),
+                    client_type=str(data.get("client_type") or "realtime"),
+                )
             elif data.get("type") == "ping":
                 await websocket.send_json({"type": "pong"})
             else:
@@ -1986,23 +2345,69 @@ async def redis_realtime_listener(websocket: WebSocket) -> None:
         await client.close()
 
 
-async def stream_chat_to_websocket(websocket: WebSocket, message: str, limit: int) -> None:
+async def stream_chat_to_websocket(
+    websocket: WebSocket,
+    message: str,
+    limit: int,
+    conversation_id: Optional[str] = None,
+    client_type: str = "realtime",
+) -> None:
     if not message.strip():
         await websocket.send_json({"type": "error", "message": "message is required"})
         return
+    redis_obj = redis_client()
+    try:
+        with db() as conn:
+            user_turn = persist_assistant_turn(
+                conn,
+                redis_obj,
+                role="user",
+                content=message,
+                conversation_id=conversation_id,
+                client_type=client_type,
+            )
+    except psycopg.Error:
+        user_turn = transient_assistant_turn("user", conversation_id)
     context = retrieve_context(message, max(1, min(limit, 30)))
-    messages = build_chat_messages(message, context)
+    assistant_context = retrieve_assistant_dialogue_context(message, conversation_id=user_turn["conversation_id"], limit=8)
+    context_pack = build_context_pack(message, context, assistant_context=assistant_context, conversation_id=user_turn["conversation_id"])
+    try:
+        with db() as conn:
+            persist_context_snapshot(conn, user_turn["event_id"], "websocket_chat_response", context_pack)
+    except psycopg.Error:
+        pass
+    messages = build_chat_messages(message, context_pack)
     answer_parts: list[str] = []
     async for delta in QwenClient(MODEL_BASE_URL, MODEL_NAME).stream_chat(messages):
         if not delta:
             continue
         answer_parts.append(delta)
         await websocket.send_json({"type": "chat_delta", "delta": delta})
+    answer = "".join(answer_parts)
+    try:
+        with db() as conn:
+            persist_assistant_turn(
+                conn,
+                redis_obj,
+                role="assistant",
+                content=answer,
+                conversation_id=user_turn["conversation_id"],
+                client_type=client_type,
+            )
+    except psycopg.Error:
+        pass
     await websocket.send_json(
         {
             "type": "chat_done",
-            "answer": "".join(answer_parts),
+            "answer": answer,
+            "conversation_id": user_turn["conversation_id"],
             "sources": decorate_context_sources(context),
+            "context_pack": {
+                "included_event_ids": context_pack["included_event_ids"],
+                "assistant_dialogue_count": len(context_pack["assistant_dialogue"]),
+                "memory_context_count": len(context_pack["memory_context"]),
+                "reason": context_pack["reason"],
+            },
         }
     )
 
@@ -2252,6 +2657,7 @@ def filter_open_suggestions(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 def suggestion_to_realtime_message(item: dict[str, Any]) -> dict[str, Any]:
     metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
+    actions = metadata.get("actions") if isinstance(metadata.get("actions"), list) else []
     return {
         "type": "proactive_message",
         "id": str(item.get("id", "")),
@@ -2262,6 +2668,7 @@ def suggestion_to_realtime_message(item: dict[str, Any]) -> dict[str, Any]:
         "priority": item.get("priority", 0),
         "source": metadata.get("source") or metadata.get("collector") or "unknown",
         "metadata": metadata,
+        "actions": actions,
         "created_at": item.get("created_at"),
         "open_view": "chat",
     }
