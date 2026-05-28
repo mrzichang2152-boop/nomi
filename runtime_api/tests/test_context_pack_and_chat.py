@@ -209,3 +209,62 @@ def test_chat_endpoint_persists_turns_uses_context_pack_and_returns_trace(monkey
     assert persisted_turns[0]["content"] == "那就周日吧"
     assert snapshots == [("event-user", "chat_response", ["event-user"])]
 
+
+def test_chat_messages_alias_uses_same_chat_pipeline(monkeypatch):
+    monkeypatch.setenv("APP_PASSWORD", "secret")
+    from app import main
+
+    def fake_persist_turn(conn, redis_client, role, content, conversation_id=None, client_type="web", **kwargs):
+        return {
+            "conversation_id": conversation_id or "conv-alias",
+            "turn_id": f"turn-{role}",
+            "event_id": f"event-{role}",
+        }
+
+    def fake_context_pack(message, base_context, assistant_context=None, conversation_id=None, **kwargs):
+        return {
+            "query": message,
+            "memory_context": base_context,
+            "assistant_dialogue": [],
+            "agenda_context": [],
+            "included_event_ids": ["event-user"],
+            "included_agenda_ids": [],
+            "reason": "bounded context pack: alias route",
+        }
+
+    class FakeQwen:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def chat(self, messages):
+            assert "alias route" in messages[1]["content"]
+            return "别名路由也走同一个对话管线。"
+
+    class Conn:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return None
+
+    monkeypatch.setattr(main, "db", lambda: Conn())
+    monkeypatch.setattr(main, "redis_client", lambda: object())
+    monkeypatch.setattr(main, "retrieve_context", lambda message, limit: [])
+    monkeypatch.setattr(main, "retrieve_assistant_dialogue_context", lambda *args, **kwargs: [])
+    monkeypatch.setattr(main, "retrieve_active_agenda_context", lambda *args, **kwargs: [])
+    monkeypatch.setattr(main, "persist_assistant_turn", fake_persist_turn, raising=False)
+    monkeypatch.setattr(main, "build_context_pack", fake_context_pack, raising=False)
+    monkeypatch.setattr(main, "persist_context_snapshot", lambda *args, **kwargs: None, raising=False)
+    monkeypatch.setattr(main, "QwenClient", FakeQwen)
+
+    response = TestClient(main.app).post(
+        "/api/chat/messages",
+        headers={"x-par-password": "secret"},
+        json={"message": "走兼容消息接口", "conversation_id": "conv-alias"},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["conversation_id"] == "conv-alias"
+    assert body["answer"] == "别名路由也走同一个对话管线。"
+    assert body["context_pack"]["included_event_ids"] == ["event-user"]

@@ -1,3 +1,4 @@
+import json
 import os
 import sys
 from pathlib import Path
@@ -6,6 +7,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 os.environ.setdefault("DATABASE_URL", "postgresql://test")
 os.environ.setdefault("REDIS_URL", "redis://test")
+os.environ.setdefault("AGENDA_MODEL_ENABLED", "0")
 
 
 def test_persist_semantics_skips_memory_and_timeline_when_event_already_processed():
@@ -106,6 +108,72 @@ def test_rule_extract_semantics_marks_nomi_user_instruction_and_feedback():
     assert feedback["importance"] >= 0.8
 
 
+def test_extract_semantics_merges_model_and_rule_event_labels(monkeypatch):
+    from app import worker
+
+    monkeypatch.setattr(
+        worker,
+        "call_model",
+        lambda messages: """
+        {
+          "intent": "social_plan",
+          "entities": {
+            "source": "whatsapp",
+            "labels": ["appointment", "travel"],
+            "primary_label": "appointment",
+            "actors": ["Alex"],
+            "place_expressions": ["武康路"]
+          },
+          "importance": 0.88,
+          "summary": "Alex 约用户周末去武康路见面。"
+        }
+        """,
+    )
+
+    semantic = worker.extract_semantics(
+        "whatsapp",
+        "whatsapp_message",
+        {"chat_name": "Alex", "sender": "Alex", "message": "周末去武康路见吧"},
+    )
+
+    assert semantic["intent"] == "social_plan"
+    assert semantic["entities"]["primary_label"] == "appointment"
+    assert "appointment" in semantic["entities"]["labels"]
+    assert "travel" in semantic["entities"]["labels"]
+    assert semantic["entities"]["classification_trace"]["parser_mode"] == "hybrid_model_rules"
+    assert "appointment" in semantic["entities"]["classification_trace"]["rule_labels"]
+
+
+def test_extract_semantics_keeps_rule_payment_label_when_model_misses_it(monkeypatch):
+    from app import worker
+
+    monkeypatch.setattr(
+        worker,
+        "call_model",
+        lambda messages: """
+        {
+          "intent": "generic_event",
+          "entities": {"source": "gmail", "labels": ["ordinary_chat"], "primary_label": "ordinary_chat"},
+          "importance": 0.4,
+          "summary": "一封普通邮件。"
+        }
+        """,
+    )
+
+    semantic = worker.extract_semantics(
+        "gmail",
+        "gmail_thread_snapshot",
+        {"subject": "Invoice due", "body": "云服务器账单需要在明天前付款"},
+    )
+
+    assert semantic["intent"] == "payment_reminder"
+    assert semantic["entities"]["primary_label"] == "payment"
+    assert "payment" in semantic["entities"]["labels"]
+    assert "ordinary_chat" not in semantic["entities"]["labels"]
+    assert "付款" in semantic["summary"]
+    assert "rule_overrode_low_value_model_label" in semantic["entities"]["classification_trace"]["validation_warnings"]
+
+
 def test_agenda_candidate_for_fuzzy_social_plan_has_missing_exact_time_and_place():
     from app.worker import agenda_candidate_from_semantic
 
@@ -130,6 +198,30 @@ def test_agenda_candidate_for_fuzzy_social_plan_has_missing_exact_time_and_place
     assert candidate["needs_clarification"] is True
     assert candidate["participants"] == ["Alex"]
     assert candidate["source_event_ids"] == ["11111111-1111-1111-1111-111111111111"]
+
+
+def test_agenda_candidate_for_exact_meeting_has_no_missing_fields():
+    from app.worker import agenda_candidate_from_semantic
+
+    candidate = agenda_candidate_from_semantic(
+        "11111111-1111-1111-1111-111111111111",
+        "2026-05-28T09:00:00+00:00",
+        {
+            "intent": "social_plan",
+            "summary": "Alex 约我今晚 7点在武康路见面。",
+            "importance": 0.9,
+            "entities": {"source": "whatsapp", "event_type": "whatsapp_message"},
+            "raw_data": {"chat_name": "Alex", "sender": "Alex", "message": "今晚 7点在武康路见面吧"},
+        },
+    )
+
+    assert candidate is not None
+    assert candidate["type"] == "appointment"
+    assert candidate["certainty"] == "exact"
+    assert candidate["place"] == "武康路"
+    assert candidate["missing_fields"] == []
+    assert candidate["needs_clarification"] is False
+    assert candidate["time_window"]["has_exact_time"] is True
 
 
 def test_agenda_dedupe_key_links_reschedule_to_original_conversation():
@@ -164,6 +256,125 @@ def test_agenda_dedupe_key_links_reschedule_to_original_conversation():
     assert reschedule["metadata"]["dedupe_key"] == original["metadata"]["dedupe_key"]
 
 
+def test_hybrid_agenda_uses_valid_model_candidate_with_rule_safety(monkeypatch):
+    from app import worker
+
+    monkeypatch.setenv("AGENDA_MODEL_ENABLED", "1")
+
+    def fake_model(messages):
+        return """
+        {
+          "is_agenda": true,
+          "type": "appointment",
+          "operation": "create",
+          "title": "周日和 Alex 去武康路见面",
+          "certainty": "fuzzy",
+          "time_window": {"raw_text": "周日"},
+          "place": "武康路",
+          "participants": ["Alex"],
+          "missing_fields": ["exact_time"],
+          "needs_clarification": true,
+          "confidence": 0.91,
+          "reason": "对话明确提到周日见面和武康路，但没有精确时间。"
+        }
+        """
+
+    monkeypatch.setattr(worker, "call_model", fake_model)
+    candidate = worker.hybrid_agenda_candidate_from_semantic(
+        "11111111-1111-1111-1111-111111111111",
+        "2026-05-28T09:00:00+00:00",
+        {
+            "intent": "social_plan",
+            "summary": "Alex 说周日去武康路见。",
+            "importance": 0.82,
+            "entities": {"source": "whatsapp", "event_type": "whatsapp_message"},
+            "raw_data": {"chat_name": "Alex", "chat_id": "wa-alex", "sender": "Alex", "message": "周日去武康路见吧"},
+        },
+    )
+
+    assert candidate is not None
+    assert candidate["title"] == "周日和 Alex 去武康路见面"
+    assert candidate["place"] == "武康路"
+    assert candidate["participants"] == ["Alex"]
+    assert candidate["certainty"] == "fuzzy"
+    assert candidate["missing_fields"] == ["exact_time"]
+    assert candidate["needs_clarification"] is True
+    assert candidate["metadata"]["parser_mode"] == "hybrid_model_rules"
+    assert candidate["metadata"]["model_candidate"]["confidence"] == 0.91
+    assert candidate["metadata"]["rule_candidate"]["type"] == "appointment"
+
+
+def test_hybrid_agenda_rejects_model_invented_exact_time(monkeypatch):
+    from app import worker
+
+    monkeypatch.setenv("AGENDA_MODEL_ENABLED", "1")
+
+    def fake_model(messages):
+        return """
+        {
+          "is_agenda": true,
+          "type": "appointment",
+          "operation": "create",
+          "title": "周末和 Alex 晚上八点见面",
+          "certainty": "exact",
+          "time_window": {"raw_text": "周六晚上八点", "start": "2026-05-30T20:00:00+08:00"},
+          "place": "武康路",
+          "participants": ["Alex"],
+          "missing_fields": [],
+          "needs_clarification": false,
+          "confidence": 0.94,
+          "reason": "模型猜测了晚上八点。"
+        }
+        """
+
+    monkeypatch.setattr(worker, "call_model", fake_model)
+    candidate = worker.hybrid_agenda_candidate_from_semantic(
+        "11111111-1111-1111-1111-111111111111",
+        "2026-05-28T09:00:00+00:00",
+        {
+            "intent": "social_plan",
+            "summary": "Alex 说周末去武康路见。",
+            "importance": 0.82,
+            "entities": {"source": "whatsapp", "event_type": "whatsapp_message"},
+            "raw_data": {"chat_name": "Alex", "sender": "Alex", "message": "周末去武康路见吧"},
+        },
+    )
+
+    assert candidate is not None
+    assert candidate["certainty"] == "fuzzy"
+    assert candidate["title"] == "Alex 说周末去武康路见。"
+    assert candidate["time_window"]["raw_text"] == "Alex 说周末去武康路见。\n周末去武康路见吧"
+    assert "exact_time" in candidate["missing_fields"]
+    assert candidate["confidence"] == 0.82
+    assert candidate["needs_clarification"] is True
+    assert candidate["metadata"]["parser_mode"] == "hybrid_model_rules"
+    assert "unsupported_exact_time" in candidate["metadata"]["validation_warnings"]
+    assert "unsupported_title_detail" in candidate["metadata"]["validation_warnings"]
+
+
+def test_hybrid_agenda_falls_back_to_rules_when_model_is_invalid(monkeypatch):
+    from app import worker
+
+    monkeypatch.setenv("AGENDA_MODEL_ENABLED", "1")
+    monkeypatch.setattr(worker, "call_model", lambda messages: "not json")
+    candidate = worker.hybrid_agenda_candidate_from_semantic(
+        "11111111-1111-1111-1111-111111111111",
+        "2026-05-28T09:00:00+00:00",
+        {
+            "intent": "social_plan",
+            "summary": "Alex 说那就周日见。",
+            "importance": 0.82,
+            "entities": {"source": "whatsapp", "event_type": "whatsapp_message"},
+            "raw_data": {"chat_name": "Alex", "sender": "Alex", "message": "那就周日吧"},
+        },
+    )
+
+    assert candidate is not None
+    assert candidate["title"] == "Alex 说那就周日见。"
+    assert candidate["metadata"]["parser_mode"] == "rules_fallback"
+    assert candidate["metadata"]["validation_warnings"]
+
+
 def test_persist_agenda_writes_item_and_version_with_reason():
     from app.worker import persist_agenda
 
@@ -182,7 +393,7 @@ def test_persist_agenda_writes_item_and_version_with_reason():
         def execute(self, sql, params=()):
             executed.append((sql, params))
             normalized = " ".join(sql.split())
-            if "SELECT id FROM agenda_items" in normalized:
+            if "FROM agenda_items WHERE metadata->>'dedupe_key'" in normalized:
                 return Cursor()
             if "INSERT INTO agenda_items" in normalized:
                 return Cursor([("22222222-2222-2222-2222-222222222222",)])
@@ -213,6 +424,72 @@ def test_persist_agenda_writes_item_and_version_with_reason():
     assert "INSERT INTO agenda_item_versions" in version_sql
     assert version_params[2] == "create"
     assert "Alex 说那就周日见" in version_params[5]
+
+
+def test_persist_agenda_version_records_previous_value_when_updating_existing_item():
+    from app.worker import persist_agenda
+
+    executed = []
+
+    class Cursor:
+        rowcount = 1
+
+        def __init__(self, rows=None):
+            self.rows = rows or []
+
+        def fetchone(self):
+            return self.rows[0] if self.rows else None
+
+    class Conn:
+        def execute(self, sql, params=()):
+            executed.append((sql, params))
+            normalized = " ".join(sql.split())
+            if "FROM agenda_items WHERE metadata->>'dedupe_key'" in normalized:
+                return Cursor(
+                    [
+                        (
+                            "22222222-2222-2222-2222-222222222222",
+                            "appointment",
+                            "Alex 说那就周日见。",
+                            "scheduled",
+                            "fuzzy",
+                            {"raw_text": "那就周日吧", "has_exact_time": False, "has_fuzzy_time": True},
+                            "",
+                            ["Alex"],
+                            ["exact_time", "exact_place"],
+                            True,
+                            0.82,
+                            ["77777777-7777-7777-7777-777777777777"],
+                            {"dedupe_key": "agenda:appointment:whatsapp:wa alex"},
+                        )
+                    ]
+                )
+            return Cursor()
+
+    persist_agenda(
+        Conn(),
+        "11111111-1111-1111-1111-111111111111",
+        "2026-05-28T10:00:00+00:00",
+        {
+            "intent": "social_plan",
+            "summary": "Alex 把见面改到周六。",
+            "importance": 0.86,
+            "entities": {"source": "whatsapp", "event_type": "whatsapp_message"},
+            "raw_data": {"chat_name": "Alex", "chat_id": "wa-alex", "sender": "Alex", "message": "改到周六吧"},
+        },
+    )
+
+    version_sql, version_params = next(item for item in executed if "INSERT INTO agenda_item_versions" in item[0])
+    previous_value = json.loads(version_params[3])
+    new_value = json.loads(version_params[4])
+    assert "INSERT INTO agenda_item_versions" in version_sql
+    assert version_params[2] == "reschedule"
+    assert previous_value["title"] == "Alex 说那就周日见。"
+    assert previous_value["certainty"] == "fuzzy"
+    assert previous_value["missing_fields"] == ["exact_time", "exact_place"]
+    assert previous_value["source_event_ids"] == ["77777777-7777-7777-7777-777777777777"]
+    assert new_value["title"] == "Alex 把见面改到周六。"
+    assert new_value["source_event_ids"] == ["11111111-1111-1111-1111-111111111111"]
 
 
 def test_suggestion_for_social_plan_includes_route_ride_and_snooze_actions():

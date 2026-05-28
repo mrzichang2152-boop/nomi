@@ -91,6 +91,28 @@ CREATE TABLE IF NOT EXISTS proactive_suggestions (
   updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+CREATE TABLE IF NOT EXISTS proactive_candidates (
+  id UUID PRIMARY KEY,
+  candidate_type TEXT NOT NULL,
+  agenda_item_id UUID,
+  event_ids UUID[] NOT NULL DEFAULT ARRAY[]::UUID[],
+  scores JSONB NOT NULL DEFAULT '{}'::jsonb,
+  decision TEXT NOT NULL DEFAULT 'pending',
+  cooldown_key TEXT,
+  metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS user_feedback (
+  id UUID PRIMARY KEY,
+  suggestion_id UUID,
+  action TEXT NOT NULL,
+  rating DOUBLE PRECISION,
+  reason TEXT NOT NULL DEFAULT '',
+  metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
 CREATE TABLE IF NOT EXISTS assistant_conversations (
   id UUID PRIMARY KEY,
   client_type TEXT NOT NULL DEFAULT 'web',
@@ -204,6 +226,273 @@ CREATE TABLE IF NOT EXISTS memory_audit_log (
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+CREATE TABLE IF NOT EXISTS task_route_traces (
+  id UUID PRIMARY KEY,
+  request TEXT NOT NULL,
+  route_type TEXT NOT NULL,
+  capability_id TEXT NOT NULL,
+  pipeline_id TEXT,
+  risk_permission TEXT NOT NULL,
+  confirmation_required BOOLEAN NOT NULL DEFAULT FALSE,
+  task_route_decision JSONB NOT NULL DEFAULT '{}'::jsonb,
+  openclaw_task_packet JSONB,
+  clarification JSONB,
+  context_summary JSONB NOT NULL DEFAULT '{}'::jsonb,
+  source_event_ids TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[],
+  conversation_id TEXT,
+  suggestion_id TEXT,
+  agenda_item_ids TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[],
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS pipeline_execution_results (
+  id UUID PRIMARY KEY,
+  task_trace_id TEXT,
+  request TEXT NOT NULL,
+  route_type TEXT NOT NULL,
+  capability_id TEXT,
+  pipeline_id TEXT,
+  status TEXT NOT NULL,
+  required_slots TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[],
+  resolved_slots JSONB NOT NULL DEFAULT '{}'::jsonb,
+  missing_slots TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[],
+  risk JSONB NOT NULL DEFAULT '{}'::jsonb,
+  execution_guard JSONB NOT NULL DEFAULT '{}'::jsonb,
+  source_event_ids TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[],
+  conversation_id TEXT,
+  suggestion_id TEXT,
+  agenda_item_ids TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[],
+  result JSONB NOT NULL DEFAULT '{}'::jsonb,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS pipeline_writeback_events (
+  id UUID PRIMARY KEY,
+  pipeline_execution_id TEXT,
+  task_trace_id TEXT,
+  pipeline_id TEXT,
+  target TEXT NOT NULL,
+  operation TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL,
+  payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+  error TEXT NOT NULL DEFAULT '',
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS event_quarantine (
+  id UUID PRIMARY KEY,
+  event_id TEXT,
+  dedupe_key TEXT,
+  source TEXT NOT NULL DEFAULT '',
+  event_type TEXT NOT NULL DEFAULT '',
+  event_timestamp TEXT,
+  schema_errors TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[],
+  raw_event JSONB NOT NULL DEFAULT '{}'::jsonb,
+  summary TEXT NOT NULL DEFAULT '',
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS duplicate_skip (
+  id UUID PRIMARY KEY,
+  event_id TEXT,
+  dedupe_key TEXT,
+  duplicate_of TEXT,
+  source TEXT NOT NULL DEFAULT '',
+  event_type TEXT NOT NULL DEFAULT '',
+  payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS memory_items (
+  id TEXT PRIMARY KEY,
+  source_event_id TEXT,
+  scope JSONB NOT NULL DEFAULT '{}'::jsonb,
+  payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS knowledge_entities (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL DEFAULT '',
+  scope JSONB NOT NULL DEFAULT '{}'::jsonb,
+  payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS knowledge_edges (
+  id UUID PRIMARY KEY,
+  source_id TEXT NOT NULL DEFAULT '',
+  target_id TEXT NOT NULL DEFAULT '',
+  relation_type TEXT NOT NULL DEFAULT '',
+  scope JSONB NOT NULL DEFAULT '{}'::jsonb,
+  payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS memory_vector_retries (
+  id UUID PRIMARY KEY,
+  source_event_id TEXT,
+  chunk_id TEXT,
+  reason TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'queued',
+  payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS context_snapshot_plans (
+  id UUID PRIMARY KEY,
+  request_or_event_id TEXT NOT NULL DEFAULT '',
+  current_scope JSONB NOT NULL DEFAULT '{}'::jsonb,
+  payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS internal_todos (
+  id UUID PRIMARY KEY,
+  task_title TEXT NOT NULL DEFAULT '',
+  owner TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'open',
+  due_window JSONB NOT NULL DEFAULT '{}'::jsonb,
+  source_event_ids TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[],
+  payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS internal_reminders (
+  id UUID PRIMARY KEY,
+  status TEXT NOT NULL DEFAULT 'planned_internal',
+  due_window JSONB NOT NULL DEFAULT '{}'::jsonb,
+  source_event_ids TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[],
+  payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS provider_call_traces (
+  id UUID PRIMARY KEY,
+  task_id TEXT NOT NULL DEFAULT '',
+  provider TEXT NOT NULL DEFAULT '',
+  action TEXT NOT NULL DEFAULT '',
+  call_status TEXT NOT NULL DEFAULT '',
+  payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS confirmation_ledger (
+  id UUID PRIMARY KEY,
+  task_id TEXT NOT NULL DEFAULT '',
+  kind TEXT NOT NULL DEFAULT '',
+  confirm_action TEXT NOT NULL DEFAULT '',
+  final_user_confirmation BOOLEAN NOT NULL DEFAULT FALSE,
+  status TEXT NOT NULL DEFAULT 'required',
+  payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS pipeline_health_metrics (
+  id UUID PRIMARY KEY,
+  pipeline_id TEXT,
+  status TEXT NOT NULL DEFAULT '',
+  applied_count INTEGER NOT NULL DEFAULT 0,
+  failed_count INTEGER NOT NULL DEFAULT 0,
+  skipped_count INTEGER NOT NULL DEFAULT 0,
+  payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS search_audit (
+  id UUID PRIMARY KEY,
+  pipeline_id TEXT NOT NULL DEFAULT '',
+  query TEXT NOT NULL DEFAULT '',
+  scope TEXT NOT NULL DEFAULT '',
+  result_count INTEGER NOT NULL DEFAULT 0,
+  payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS account_connections (
+  provider TEXT PRIMARY KEY,
+  status TEXT NOT NULL DEFAULT 'not_connected',
+  metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS composio_sessions (
+  id UUID PRIMARY KEY,
+  user_id TEXT NOT NULL,
+  session_kind TEXT NOT NULL,
+  session_id TEXT NOT NULL UNIQUE,
+  mcp_url TEXT NOT NULL DEFAULT '',
+  mcp_headers JSONB NOT NULL DEFAULT '{}'::jsonb,
+  enabled_toolkits TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[],
+  tags JSONB NOT NULL DEFAULT '{}'::jsonb,
+  status TEXT NOT NULL DEFAULT 'active',
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS composio_connect_requests (
+  id UUID PRIMARY KEY,
+  user_id TEXT NOT NULL,
+  toolkit_slug TEXT NOT NULL,
+  session_kind TEXT NOT NULL,
+  session_id TEXT NOT NULL DEFAULT '',
+  connection_request_id TEXT NOT NULL DEFAULT '',
+  redirect_url TEXT NOT NULL DEFAULT '',
+  connected_account_id TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'link_created',
+  expires_at TIMESTAMPTZ,
+  metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS composio_toolkits (
+  slug TEXT NOT NULL,
+  session_kind TEXT NOT NULL,
+  name TEXT NOT NULL DEFAULT '',
+  logo TEXT NOT NULL DEFAULT '',
+  is_connected BOOLEAN NOT NULL DEFAULT FALSE,
+  connected_account_id TEXT NOT NULL DEFAULT '',
+  session_id TEXT NOT NULL DEFAULT '',
+  raw JSONB NOT NULL DEFAULT '{}'::jsonb,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (slug, session_kind)
+);
+
+CREATE TABLE IF NOT EXISTS composio_tool_invocations (
+  id UUID PRIMARY KEY,
+  task_trace_id TEXT,
+  toolkit_slug TEXT NOT NULL DEFAULT '',
+  tool_slug TEXT NOT NULL DEFAULT '',
+  session_kind TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT '',
+  request JSONB NOT NULL DEFAULT '{}'::jsonb,
+  response JSONB NOT NULL DEFAULT '{}'::jsonb,
+  error TEXT NOT NULL DEFAULT '',
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS composio_triggers (
+  id UUID PRIMARY KEY,
+  trigger_id TEXT NOT NULL DEFAULT '',
+  trigger_slug TEXT NOT NULL DEFAULT '',
+  toolkit_slug TEXT NOT NULL DEFAULT '',
+  user_id TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT '',
+  config JSONB NOT NULL DEFAULT '{}'::jsonb,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS route_cache (
+  id UUID PRIMARY KEY,
+  origin TEXT NOT NULL DEFAULT '',
+  destination TEXT NOT NULL DEFAULT '',
+  mode TEXT NOT NULL DEFAULT '',
+  payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
 CREATE INDEX IF NOT EXISTS events_source_idx ON events(source);
 CREATE INDEX IF NOT EXISTS events_type_idx ON events(event_type);
 CREATE INDEX IF NOT EXISTS events_timestamp_idx ON events(timestamp DESC);
@@ -214,6 +503,8 @@ CREATE INDEX IF NOT EXISTS facts_subject_idx ON facts(subject);
 CREATE INDEX IF NOT EXISTS memory_states_updated_idx ON memory_states(updated_at DESC);
 CREATE INDEX IF NOT EXISTS memory_vectors_embedding_idx ON memory_vectors USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100);
 CREATE INDEX IF NOT EXISTS proactive_suggestions_status_idx ON proactive_suggestions(status, priority DESC);
+CREATE INDEX IF NOT EXISTS proactive_candidates_decision_idx ON proactive_candidates(decision, created_at DESC);
+CREATE INDEX IF NOT EXISTS user_feedback_suggestion_idx ON user_feedback(suggestion_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS assistant_turns_conversation_idx ON assistant_turns(conversation_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS assistant_turns_event_idx ON assistant_turns(event_id);
 CREATE INDEX IF NOT EXISTS context_snapshots_event_idx ON context_snapshots(event_id, created_at DESC);
@@ -221,3 +512,28 @@ CREATE INDEX IF NOT EXISTS agenda_items_status_idx ON agenda_items(status, updat
 CREATE INDEX IF NOT EXISTS agenda_items_metadata_dedupe_idx ON agenda_items ((metadata->>'dedupe_key'));
 CREATE INDEX IF NOT EXISTS collector_settings_enabled_idx ON collector_settings(enabled, paused_until);
 CREATE INDEX IF NOT EXISTS memory_audit_log_target_idx ON memory_audit_log(target_type, target_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS task_route_traces_created_idx ON task_route_traces(created_at DESC);
+CREATE INDEX IF NOT EXISTS task_route_traces_route_idx ON task_route_traces(route_type, capability_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS task_route_traces_source_event_idx ON task_route_traces USING GIN(source_event_ids);
+CREATE INDEX IF NOT EXISTS task_route_traces_conversation_idx ON task_route_traces(conversation_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS pipeline_execution_results_trace_idx ON pipeline_execution_results(task_trace_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS pipeline_execution_results_source_event_idx ON pipeline_execution_results USING GIN(source_event_ids);
+CREATE INDEX IF NOT EXISTS pipeline_execution_results_conversation_idx ON pipeline_execution_results(conversation_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS pipeline_writeback_events_trace_idx ON pipeline_writeback_events(task_trace_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS pipeline_writeback_events_target_idx ON pipeline_writeback_events(target, status, created_at DESC);
+CREATE INDEX IF NOT EXISTS event_quarantine_source_idx ON event_quarantine(source, event_type, created_at DESC);
+CREATE INDEX IF NOT EXISTS duplicate_skip_dedupe_idx ON duplicate_skip(dedupe_key, created_at DESC);
+CREATE INDEX IF NOT EXISTS memory_items_source_event_idx ON memory_items(source_event_id);
+CREATE INDEX IF NOT EXISTS knowledge_entities_name_idx ON knowledge_entities(name);
+CREATE INDEX IF NOT EXISTS knowledge_edges_source_idx ON knowledge_edges(source_id, relation_type);
+CREATE INDEX IF NOT EXISTS internal_todos_status_idx ON internal_todos(status, updated_at DESC);
+CREATE INDEX IF NOT EXISTS internal_reminders_status_idx ON internal_reminders(status, updated_at DESC);
+CREATE INDEX IF NOT EXISTS provider_call_traces_task_idx ON provider_call_traces(task_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS confirmation_ledger_task_idx ON confirmation_ledger(task_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS pipeline_health_metrics_pipeline_idx ON pipeline_health_metrics(pipeline_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS search_audit_query_idx ON search_audit(query, created_at DESC);
+CREATE INDEX IF NOT EXISTS composio_sessions_user_kind_idx ON composio_sessions(user_id, session_kind, updated_at DESC);
+CREATE INDEX IF NOT EXISTS composio_connect_requests_toolkit_idx ON composio_connect_requests(toolkit_slug, status, created_at DESC);
+CREATE INDEX IF NOT EXISTS composio_tool_invocations_tool_idx ON composio_tool_invocations(toolkit_slug, tool_slug, created_at DESC);
+CREATE INDEX IF NOT EXISTS composio_triggers_slug_idx ON composio_triggers(trigger_slug, status, updated_at DESC);
+CREATE INDEX IF NOT EXISTS route_cache_destination_idx ON route_cache(destination, updated_at DESC);

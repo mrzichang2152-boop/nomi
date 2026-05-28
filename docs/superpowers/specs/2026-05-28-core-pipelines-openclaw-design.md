@@ -318,3 +318,52 @@ Recommended implementation order:
 - Whether `crm_update_pipeline`, `project_issue_pipeline`, and `spreadsheet_update_pipeline` should be core in the first public release or remain OpenClaw/Composio long-tail routes until repeated usage proves demand.
 - Whether OpenClaw should be invoked directly from the runtime API or through a worker queue for better isolation and retry control.
 - Whether the first release should expose route traces to end users or only to the local governance/debug page.
+
+## Implementation Verification And Gaps
+
+**Verification date:** 2026-05-28
+
+The current implementation covers the routing and constrained-execution contract for this design, not every downstream execution engine.
+
+Verified with:
+
+- `python3 -m pytest runtime_api/tests/test_auth_and_model.py -q`
+- `python3 -m pytest runtime_api/tests/test_core_pipeline_engine.py -q`
+- `python3 -m pytest -q`
+- `python3 scripts/validate-core-pipelines-openclaw.py`
+- `python3 scripts/validate-private-event-processing.py`
+- `git diff --check`
+
+| Requirement | Status | Verification result |
+| --- | --- | --- |
+| Core high-frequency tasks route through deterministic pipeline metadata | Implemented | `core_pipeline_registry_matches_design` verified 18 expected pipelines, including reply, route, ride, payment, document, account login, governance, memory, context, agenda, and proactive suggestion. |
+| Long-tail unsupported workflows route to OpenClaw | Implemented | Unknown browser form request routed to `openclaw_tool` with legacy compatibility field `long_tail_tool`. |
+| Nomi keeps ownership of risk and confirmation | Implemented for routing layer | Reply uses `external_message`; ride uses `payment_or_purchase` and final confirmation; ambiguous payment returns `ask_user`. |
+| OpenClaw receives constrained task packet, not full memory | Implemented for route construction | Packet includes `goal`, `allowed_actions`, `forbidden_actions`, `requires_stop_before`, return schema, and minimized context. Raw memory dumps and unrelated messages are excluded. |
+| Context minimization redacts sensitive values | Implemented with allowlist and existing redaction rules | URL query values and email are redacted in OpenClaw packet validation; phone-like values are not mislabeled as payment amounts in sensitivity explanations. |
+| Ambiguous external-effect tasks ask user before OpenClaw or core execution | Implemented with deterministic heuristic | `帮我付款` asks for amount and counterparty; vague customer handling asks for target contact and target action. |
+| UI distinguishes core pipeline, OpenClaw, and ask-user routes | Implemented in static workbench rendering | `renderRouteResult()` labels `核心 Pipeline`, `OpenClaw 长尾执行`, and `需要澄清`, and displays packet/clarification summaries. |
+| Route decisions are persistable | Implemented | `task_route_traces` schema and `persist_task_route_trace()` store route type, capability, pipeline, risk, decision JSON, OpenClaw packet, clarification, and minimized context summary. |
+| Route decisions are browsable from the governance surface | Implemented | `GET /api/tools/route/traces` supports route type, capability, keyword, and limit filters. The governance page renders recent task routing traces with pipeline/OpenClaw/clarification summaries. |
+| OpenClaw live execution has a runtime adapter | Implemented as gated adapter | `execute_openclaw_task_packet()` defaults to safe dry-run. Live Gateway calls require `OPENCLAW_ENABLED=true` and use the OpenResponses-compatible `/v1/responses` endpoint with optional bearer token. |
+| OpenClaw execution is exposed to the runtime API | Implemented | `POST /api/tools/openclaw/execute` is password-protected and returns dry-run or live adapter results. |
+| OpenClaw execution can be isolated as auditable jobs | Implemented for local runtime jobs | `openclaw_execution_jobs` and `openclaw_execution_events` persist queued jobs, attempts, normalized tool events, final status, and retry scheduling. `POST /api/tools/openclaw/jobs`, `POST /api/tools/openclaw/jobs/{job_id}/run-once`, and `GET /api/tools/openclaw/jobs/{job_id}` expose the lifecycle. |
+| OpenClaw queued/retry jobs are picked up automatically | Implemented as an in-process runtime runner | `openclaw_execution_job_runner_loop()` periodically selects due `queued` / `retry_scheduled` jobs using `FOR UPDATE SKIP LOCKED` and runs a bounded batch. It can be configured with `ENABLE_OPENCLAW_JOB_RUNNER`, `OPENCLAW_JOB_RUNNER_INTERVAL_SECONDS`, and `OPENCLAW_JOB_RUNNER_BATCH_SIZE`. |
+| Gateway/tool events are normalized before display/storage | Implemented for response event payloads | Gateway `events` are converted into `{event_type, tool_name, message, payload}` and sensitive URL/query values are redacted before job-event storage or UI display. |
+| OpenClaw job events update the workbench in realtime | Implemented through existing realtime channel | Every job event publishes an `openclaw_job_event` message to `REALTIME_CHANNEL`. The web workbench updates known job cards and appends event text without manual refresh. |
+| Context minimization has explainable necessity decisions | Implemented | `context_necessity` records rule decisions, sensitivity flags, and excluded keys such as raw memory dumps. |
+| Context minimization can use model assistance | Partially implemented | `OPENCLAW_CONTEXT_MODEL_ENABLED=true` enables model review. The model may only reduce allowed context, not add disallowed fields. |
+| User-approved sensitive field release | Implemented for API, packet, and basic workbench flow | `POST /api/tools/openclaw/field-release` creates auditable `approved_sensitive_fields`; OpenClaw packets carry raw values only through this release channel while ordinary approved fields remain redacted. The tools page can create a release for the next route. |
+| Core pipelines expose executable state-machine contract | Implemented for initial deterministic contract | `run_core_pipeline()` and `POST /api/pipelines/run` return `status`, required/resolved/missing slots, risk, confirmation gates, external effects, writeback targets, and step states. Validation stage `core_pipeline_engine_status_contract` checks reply, route, ride, and ambiguous payment outputs. |
+| Core pipeline slots use model-plus-rule parsing | Implemented as gated hybrid parser | Rules run first, the model can fill missing required slots, rule/model conflicts preserve the rule value, and validation warnings record rejected model values. Validation stage `hybrid_pipeline_slot_extraction_is_conservative` checks both model fill and conflict rejection. |
+| Pipeline executions are persisted separately from route traces | Implemented | `pipeline_execution_results` stores route trace id, pipeline id, status, slot state, risk, execution guard, explicit references, and full result JSON. `POST /api/pipelines/run` persists through a safe wrapper when persistence is enabled. |
+| Route and pipeline traces use explicit references | Implemented for new rows with legacy fallback | `task_route_traces` and `pipeline_execution_results` store `source_event_ids`, `conversation_id`, `suggestion_id`, and `agenda_item_ids`. Event/conversation trace APIs query those references first and keep JSON/text fallback for older rows. |
+
+Known gaps:
+
+- Core pipelines now have an executable deterministic contract for high-frequency examples, but they are not yet full provider-backed state machines for every pipeline listed above.
+- OpenClaw response `events` are normalized, recorded, and pushed to the workbench over the existing realtime channel. True streaming Gateway consumption while a remote OpenClaw run is still in progress is not implemented yet; events arrive when the runtime receives them from the adapter/job runner.
+- The field-release workbench UI is intentionally basic. It creates releases for the next route, but does not yet offer per-field source picking from a memory/event detail panel.
+- Pipeline slot extraction has a gated model-plus-rule path, but provider-backed execution still depends on future per-pipeline modules and real tool adapters.
+- Worker-queue isolation is implemented as an in-process FastAPI runtime runner. It is not yet a separate worker service with independent scaling, process supervision, or cross-host queue ownership.
+- CRM, project issue, and spreadsheet update are still long-tail routes. They can be promoted into first-party pipelines after repeated usage proves demand.

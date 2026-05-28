@@ -7,3 +7,4 @@ python-dotenv==1.0.1
 httpx==0.28.1
 fastembed==0.4.2
 cryptography==46.0.3
+composio==0.13.1

@@ -161,6 +161,10 @@ button:hover {
   grid-template-columns: minmax(180px, 1fr) 160px 160px auto;
 }
 
+.field-release-toolbar {
+  grid-template-columns: 160px minmax(180px, 1fr) minmax(220px, 1fr) auto;
+}
+
 .messages,
 .content-list {
   overflow-y: auto;
@@ -251,6 +255,39 @@ button:hover {
   display: flex;
   flex-wrap: wrap;
   gap: 8px;
+}
+
+.integration-card {
+  display: grid;
+  gap: 12px;
+}
+
+.connection-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 10px;
+}
+
+.connection-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 10px;
+  border: 1px solid #d7dee8;
+  border-radius: 8px;
+  background: #f8fafc;
+}
+
+.connection-row strong,
+.connection-row span {
+  display: block;
+}
+
+.connection-row span {
+  margin-top: 3px;
+  color: #667085;
+  font-size: 12px;
 }
 
 .tool-card p span,

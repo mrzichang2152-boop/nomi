@@ -104,6 +104,13 @@
               <input id="toolRouteInput" type="search" placeholder="输入一个任务，看看 Nomi 会走哪个 Pipeline 或工具" />
               <button type="submit">路由</button>
             </form>
+            <form id="fieldReleaseForm" class="toolbar field-release-toolbar">
+              <input id="fieldReleaseName" type="text" placeholder="字段，例如 phone" />
+              <input id="fieldReleaseValue" type="text" placeholder="本地要使用的原值" />
+              <input id="fieldReleasePurpose" type="text" placeholder="用途，例如填写报名表联系电话" />
+              <button type="submit">放行字段</button>
+            </form>
+            <div id="fieldReleaseResult" class="content-list route-result"></div>
             <div id="toolRouteResult" class="content-list route-result"></div>
             <div id="toolsContent" class="content-list"></div>
           </section>

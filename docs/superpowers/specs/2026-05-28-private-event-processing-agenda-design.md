@@ -95,6 +95,8 @@ Each event may receive multiple labels with confidence scores. The primary label
 - `user_feedback`: correction, dismissal, approval, rating, or implicit signal from user action.
 - `low_value`: noise, duplicate notification, spam-like content, or content not worth surfacing.
 
+The event classifier is also hybrid model + rules. The model proposes labels and structured fields, while rules preserve high-confidence deterministic labels such as payment, cancellation, reschedule, deadline, and direct user instruction. If the model marks a payment-like email as ordinary chat, the rule label wins and the trace records that override.
+
 The classifier must produce:
 
 - `labels`: all relevant labels.
@@ -106,6 +108,7 @@ The classifier must produce:
 - `place_expressions`: exact or fuzzy location expressions.
 - `required_actions`: possible actions the user may need.
 - `risk_flags`: sensitive relationship, money, health, legal, account security, or external-effect risk.
+- `classification_trace`: parser mode, rule labels, model labels, and validation warnings.
 
 ## Nomi Conversation Context
 
@@ -254,6 +257,36 @@ Every agenda change must write an `agenda_item_version` record with:
 - timestamp
 
 This version history is required because private conversations often change plans gradually.
+
+### Hybrid Model + Rule Parsing
+
+Agenda resolution must use a hybrid parser, not a pure model parser and not a pure keyword parser.
+
+The model is responsible for proposing a structured candidate:
+
+- whether the event is agenda-worthy
+- type, such as appointment, payment, todo, deadline, travel, or shopping
+- operation, such as create, reschedule, cancel, or complete
+- title, participants, place, time window, missing fields, confidence, and evidence reason
+
+Rules are responsible for the final decision:
+
+- reject malformed or low-confidence model output
+- reject unsupported exact time, exact place, amount, participant, or action details
+- preserve fuzzy plans as fuzzy instead of inventing exact values
+- add required missing fields such as `exact_time` and `exact_place`
+- force cancellation and reschedule operations when the source text clearly says so
+- keep stable source/thread/contact-based dedupe keys
+- keep source event ids and parser trace metadata
+
+The final candidate must store:
+
+- `metadata.parser_mode`: `hybrid_model_rules` or `rules_fallback`
+- `metadata.model_candidate`: the raw model candidate when available
+- `metadata.rule_candidate`: the rule candidate used for grounding
+- `metadata.validation_warnings`: why any model field was rejected or downgraded
+
+Example: if WhatsApp says "周末去武康路见吧" and the model proposes "周六晚上八点", the final agenda item must remain `fuzzy`, keep `exact_time` in `missing_fields`, and record `unsupported_exact_time` in validation warnings.
 
 ## Proactive Suggestions
 
@@ -439,6 +472,20 @@ Sensitive information remains stored locally because Nomi needs it to help the u
 - Redact credentials, tokens, full account identifiers, and unrelated third-party private details.
 - Keep source ids locally so the model can reason from summarized evidence without receiving unnecessary raw text.
 - For high-sensitivity records, use local model execution when available or ask for explicit user approval before sending raw content to an external model.
+
+## Open Source Reference and Evaluation Policy
+
+Before adding a new major capability, the implementation should first check mature open-source projects on GitHub and use them as references when they fit Nomi's architecture.
+
+Useful current references:
+
+- Mem0: production memory patterns such as add-only extraction, entity linking, multi-signal retrieval, and temporal reasoning.
+- Graphiti/Zep: temporal knowledge graph memory with provenance, validity windows, incremental graph construction, and hybrid retrieval.
+- LangMem: hot-path memory tools plus background memory managers for agent conversations.
+- MailEx / Email-Event-Extraction: email event extraction examples and evaluation data.
+- MultiWOZ, Schema-Guided Dialogue, LoCoMo, LongMemEval: dialogue and long-memory evaluation data.
+
+Before accepting a new capability as complete, evaluation should also look for usable public datasets or fixtures on GitHub. If a public dataset cannot be used directly, the project should create a local fixture set that mirrors the same task shape and record why that fallback was used.
 
 ## Correctness Requirements
 

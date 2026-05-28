@@ -39,6 +39,59 @@ CHINESE_ADDRESS_RE = re.compile(
     r"((?:收货地址|地址)[：:\s]*)([^，。；;\\n]{6,80}(?:号|室|楼|层|单元|弄|路|街|大道|巷|村|县|区|市))"
 )
 ENTITY_CLEAN_RE = re.compile(r"^[\s\W_]+|[\s\W_]+$")
+EXACT_TIME_RE = re.compile(r"\d{1,2}[:：点]\d{0,2}|[一二三四五六七八九十两]{1,3}点|上午|下午|晚上|中午|早上")
+AGENDA_MODEL_DISABLED_VALUES = {"0", "false", "off", "no", "disabled"}
+AGENDA_TYPES = {"appointment", "deadline", "todo", "payment", "travel", "shopping", "followup", "reminder"}
+AGENDA_OPERATIONS = {
+    "create",
+    "update",
+    "reschedule",
+    "cancel",
+    "merge",
+    "complete",
+    "lower_confidence",
+    "request_clarification",
+}
+AGENDA_STATUSES = {"scheduled", "open", "pending", "canceled", "completed"}
+AGENDA_CERTAINTIES = {"exact", "fuzzy"}
+AGENDA_MODEL_MIN_CONFIDENCE = 0.45
+EVENT_LABELS = {
+    "ordinary_chat",
+    "todo",
+    "commitment",
+    "appointment",
+    "reschedule",
+    "cancel",
+    "deadline",
+    "payment",
+    "travel",
+    "shopping",
+    "relationship_signal",
+    "important_fact",
+    "user_instruction",
+    "preference_update",
+    "user_feedback",
+    "low_value",
+}
+EVENT_LABEL_PRIORITY = [
+    "cancel",
+    "reschedule",
+    "payment",
+    "deadline",
+    "appointment",
+    "travel",
+    "shopping",
+    "todo",
+    "commitment",
+    "user_instruction",
+    "preference_update",
+    "user_feedback",
+    "relationship_signal",
+    "important_fact",
+    "ordinary_chat",
+    "low_value",
+]
+LOW_VALUE_EVENT_LABELS = {"ordinary_chat", "low_value"}
 
 
 def mask_value(value: Any) -> Any:
@@ -220,7 +273,12 @@ def rule_extract_semantics(source: str, event_type: str, raw_data: dict[str, Any
         "event_type": event_type,
         "keywords": [word for word in ["Tokyo", "东京", "Alex", "hotel", "酒店"] if word in text],
     }
-    summary = raw_data.get("message") or raw_data.get("query") or raw_data.get("subject") or raw_data.get("title") or text[:180]
+    if source == "gmail" and raw_data.get("body"):
+        subject = str(raw_data.get("subject") or "").strip()
+        body = str(raw_data.get("body") or "").strip()
+        summary = f"{subject}：{body}" if subject else body
+    else:
+        summary = raw_data.get("message") or raw_data.get("query") or raw_data.get("subject") or raw_data.get("title") or text[:180]
     return {
         "intent": intent,
         "entities": entities,
@@ -228,6 +286,128 @@ def rule_extract_semantics(source: str, event_type: str, raw_data: dict[str, Any
         "summary": str(summary)[:500],
         "model_version": f"{MODEL_MODE}:rules-v0",
     }
+
+
+def event_label_text(raw_data: dict[str, Any], semantic: dict[str, Any]) -> str:
+    pieces = [
+        semantic.get("intent"),
+        semantic.get("summary"),
+        raw_data.get("message"),
+        raw_data.get("body"),
+        raw_data.get("text"),
+        raw_data.get("content"),
+        raw_data.get("subject"),
+        raw_data.get("title"),
+        raw_data.get("query"),
+    ]
+    return "\n".join(str(piece) for piece in pieces if piece)
+
+
+def rule_event_labels(source: str, event_type: str, raw_data: dict[str, Any], semantic: dict[str, Any]) -> list[str]:
+    text = event_label_text(raw_data, semantic)
+    lowered = text.lower()
+    intent = str(semantic.get("intent") or "")
+    labels: list[str] = []
+
+    def add(label: str) -> None:
+        if label in EVENT_LABELS and label not in labels:
+            labels.append(label)
+
+    if any(marker in text for marker in ["取消", "不去了", "不用去了"]) or any(marker in lowered for marker in ["cancel", "canceled", "cancelled"]):
+        add("cancel")
+    if any(marker in text for marker in ["改到", "改成", "换到", "推迟", "提前"]) or "reschedule" in lowered:
+        add("reschedule")
+    if intent in {"social_plan", "schedule"} or any(marker in text for marker in ["见面", "见吧", "吃饭", "约", "会议", "开会", "碰面"]):
+        add("appointment")
+    if any(marker in text for marker in ["路线", "打车", "导航", "机场", "酒店", "高铁", "航班", "出发", "到达"]):
+        add("travel")
+    if intent in {"payment_reminder"} or any(marker in text for marker in ["付款", "支付", "账单", "发票", "还款", "报销"]):
+        add("payment")
+    if any(marker in text for marker in ["截止", "到期"]) or any(marker in lowered for marker in ["deadline", "due"]):
+        add("deadline")
+    if intent in {"task_request", "user_instruction"} or any(marker in text for marker in ["待办", "帮我", "提醒", "处理", "盯一下"]):
+        add("todo")
+    if any(marker in text for marker in ["我会", "我来", "答应", "承诺", "promise"]):
+        add("commitment")
+    if any(marker in text for marker in ["买", "下单", "购物", "快递", "包裹", "订单", "退货"]):
+        add("shopping")
+    if intent == "preference_update":
+        add("preference_update")
+    if intent == "user_feedback":
+        add("user_feedback")
+    if intent == "user_instruction":
+        add("user_instruction")
+    if any(marker in text for marker in ["喜欢", "讨厌", "不信任", "关系", "生日", "家人", "朋友"]):
+        add("relationship_signal")
+    if intent in {"long_term_memory_fact", "conversation_memory", "research_interest", "focused_attention"}:
+        add("important_fact")
+    if not labels:
+        add("ordinary_chat" if source in {"whatsapp", "telegram", "nomi_chat", "longmemeval_conversation", "locomo_conversation"} else "low_value")
+    return labels
+
+
+def primary_event_label(labels: list[str]) -> str:
+    label_set = set(labels)
+    for label in EVENT_LABEL_PRIORITY:
+        if label in label_set:
+            return label
+    return labels[0] if labels else "low_value"
+
+
+def intent_for_primary_label(primary_label: str, current_intent: str) -> str:
+    if current_intent and current_intent != "generic_event":
+        return current_intent
+    return {
+        "payment": "payment_reminder",
+        "appointment": "social_plan",
+        "deadline": "task_request",
+        "todo": "task_request",
+        "travel": "travel_plan",
+        "shopping": "shopping_intent",
+        "cancel": "schedule",
+        "reschedule": "schedule",
+    }.get(primary_label, current_intent or "generic_event")
+
+
+def enrich_semantic_classification(
+    source: str,
+    event_type: str,
+    raw_data: dict[str, Any],
+    semantic: dict[str, Any],
+    model_entities: Optional[dict[str, Any]] = None,
+    parser_mode: str = "rules_only",
+    validation_warnings: Optional[list[str]] = None,
+) -> dict[str, Any]:
+    entities = dict(semantic.get("entities") or {})
+    rule_labels = rule_event_labels(source, event_type, raw_data, semantic)
+    model_labels = normalize_string_list((model_entities or entities).get("labels"))
+    model_labels = [label for label in model_labels if label in EVENT_LABELS]
+    warnings = list(validation_warnings or [])
+
+    substantive_rule_labels = [label for label in rule_labels if label not in LOW_VALUE_EVENT_LABELS]
+    labels = list(rule_labels)
+    if substantive_rule_labels:
+        if set(model_labels).issubset(LOW_VALUE_EVENT_LABELS):
+            warnings.append("rule_overrode_low_value_model_label")
+        labels.extend(label for label in model_labels if label not in LOW_VALUE_EVENT_LABELS)
+    else:
+        labels = model_labels or rule_labels
+    labels = list(dict.fromkeys(label for label in labels if label in EVENT_LABELS))
+    if any(label not in LOW_VALUE_EVENT_LABELS for label in labels):
+        labels = [label for label in labels if label not in LOW_VALUE_EVENT_LABELS]
+    primary_label = primary_event_label(labels)
+
+    entities["labels"] = labels
+    entities["primary_label"] = primary_label
+    entities["classification_trace"] = {
+        "parser_mode": parser_mode,
+        "rule_labels": rule_labels,
+        "model_labels": model_labels,
+        "validation_warnings": list(dict.fromkeys(warnings)),
+    }
+    semantic["entities"] = entities
+    semantic["intent"] = intent_for_primary_label(primary_label, str(semantic.get("intent") or ""))
+    return semantic
 
 
 def call_model(messages: list[dict[str, str]]) -> str:
@@ -283,6 +463,7 @@ def parse_model_json(text: str) -> dict[str, Any]:
 def extract_semantics(source: str, event_type: str, raw_data: dict[str, Any]) -> dict[str, Any]:
     fallback = rule_extract_semantics(source, event_type, raw_data)
     fallback["raw_data"] = raw_data
+    fallback = enrich_semantic_classification(source, event_type, raw_data, fallback, parser_mode="rules_only")
     if source in {"locomo_seed", "locomo_conversation", "longmemeval_conversation"}:
         return fallback
     prompt = {
@@ -297,13 +478,15 @@ def extract_semantics(source: str, event_type: str, raw_data: dict[str, Any]) ->
                 "你是个人语义事件抽取器。只输出 JSON，不要解释。"
                 "字段必须包含 intent, entities, importance, summary。"
                 "importance 是 0 到 1 的数字。entities 是对象。summary 用中文一句话概括。"
+                "entities 可包含 labels 和 primary_label；labels 只能来自普通聊天、待办、约定、改期、取消、截止日期、付款、出行、购物、关系信号、重要事实、用户指令、偏好更新、用户反馈、低价值这些类别。"
+                "不要把模糊时间或地点补成精确信息。"
             ),
         },
         {"role": "user", "content": json.dumps(prompt, ensure_ascii=False)},
     ]
     try:
         parsed = parse_model_json(call_model(messages))
-        return {
+        semantic = {
             "intent": str(parsed.get("intent") or fallback["intent"])[:120],
             "entities": parsed.get("entities") if isinstance(parsed.get("entities"), dict) else fallback["entities"],
             "importance": float(parsed.get("importance", fallback["importance"])),
@@ -311,8 +494,28 @@ def extract_semantics(source: str, event_type: str, raw_data: dict[str, Any]) ->
             "model_version": f"{MODEL_MODE}:{MODEL_NAME}",
             "raw_data": raw_data,
         }
+        semantic = enrich_semantic_classification(
+            source,
+            event_type,
+            raw_data,
+            semantic,
+            model_entities=parsed.get("entities") if isinstance(parsed.get("entities"), dict) else {},
+            parser_mode="hybrid_model_rules",
+        )
+        warnings = semantic["entities"].get("classification_trace", {}).get("validation_warnings", [])
+        if "rule_overrode_low_value_model_label" in warnings:
+            semantic["summary"] = fallback["summary"]
+            semantic["importance"] = max(float(semantic.get("importance") or 0), float(fallback.get("importance") or 0))
+        return semantic
     except Exception:
-        return fallback
+        return enrich_semantic_classification(
+            source,
+            event_type,
+            raw_data,
+            fallback,
+            parser_mode="rules_fallback",
+            validation_warnings=["model_semantic_parse_failed"],
+        )
 
 
 def suggestion_actions_for_event(intent: str, source: str, suggestion_type: str, summary: str) -> list[dict[str, Any]]:
@@ -1013,8 +1216,81 @@ def extract_place(text: str, raw_data: dict[str, Any]) -> str:
     return match.group(1).strip() if match else ""
 
 
+def agenda_source_for_semantic(semantic: dict[str, Any], raw_data: dict[str, Any]) -> str:
+    entities = semantic.get("entities") if isinstance(semantic.get("entities"), dict) else {}
+    return str(entities.get("source") or raw_data.get("source") or "").strip()
+
+
+def agenda_dedupe_key_for_semantic(
+    agenda_type: str,
+    source: str,
+    raw_data: dict[str, Any],
+    participants: list[str],
+) -> str:
+    conversation_key = normalize_entity_name(
+        str(
+            raw_data.get("conversation_id")
+            or raw_data.get("chat_id")
+            or raw_data.get("thread_id")
+            or raw_data.get("chat_name")
+            or raw_data.get("subject")
+            or ",".join(participants)
+            or source
+            or agenda_type
+        )
+    )
+    dedupe_seed = ":".join([agenda_type, source or "unknown", conversation_key])
+    return f"agenda:{dedupe_seed}"
+
+
+def agenda_model_enabled() -> bool:
+    return os.getenv("AGENDA_MODEL_ENABLED", "1").strip().lower() not in AGENDA_MODEL_DISABLED_VALUES
+
+
+def normalize_support_text(value: Any) -> str:
+    normalized = str(value or "").strip().lower()
+    normalized = re.sub(r"\s+", "", normalized)
+    normalized = re.sub(r"[，。！？、,.!?;；:：\"'“”‘’（）()【】\[\]{}<>《》-]", "", normalized)
+    return normalized
+
+
+def text_supports_model_value(value: Any, text: str) -> bool:
+    normalized_value = normalize_support_text(value)
+    if not normalized_value:
+        return True
+    return normalized_value in normalize_support_text(text)
+
+
+def normalize_string_list(value: Any) -> list[str]:
+    if isinstance(value, list):
+        raw_items = value
+    elif value:
+        raw_items = [value]
+    else:
+        raw_items = []
+    cleaned = []
+    for item in raw_items:
+        text = str(item or "").strip()
+        if text and text.lower() not in {"unknown", "none", "null"}:
+            cleaned.append(text[:120])
+    return list(dict.fromkeys(cleaned))
+
+
+def bounded_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return min(max(float(value), 0), 1)
+    except (TypeError, ValueError):
+        return default
+
+
+def agenda_candidate_copy(candidate: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
+    if candidate is None:
+        return None
+    return json.loads(json.dumps(candidate, ensure_ascii=False))
+
+
 def agenda_certainty_and_missing(text: str, place: str, agenda_type: str, operation: str) -> tuple[str, list[str], dict[str, Any]]:
-    has_exact_time = bool(re.search(r"\d{1,2}[:：点]\d{0,2}|上午|下午|晚上|中午|早上", text))
+    has_exact_time = bool(EXACT_TIME_RE.search(text))
     has_fuzzy_time = any(marker in text for marker in ["周末", "下周", "周日", "周六", "改天", "找时间", "有空", "明后天"])
     missing_fields: list[str] = []
     if operation == "cancel":
@@ -1044,20 +1320,7 @@ def agenda_candidate_from_semantic(event_id: str, timestamp: str, semantic: dict
     certainty, missing_fields, time_window = agenda_certainty_and_missing(text, place, agenda_type, operation)
     status = "canceled" if operation == "cancel" else "scheduled"
     title = str(semantic.get("summary") or text or agenda_type).strip()[:180]
-    source = str((semantic.get("entities") or {}).get("source") or raw_data.get("source") or "")
-    conversation_key = normalize_entity_name(
-        str(
-            raw_data.get("conversation_id")
-            or raw_data.get("chat_id")
-            or raw_data.get("thread_id")
-            or raw_data.get("chat_name")
-            or raw_data.get("subject")
-            or ",".join(participants)
-            or source
-            or agenda_type
-        )
-    )
-    dedupe_seed = ":".join([agenda_type, source or "unknown", conversation_key])
+    source = agenda_source_for_semantic(semantic, raw_data)
     return {
         "type": agenda_type,
         "title": title,
@@ -1073,26 +1336,303 @@ def agenda_candidate_from_semantic(event_id: str, timestamp: str, semantic: dict
         "operation": operation,
         "metadata": {
             "source": source,
-            "dedupe_key": f"agenda:{dedupe_seed}",
+            "dedupe_key": agenda_dedupe_key_for_semantic(agenda_type, source, raw_data, participants),
             "created_from": "semantic_event",
             "event_timestamp": timestamp,
         },
     }
 
 
+def model_agenda_candidate_from_semantic(
+    event_id: str,
+    timestamp: str,
+    semantic: dict[str, Any],
+    rule_candidate: Optional[dict[str, Any]],
+) -> tuple[Optional[dict[str, Any]], list[str]]:
+    if not agenda_model_enabled():
+        return None, ["agenda_model_disabled"]
+
+    raw_data = semantic.get("raw_data") if isinstance(semantic.get("raw_data"), dict) else {}
+    prompt = {
+        "event_id": event_id,
+        "event_timestamp": timestamp,
+        "semantic": mask_value(
+            {
+                "intent": semantic.get("intent"),
+                "importance": semantic.get("importance"),
+                "summary": semantic.get("summary"),
+                "entities": semantic.get("entities") if isinstance(semantic.get("entities"), dict) else {},
+            }
+        ),
+        "raw_data": mask_value(raw_data),
+        "rule_candidate": mask_value(rule_candidate or {}),
+        "output_schema": {
+            "is_agenda": "boolean",
+            "type": sorted(AGENDA_TYPES),
+            "operation": sorted(AGENDA_OPERATIONS),
+            "title": "short Chinese title grounded in evidence",
+            "status": sorted(AGENDA_STATUSES),
+            "certainty": sorted(AGENDA_CERTAINTIES),
+            "time_window": "object with raw_text and optional exact fields only when source evidence is exact",
+            "place": "place string only when supported by source evidence",
+            "participants": "array",
+            "missing_fields": "array, e.g. exact_time/exact_place",
+            "needs_clarification": "boolean",
+            "confidence": "0..1",
+            "reason": "short evidence-based explanation",
+        },
+    }
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "你是 Nomi 的私有事件日程候选解析器。只输出 JSON。"
+                "你的任务是提出候选，不是最终决策。"
+                "严禁根据常识补全原文没有的精确时间、地点、金额或人名。"
+                "如果只有周末、下周、找时间这类信息，certainty 必须是 fuzzy，并把 exact_time 放入 missing_fields。"
+                "如果不是日程、待办、付款、出行、购物或截止日期，is_agenda=false。"
+            ),
+        },
+        {"role": "user", "content": json.dumps(prompt, ensure_ascii=False)},
+    ]
+    try:
+        parsed = parse_model_json(call_model(messages))
+    except Exception as exc:
+        return None, [f"model_parse_failed:{exc.__class__.__name__}"]
+    if not isinstance(parsed, dict):
+        return None, ["model_candidate_not_object"]
+    return parsed, []
+
+
+def rules_fallback_agenda_candidate(
+    rule_candidate: Optional[dict[str, Any]],
+    model_candidate: Optional[dict[str, Any]],
+    warnings: list[str],
+) -> Optional[dict[str, Any]]:
+    candidate = agenda_candidate_copy(rule_candidate)
+    if not candidate:
+        return None
+    metadata = dict(candidate.get("metadata") or {})
+    metadata["parser_mode"] = "rules_fallback"
+    metadata["rule_candidate"] = agenda_candidate_copy(rule_candidate)
+    metadata["validation_warnings"] = warnings or ["model_candidate_rejected"]
+    if model_candidate is not None:
+        metadata["model_candidate"] = model_candidate
+    candidate["metadata"] = metadata
+    return candidate
+
+
+def validated_model_fields_for_agenda(
+    rule_candidate: Optional[dict[str, Any]],
+    model_candidate: dict[str, Any],
+    semantic: dict[str, Any],
+    timestamp: str,
+) -> tuple[Optional[dict[str, Any]], list[str]]:
+    warnings: list[str] = []
+    raw_data = semantic.get("raw_data") if isinstance(semantic.get("raw_data"), dict) else {}
+    text = semantic_text(semantic)
+    source = agenda_source_for_semantic(semantic, raw_data)
+
+    if model_candidate.get("is_agenda") is False:
+        return None, ["model_said_not_agenda"]
+
+    model_type = str(model_candidate.get("type") or "").strip()
+    rule_type = rule_candidate.get("type") if rule_candidate else ""
+    agenda_type = model_type if model_type in AGENDA_TYPES else str(rule_type or "")
+    if not agenda_type:
+        return None, ["missing_or_invalid_agenda_type"]
+    if model_type and model_type not in AGENDA_TYPES:
+        warnings.append("invalid_model_type")
+
+    model_operation = str(model_candidate.get("operation") or "").strip()
+    rule_operation = str(rule_candidate.get("operation") or "create") if rule_candidate else "create"
+    if rule_operation in {"cancel", "reschedule"}:
+        operation = rule_operation
+        if model_operation and model_operation != rule_operation:
+            warnings.append("rule_operation_overrode_model")
+    elif model_operation in AGENDA_OPERATIONS:
+        operation = model_operation
+    else:
+        operation = rule_operation if rule_operation in AGENDA_OPERATIONS else "create"
+        if model_operation:
+            warnings.append("invalid_model_operation")
+
+    confidence = bounded_float(model_candidate.get("confidence"))
+    if confidence < AGENDA_MODEL_MIN_CONFIDENCE and rule_candidate:
+        return None, ["model_confidence_too_low"]
+
+    rule_place = str(rule_candidate.get("place") or "") if rule_candidate else extract_place(text, raw_data)
+    model_place = str(model_candidate.get("place") or "").strip()
+    if model_place:
+        if text_supports_model_value(model_place, text) or (
+            rule_place and normalize_support_text(model_place) == normalize_support_text(rule_place)
+        ):
+            place = model_place[:180]
+        else:
+            warnings.append("unsupported_place")
+            place = rule_place
+    else:
+        place = rule_place
+
+    rule_certainty, rule_missing_fields, rule_time_window = agenda_certainty_and_missing(text, place, agenda_type, operation)
+    model_certainty = str(model_candidate.get("certainty") or "").strip()
+    if model_certainty not in AGENDA_CERTAINTIES:
+        model_certainty = rule_certainty
+        warnings.append("invalid_model_certainty")
+
+    model_time_window = model_candidate.get("time_window") if isinstance(model_candidate.get("time_window"), dict) else {}
+    model_has_exact_time = model_certainty == "exact" or any(key in model_time_window for key in ["start", "end", "start_at", "end_at"])
+    if model_has_exact_time and not rule_time_window.get("has_exact_time"):
+        warnings.append("unsupported_exact_time")
+        model_time_window = {}
+        model_certainty = "fuzzy"
+
+    certainty = "fuzzy" if rule_certainty == "fuzzy" or model_certainty == "fuzzy" else "exact"
+    missing_fields = normalize_string_list(model_candidate.get("missing_fields"))
+    for field in rule_missing_fields:
+        if field not in missing_fields:
+            missing_fields.append(field)
+    if operation == "cancel":
+        missing_fields = []
+        certainty = model_certainty if model_certainty in AGENDA_CERTAINTIES else "exact"
+    if model_has_exact_time and "unsupported_exact_time" in warnings and "exact_time" not in missing_fields:
+        missing_fields.append("exact_time")
+    if agenda_type == "appointment" and operation != "cancel" and not place and "exact_place" not in missing_fields:
+        missing_fields.append("exact_place")
+
+    participants = normalize_string_list(model_candidate.get("participants"))
+    if not participants:
+        participants = list(rule_candidate.get("participants") or []) if rule_candidate else extract_agenda_participants(raw_data, semantic)
+    else:
+        rule_participants = list(rule_candidate.get("participants") or []) if rule_candidate else extract_agenda_participants(raw_data, semantic)
+        participants = list(dict.fromkeys(participants + rule_participants))[:8]
+
+    title = str(model_candidate.get("title") or "").strip()[:180]
+    if not title:
+        title = str(rule_candidate.get("title") if rule_candidate else semantic.get("summary") or agenda_type).strip()[:180]
+    elif "unsupported_exact_time" in warnings and EXACT_TIME_RE.search(title):
+        warnings.append("unsupported_title_detail")
+        title = str(rule_candidate.get("title") if rule_candidate else semantic.get("summary") or agenda_type).strip()[:180]
+
+    status = str(model_candidate.get("status") or "").strip()
+    if operation == "cancel":
+        status = "canceled"
+    elif status not in AGENDA_STATUSES:
+        status = str(rule_candidate.get("status") or "scheduled") if rule_candidate else "scheduled"
+
+    time_window = dict(rule_time_window)
+    if model_time_window:
+        time_window.update({str(key): value for key, value in model_time_window.items() if str(key) not in {"start", "end", "start_at", "end_at"}})
+    time_window["rule_has_exact_time"] = bool(rule_time_window.get("has_exact_time"))
+
+    metadata = dict(rule_candidate.get("metadata") or {}) if rule_candidate else {}
+    metadata.update(
+        {
+            "source": source,
+            "dedupe_key": metadata.get("dedupe_key")
+            or agenda_dedupe_key_for_semantic(agenda_type, source, raw_data, participants),
+            "created_from": "semantic_event",
+            "event_timestamp": metadata.get("event_timestamp") or timestamp,
+            "parser_mode": "hybrid_model_rules",
+            "model_candidate": model_candidate,
+            "rule_candidate": agenda_candidate_copy(rule_candidate),
+            "validation_warnings": warnings,
+            "model_reason": str(model_candidate.get("reason") or "")[:500],
+        }
+    )
+
+    return {
+        "type": agenda_type,
+        "title": title,
+        "status": status,
+        "certainty": certainty,
+        "time_window": time_window,
+        "place": place,
+        "participants": participants[:8],
+        "missing_fields": missing_fields,
+        "needs_clarification": bool(missing_fields) or bool(model_candidate.get("needs_clarification")),
+        "confidence": (
+            max(confidence, bounded_float(rule_candidate.get("confidence")) if rule_candidate else 0)
+            if not warnings
+            else bounded_float(rule_candidate.get("confidence"), confidence) if rule_candidate else confidence
+        ),
+        "source_event_ids": list(rule_candidate.get("source_event_ids") or []) if rule_candidate else [],
+        "operation": operation,
+        "metadata": metadata,
+    }, warnings
+
+
+def hybrid_agenda_candidate_from_semantic(event_id: str, timestamp: str, semantic: dict[str, Any]) -> Optional[dict[str, Any]]:
+    rule_candidate = agenda_candidate_from_semantic(event_id, timestamp, semantic)
+    model_candidate, model_warnings = model_agenda_candidate_from_semantic(event_id, timestamp, semantic, rule_candidate)
+    if model_warnings and model_candidate is None:
+        return rules_fallback_agenda_candidate(rule_candidate, model_candidate, model_warnings)
+    if model_candidate is None:
+        return rules_fallback_agenda_candidate(rule_candidate, model_candidate, ["model_candidate_missing"])
+
+    validated, validation_warnings = validated_model_fields_for_agenda(rule_candidate, model_candidate, semantic, timestamp)
+    warnings = model_warnings + validation_warnings
+    if not validated:
+        return rules_fallback_agenda_candidate(rule_candidate, model_candidate, warnings)
+    if event_id not in validated["source_event_ids"]:
+        validated["source_event_ids"].append(event_id)
+    validated["metadata"]["validation_warnings"] = warnings
+    return validated
+
+
+def normalize_agenda_stored_value(value: Any) -> Any:
+    if isinstance(value, str):
+        text = value.strip()
+        if text.startswith("{") or text.startswith("["):
+            try:
+                return json.loads(text)
+            except json.JSONDecodeError:
+                return value
+        return value
+    if isinstance(value, list):
+        return [str(item) if isinstance(item, uuid.UUID) else item for item in value]
+    return value
+
+
+def agenda_previous_value_from_row(row: Any) -> dict[str, Any]:
+    if not row or len(row) < 13:
+        return {}
+    return {
+        "type": row[1],
+        "title": row[2],
+        "status": row[3],
+        "certainty": row[4],
+        "time_window": normalize_agenda_stored_value(row[5]),
+        "place": row[6] or "",
+        "participants": normalize_agenda_stored_value(row[7]) or [],
+        "missing_fields": normalize_agenda_stored_value(row[8]) or [],
+        "needs_clarification": bool(row[9]),
+        "confidence": bounded_float(row[10]),
+        "source_event_ids": [str(item) for item in (normalize_agenda_stored_value(row[11]) or [])],
+        "metadata": normalize_agenda_stored_value(row[12]) or {},
+    }
+
+
 def persist_agenda(conn: psycopg.Connection, event_id: str, timestamp: str, semantic: dict[str, Any]) -> None:
     ensure_agenda_schema(conn)
-    candidate = agenda_candidate_from_semantic(event_id, timestamp, semantic)
+    candidate = hybrid_agenda_candidate_from_semantic(event_id, timestamp, semantic)
     if not candidate:
         return
     dedupe_key = candidate["metadata"]["dedupe_key"]
     existing_cursor = conn.execute(
-        "SELECT id FROM agenda_items WHERE metadata->>'dedupe_key' = %s ORDER BY updated_at DESC LIMIT 1",
+        """
+        SELECT id, type, title, status, certainty, time_window, place, participants, missing_fields,
+               needs_clarification, confidence, source_event_ids, metadata
+        FROM agenda_items
+        WHERE metadata->>'dedupe_key' = %s
+        ORDER BY updated_at DESC
+        LIMIT 1
+        """,
         (dedupe_key,),
     )
     existing = existing_cursor.fetchone() if hasattr(existing_cursor, "fetchone") else None
     agenda_id = existing[0] if existing else uuid.uuid4()
-    previous_value: dict[str, Any] = {}
+    previous_value = agenda_previous_value_from_row(existing)
     new_value = {
         key: candidate[key]
         for key in [
@@ -1108,6 +1648,8 @@ def persist_agenda(conn: psycopg.Connection, event_id: str, timestamp: str, sema
             "confidence",
         ]
     }
+    new_value["source_event_ids"] = [str(item) for item in candidate["source_event_ids"]]
+    new_value["metadata"] = candidate["metadata"]
     if existing:
         conn.execute(
             """
