@@ -150,6 +150,7 @@ class ChatIn(BaseModel):
     limit: int = Field(default=12, ge=1, le=30)
     conversation_id: Optional[str] = None
     client_type: str = Field(default="web", max_length=40)
+    client_context: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class ToolRouteIn(BaseModel):
@@ -6124,19 +6125,73 @@ def relevant_assistant_dialogue_items(
     limit: int = 6,
 ) -> list[dict[str, Any]]:
     tokens = set(query_tokens(query))
+    is_short_followup = short_followup_query(query)
     selected: list[dict[str, Any]] = []
     for item in assistant_context:
         item_conversation_id = str(item.get("conversation_id") or "")
         content = str(item.get("content") or "")
         content_tokens = set(query_tokens(content))
         same_conversation = bool(conversation_id and item_conversation_id == str(conversation_id))
+        from_client_context = item.get("source") == "client_context"
         is_user_correction = any(marker in content for marker in ["不是", "别提醒", "不用提醒", "以后", "记住", "纠正"])
         overlaps = bool(tokens and tokens.intersection(content_tokens))
-        if same_conversation or overlaps or is_user_correction:
+        if same_conversation or overlaps or is_user_correction or (is_short_followup and from_client_context):
             selected.append(item)
         if len(selected) >= limit:
             break
     return selected
+
+
+def short_followup_query(query: str) -> bool:
+    text = str(query or "").strip().lower()
+    if not text:
+        return False
+    compact = re.sub(r"\s+", "", text)
+    if len(compact) <= 12 and not query_tokens(text):
+        return True
+    markers = {
+        "需要",
+        "可以",
+        "好的",
+        "好",
+        "要",
+        "是",
+        "确认",
+        "继续",
+        "不用",
+        "不要",
+        "yes",
+        "ok",
+        "sure",
+        "go ahead",
+    }
+    return compact in markers
+
+
+def normalize_client_dialogue_context(
+    items: list[dict[str, Any]],
+    conversation_id: Optional[str],
+    limit: int = 8,
+) -> list[dict[str, Any]]:
+    normalized: list[dict[str, Any]] = []
+    for index, item in enumerate((items or [])[-limit:]):
+        role = str(item.get("role") or "").strip().lower()
+        if role not in {"user", "assistant"}:
+            continue
+        content = str(item.get("content") or "").strip()
+        if not content:
+            continue
+        normalized.append(
+            {
+                "layer": "assistant_dialogue",
+                "source": "client_context",
+                "event_id": f"client-context-{index}",
+                "conversation_id": str(conversation_id or item.get("conversation_id") or "client-local"),
+                "role": role,
+                "content": content[:1200],
+            }
+        )
+    return normalized
 
 
 def agenda_item_matches_query(query: str, item: dict[str, Any]) -> bool:
@@ -6456,6 +6511,11 @@ async def chat(body: ChatIn, x_par_password: Optional[str] = Header(default=None
         conversation_id=user_turn["conversation_id"],
         limit=8,
     )
+    client_dialogue_context = normalize_client_dialogue_context(
+        body.client_context,
+        user_turn["conversation_id"],
+        limit=8,
+    )
     agenda_context = retrieve_active_agenda_context(
         body.message,
         conversation_id=user_turn["conversation_id"],
@@ -6464,7 +6524,7 @@ async def chat(body: ChatIn, x_par_password: Optional[str] = Header(default=None
     context_pack = build_context_pack(
         body.message,
         context,
-        assistant_context=assistant_context,
+        assistant_context=client_dialogue_context + assistant_context,
         conversation_id=user_turn["conversation_id"],
         agenda_context=agenda_context,
     )
@@ -6512,6 +6572,7 @@ def build_chat_messages(message: str, context: list[dict[str, Any]] | dict[str, 
                 "当用户要回复某个联系人、发消息或写邮件时，不能泄露第三方私下评价、抱怨、负面观点或敏感信息。"
                 "如果某条上下文只适合用户私下分析，不要把它写进对外回复草稿。"
                 "上下文可能包含 bounded context pack；优先使用相关的 Nomi 对话纠正、用户偏好和当前任务，但不要使用无关对话。"
+                "当用户只回复“需要、可以、好的、确认、yes、ok”等短句时，必须结合 assistant_dialogue 中最近的 Nomi 提问判断指代。"
             ),
         },
         {

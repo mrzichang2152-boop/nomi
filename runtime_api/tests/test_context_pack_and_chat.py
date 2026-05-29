@@ -154,10 +154,12 @@ def test_chat_endpoint_persists_turns_uses_context_pack_and_returns_trace(monkey
         }
 
     def fake_context_pack(message, base_context, assistant_context=None, conversation_id=None, **kwargs):
+        assistant_text = "\n".join(item.get("content", "") for item in assistant_context or [])
+        assert "核对成本与利润率" in assistant_text
         return {
             "query": message,
             "memory_context": base_context,
-            "assistant_dialogue": [{"layer": "assistant_dialogue", "content": "用户之前说要盯周末见面"}],
+            "assistant_dialogue": [{"layer": "assistant_dialogue", "content": assistant_text}],
             "included_event_ids": ["event-user"],
             "reason": "bounded context pack: active conversation and scoped memory",
         }
@@ -171,8 +173,8 @@ def test_chat_endpoint_persists_turns_uses_context_pack_and_returns_trace(monkey
 
         async def chat(self, messages):
             assert "bounded context pack" in messages[1]["content"]
-            assert "用户之前说要盯周末见面" in messages[1]["content"]
-            return "我会继续帮你盯这个周末安排。"
+            assert "核对成本与利润率" in messages[1]["content"]
+            return "好的，我会继续按“核对成本与利润率”这个方向处理。"
 
     class Conn:
         def __enter__(self):
@@ -197,16 +199,24 @@ def test_chat_endpoint_persists_turns_uses_context_pack_and_returns_trace(monkey
     response = client.post(
         "/api/chat",
         headers={"x-par-password": "secret"},
-        json={"message": "那就周日吧", "limit": 8, "conversation_id": "conv-1"},
+        json={
+            "message": "需要",
+            "limit": 8,
+            "conversation_id": "conv-1",
+            "client_context": [
+                {"role": "assistant", "content": "需要我帮你核对成本与利润率数据吗？"},
+                {"role": "user", "content": "需要"},
+            ],
+        },
     )
 
     assert response.status_code == 200
     body = response.json()
     assert body["conversation_id"] == "conv-1"
-    assert body["answer"] == "我会继续帮你盯这个周末安排。"
+    assert body["answer"] == "好的，我会继续按“核对成本与利润率”这个方向处理。"
     assert body["context_pack"]["included_event_ids"] == ["event-user"]
     assert [item["role"] for item in persisted_turns] == ["user", "assistant"]
-    assert persisted_turns[0]["content"] == "那就周日吧"
+    assert persisted_turns[0]["content"] == "需要"
     assert snapshots == [("event-user", "chat_response", ["event-user"])]
 
 

@@ -30,9 +30,30 @@ final class AssistantApiClient {
     }
 
     String chat(String message) throws Exception {
-        JSONObject body = new JSONObject().put("message", message);
+        return chat(message, null, List.of()).answer;
+    }
+
+    ChatResult chat(String message, String conversationId, List<FloatingChatContext.Turn> clientContext) throws Exception {
+        JSONObject body = new JSONObject()
+                .put("message", message)
+                .put("client_type", "android");
+        if (conversationId != null && !conversationId.trim().isEmpty()) {
+            body.put("conversation_id", conversationId.trim());
+        }
+        JSONArray context = new JSONArray();
+        for (FloatingChatContext.Turn turn : clientContext) {
+            context.put(
+                    new JSONObject()
+                            .put("role", turn.role)
+                            .put("content", turn.content)
+            );
+        }
+        body.put("client_context", context);
         JSONObject json = request("POST", "/api/chat", body, true);
-        return json.optString("answer", json.optString("message", ""));
+        return new ChatResult(
+                json.optString("answer", json.optString("message", "")),
+                json.optString("conversation_id", conversationId == null ? "" : conversationId)
+        );
     }
 
     List<AssistantSuggestion> suggestions() throws Exception {
@@ -121,6 +142,16 @@ final class AssistantApiClient {
             throw new IllegalStateException("HTTP " + code + ": " + builder);
         }
         return builder.toString();
+    }
+}
+
+final class ChatResult {
+    final String answer;
+    final String conversationId;
+
+    ChatResult(String answer, String conversationId) {
+        this.answer = answer == null ? "" : answer;
+        this.conversationId = conversationId == null ? "" : conversationId;
     }
 }
 

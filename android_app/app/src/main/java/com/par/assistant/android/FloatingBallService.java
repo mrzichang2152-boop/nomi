@@ -7,13 +7,17 @@ import android.app.PendingIntent;
 import android.app.Service;
 import android.content.Intent;
 import android.graphics.Color;
+import android.graphics.Insets;
 import android.graphics.PixelFormat;
+import android.graphics.Rect;
 import android.graphics.drawable.GradientDrawable;
 import android.os.Build;
 import android.os.IBinder;
 import android.view.Gravity;
 import android.view.MotionEvent;
 import android.view.View;
+import android.view.ViewTreeObserver;
+import android.view.WindowInsets;
 import android.view.WindowManager;
 import android.widget.Button;
 import android.widget.EditText;
@@ -41,6 +45,7 @@ public final class FloatingBallService extends Service {
     private TextView bubbleView;
     private WindowManager.LayoutParams ballParams;
     private WindowManager.LayoutParams bubbleParams;
+    private WindowManager.LayoutParams panelParams;
     private LinearLayout panelView;
     private TextView responseView;
     private LinearLayout suggestionsView;
@@ -54,6 +59,12 @@ public final class FloatingBallService extends Service {
     private SuggestionPoller poller;
     private RealtimeClient realtimeClient;
     private ProactiveMessage lastProactiveMessage;
+    private final FloatingChatContext chatContext = new FloatingChatContext();
+    private String activeConversationId;
+    private ViewTreeObserver.OnGlobalLayoutListener panelLayoutListener;
+    private int panelDefaultY;
+    private int panelDefaultHeight;
+    private boolean panelInputFocused;
     private static final AccountChannel[] ACCOUNT_CHANNELS = new AccountChannel[] {
             new AccountChannel("gmail", "Gmail", "邮件、订单、验证码提醒、邮件正文快照", true),
             new AccountChannel("whatsapp", "WhatsApp Web", "聊天预览、打开会话历史、新消息监听", true),
@@ -85,7 +96,7 @@ public final class FloatingBallService extends Service {
         if (realtimeClient != null) realtimeClient.stop();
         removeView(ballView);
         removeView(bubbleView);
-        removeView(panelView);
+        closePanel();
         super.onDestroy();
     }
 
@@ -118,8 +129,7 @@ public final class FloatingBallService extends Service {
             removeBubble();
             showPanel();
         } else {
-            removeView(panelView);
-            panelView = null;
+            closePanel();
         }
     }
 
@@ -168,6 +178,11 @@ public final class FloatingBallService extends Service {
         chatContentView.addView(chatScrollView, new LinearLayout.LayoutParams(-1, 0, 1));
 
         addChatMessage("Nomi", "我在这里。你可以直接发消息，也可以点右上角打开完整工作台。");
+        if (lastProactiveMessage != null) {
+            String proactive = bubbleText(lastProactiveMessage);
+            addChatMessage("Nomi", proactive);
+            chatContext.addAssistant(proactive);
+        }
 
         EditText input = new EditText(this);
         input.setHint("和 Nomi 说点什么");
@@ -176,6 +191,14 @@ public final class FloatingBallService extends Service {
         input.setMaxLines(3);
         input.setPadding(dp(12), 0, dp(12), 0);
         input.setBackground(rounded(Color.rgb(248, 250, 252), Color.rgb(203, 213, 225), 12));
+        input.setOnFocusChangeListener((view, hasFocus) -> {
+            panelInputFocused = hasFocus;
+            if (panelView != null) panelView.postDelayed(this::adjustPanelForKeyboard, hasFocus ? 250 : 0);
+        });
+        input.setOnClickListener(view -> {
+            panelInputFocused = true;
+            if (panelView != null) panelView.postDelayed(this::adjustPanelForKeyboard, 250);
+        });
         LinearLayout composer = new LinearLayout(this);
         composer.setOrientation(LinearLayout.HORIZONTAL);
         composer.setGravity(Gravity.CENTER_VERTICAL);
@@ -208,22 +231,37 @@ public final class FloatingBallService extends Service {
         panelView.addView(settingsContentView, new LinearLayout.LayoutParams(-1, 0, 1));
         buildSettingsView();
 
-        WindowManager.LayoutParams params = overlayParams(dp(340), dp(440), true);
-        params.gravity = Gravity.TOP | Gravity.START;
-        params.x = dp(24);
-        params.y = dp(220);
-        windowManager.addView(panelView, params);
+        panelDefaultY = dp(220);
+        panelDefaultHeight = dp(440);
+        panelParams = overlayParams(dp(340), panelDefaultHeight, true);
+        panelParams.gravity = Gravity.TOP | Gravity.START;
+        panelParams.x = dp(24);
+        panelParams.y = panelDefaultY;
+        panelParams.softInputMode = WindowManager.LayoutParams.SOFT_INPUT_ADJUST_NOTHING;
+        windowManager.addView(panelView, panelParams);
+        attachPanelKeyboardListener();
     }
 
     private void sendMessage(String text) {
         if (text == null || text.trim().isEmpty()) return;
-        addChatMessage("你", text.trim());
+        String trimmed = text.trim();
+        addChatMessage("你", trimmed);
+        chatContext.addUser(trimmed);
         TextView pending = addChatMessage("Nomi", "正在思考...");
         responseView.setText("");
+        String conversationId = activeConversationId;
+        List<FloatingChatContext.Turn> clientContext = chatContext.snapshot(8);
         executor.execute(() -> {
             try {
-                String answer = api().chat(text.trim());
-                runOnMain(() -> pending.setText(messageText("Nomi", answer.isEmpty() ? "已发送，但没有返回内容。" : answer)));
+                ChatResult result = api().chat(trimmed, conversationId, clientContext);
+                runOnMain(() -> {
+                    if (!result.conversationId.trim().isEmpty()) {
+                        activeConversationId = result.conversationId.trim();
+                    }
+                    String answer = result.answer.isEmpty() ? "已发送，但没有返回内容。" : result.answer;
+                    pending.setText(messageText("Nomi", answer));
+                    chatContext.addAssistant(answer);
+                });
             } catch (Exception error) {
                 runOnMain(() -> pending.setText(messageText("Nomi", "发送失败：" + error.getMessage())));
             }
@@ -231,14 +269,82 @@ public final class FloatingBallService extends Service {
     }
 
     private void closePanel() {
+        detachPanelKeyboardListener();
         removeView(panelView);
         panelView = null;
+        panelParams = null;
+        panelInputFocused = false;
         accountsView = null;
         accountsScrollView = null;
         chatContentView = null;
         settingsContentView = null;
         chatHistoryView = null;
         chatScrollView = null;
+    }
+
+    private void attachPanelKeyboardListener() {
+        if (panelView == null) return;
+        panelLayoutListener = this::adjustPanelForKeyboard;
+        panelView.getViewTreeObserver().addOnGlobalLayoutListener(panelLayoutListener);
+        panelView.setOnApplyWindowInsetsListener((view, insets) -> {
+            adjustPanelForKeyboard();
+            return insets;
+        });
+        panelView.post(this::adjustPanelForKeyboard);
+    }
+
+    private void detachPanelKeyboardListener() {
+        if (panelView == null || panelLayoutListener == null) return;
+        ViewTreeObserver observer = panelView.getViewTreeObserver();
+        if (observer.isAlive()) {
+            observer.removeOnGlobalLayoutListener(panelLayoutListener);
+        }
+        panelLayoutListener = null;
+        panelView.setOnApplyWindowInsetsListener(null);
+    }
+
+    private void adjustPanelForKeyboard() {
+        if (panelView == null || panelParams == null) return;
+
+        int screenHeight = getResources().getDisplayMetrics().heightPixels;
+        int visibleBottom = visibleDisplayBottom(screenHeight);
+        visibleBottom = FloatingPanelLayout.visibleBottomForInputFocus(
+                screenHeight,
+                visibleBottom,
+                panelInputFocused,
+                dp(560),
+                dp(120)
+        );
+        FloatingPanelLayout.Frame frame = FloatingPanelLayout.compute(
+                panelDefaultY,
+                panelDefaultHeight,
+                visibleBottom,
+                screenHeight,
+                dp(24),
+                dp(12),
+                dp(260),
+                dp(120)
+        );
+        if (panelParams.y != frame.y || panelParams.height != frame.height) {
+            panelParams.y = frame.y;
+            panelParams.height = frame.height;
+            windowManager.updateViewLayout(panelView, panelParams);
+        }
+    }
+
+    private int visibleDisplayBottom(int screenHeight) {
+        if (Build.VERSION.SDK_INT >= 30) {
+            WindowInsets insets = panelView.getRootWindowInsets();
+            if (insets != null && insets.isVisible(WindowInsets.Type.ime())) {
+                Insets imeInsets = insets.getInsets(WindowInsets.Type.ime());
+                if (imeInsets.bottom > dp(80)) {
+                    return screenHeight - imeInsets.bottom;
+                }
+            }
+        }
+        Rect visibleFrame = new Rect();
+        panelView.getWindowVisibleDisplayFrame(visibleFrame);
+        return visibleFrame.bottom > 0 ? visibleFrame.bottom : screenHeight;
     }
 
     private void startRealtime() {
