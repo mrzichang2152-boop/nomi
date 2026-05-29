@@ -1,6 +1,6 @@
 # Nomi 256K Context Budget Design
 
-**Status:** Review draft
+**Status:** Implemented in runtime API with known residuals
 **Date:** 2026-05-29
 **Owner:** Nomi project
 
@@ -406,6 +406,35 @@ The design is implemented only when all of the following are true:
 - Context snapshots are persisted and human-readable.
 - Tests assert actual context contents and final answer quality for representative cases.
 - Online server validation confirms behavior with the deployed model endpoint.
+
+## Implementation Status
+
+**Runtime status on 2026-05-29:** Partially implemented and locally verified.
+
+Implemented:
+
+- `/api/chat` and WebSocket chat now infer a `request_scope` from the current message plus `ui_state`.
+- Android/web clients can send active source state through `ui_state.current_source` and `ui_state.source_context`; the server packs it as `source_context`.
+- Chat context retrieval now asks for a wider candidate set and then packs by token budget instead of relying on a fixed last-8-turn client window.
+- Context packs now include `current_request`, `same_conversation`, `source_context`, `task_context`, `agenda_context`, `kv_profile`, `knowledge_graph_context`, `rag_event_memory`, and fallback `memory_context` sections.
+- Active suggestions, route traces, and pipeline execution results are retrieved into `task_context` when relevant to the active conversation or query.
+- Context snapshots now persist after the assistant turn so the payload can include `final_model_answer_event_id` and `final_model_answer_turn_id`.
+- Context pack metadata now includes `context_pack_id`, `retrieval_modes`, `scope_filters_applied`, and `fallback_modes`.
+- Cross-contact filtering uses explicit `counterparty_ids` plus inferred metadata/raw-source entities before ranking, so contact-scoped sensitive memories from another person are excluded by default.
+
+Verified behavior:
+
+- A short reply such as `可以` can retain the immediately prior Nomi question and pending task context.
+- A WhatsApp-scoped Alice request includes the current Alice thread and excludes Bob's sensitive contact-scoped memory with an explicit exclusion reason.
+- The section budget caps now follow the 256K design distribution more closely: current request, same conversation, source context, task context, agenda, KV, graph, and RAG each have separate token caps.
+
+Known residuals:
+
+- Token counting still uses the conservative character-based estimator, recorded as `fallback_modes.tokenizer = conservative_char_estimator`; it is not yet a Qwen tokenizer match.
+- Oversized items are currently truncated with provenance rather than summarized by a model-assisted summarizer.
+- Candidate scoring is still deterministic/heuristic; it does not yet emit the full `scope_score`, `semantic_score`, `recency_score`, and `risk_penalty` score vector proposed above.
+- Current source context is taken from client `ui_state`; a durable Gmail/WhatsApp thread retriever can be added later for clients that cannot provide the visible thread.
+- Online deployed-server validation should be rerun after these local changes are deployed.
 
 ## Open Questions
 

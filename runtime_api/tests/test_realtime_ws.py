@@ -15,7 +15,7 @@ def test_websocket_streams_chat_delta_and_done(monkeypatch):
     monkeypatch.setenv("APP_PASSWORD", "secret")
     from app import main
 
-    monkeypatch.setattr(main, "retrieve_context", lambda message, limit: [{"layer": "semantic_memory", "summary": "用户最近收到订单邮件"}])
+    monkeypatch.setattr(main, "retrieve_context", lambda message, limit, request_scope=None: [{"layer": "semantic_memory", "summary": "用户最近收到订单邮件"}])
 
     async def fake_stream_chat(self, messages, temperature=0.4):
         yield "需要"

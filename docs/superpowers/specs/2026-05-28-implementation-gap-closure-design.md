@@ -1201,3 +1201,39 @@ Remaining provider/non-behavior work after this pass:
 - Real external adapters are still intentionally not connected: Maps, Uber, Gmail/Outlook, WhatsApp send, Amazon/commerce, payment, Drive/Docs/Sheets, and similar providers.
 - Registry/router/slot/persistence extraction from `main.py` remains a maintainability refactor rather than a behavior gap.
 - The visual pipeline dashboard is still UI polish; the local governance/health API exists.
+
+## Phase 3 256K Context Pack Gap Closure Status
+
+**Status:** Implemented locally on 2026-05-29; online deployment validation still needs to be rerun after shipping.
+
+This pass updates Gap 4 and the newer 256K context-budget design:
+
+- Chat requests now derive `request_scope` from the user message plus `ui_state`, including source type, conversation id, counterparty ids, active task ids, topic ids, and output context.
+- `build_context_pack()` now includes explicit sections for current request, same conversation, current source/thread, active task state, agenda, KV profile, knowledge graph context, RAG/event memory, and fallback memory context.
+- Active suggestions, task route traces, and pipeline execution results are retrieved into `task_context`.
+- The chat and WebSocket paths request a wider candidate pool before token packing, so the runtime is no longer bounded by the old small client-side recent-turn window.
+- Context snapshots now include `context_pack_id`, retrieval modes, applied scope filters, tokenizer fallback metadata, and final assistant answer ids in the persisted payload.
+- Cross-contact filtering now considers explicit `counterparty_ids` plus inferred memory metadata, raw source fields, and graph subject/object fields before ranking.
+
+Verified local checks:
+
+```bash
+python3 -m pytest runtime_api/tests/test_context_pack_and_chat.py -q
+python3 -m pytest runtime_api/tests -q
+JAVA_HOME=/opt/homebrew/Cellar/openjdk@17/17.0.19/libexec/openjdk.jdk/Contents/Home gradle :app:testDebugUnitTest
+JAVA_HOME=/opt/homebrew/Cellar/openjdk@17/17.0.19/libexec/openjdk.jdk/Contents/Home gradle :app:assembleDebug
+```
+
+Manual output inspection:
+
+- Simulated an Alice WhatsApp reply where the current source thread asks to confirm `PHONE_1` quote margin, a pending `reply_pipeline` task is waiting for confirmation, and Bob has a sensitive contact-scoped memory.
+- The context pack included Alice source context, the pending task, KV preference, Alice graph edge, and Alice RAG memory.
+- Bob's private memory was excluded with a `Different contact scope` reason.
+- The pack recorded section token counts, retrieval modes, scope filters, and conservative tokenizer fallback.
+
+Remaining limitations:
+
+- Exact Qwen-tokenizer accounting is still not wired; token counts use a conservative estimator and record that fallback.
+- Overflow handling truncates large items with provenance instead of generating model-assisted summaries.
+- Relevance scoring is still heuristic and does not expose the full scoring vector described in the 256K design.
+- Current source/thread context depends on client-provided `ui_state`; durable WhatsApp/Gmail thread retrieval can be added later.

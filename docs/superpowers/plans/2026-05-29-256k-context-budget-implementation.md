@@ -125,3 +125,31 @@ Use at least one chat test or smoke response to confirm:
 - [x] **Step 4: Commit**
 
 Commit runtime, Android, test, and plan changes with a message that describes the context-budget implementation.
+
+### Task 4: Gap Closure After Design Review
+
+**Files:**
+- Modify: `runtime_api/app/main.py`
+- Modify: `runtime_api/tests/test_context_pack_and_chat.py`
+- Modify: `runtime_api/tests/test_realtime_ws.py`
+- Modify: `docs/superpowers/specs/2026-05-29-256k-context-budget-design.md`
+
+- [x] **Step 1: Add failing tests for missing context-pack layers**
+
+Added tests that verify `source_context`, `task_context`, `context_pack_id`, `retrieval_modes`, and `scope_filters_applied` are present and content-bearing, not just empty metadata.
+
+- [x] **Step 2: Add failing test for chat request scope and answer trace**
+
+Added an `/api/chat` test that verifies the endpoint derives request scope from `ui_state`, fetches a wider candidate set with that scope, includes source/task context, and persists a snapshot containing the final assistant answer id.
+
+- [x] **Step 3: Implement the missing runtime behavior**
+
+Implemented request-scope inference, UI source normalization, active task/suggestion retrieval, layered context sections, final answer trace writeback, and wider context candidates for chat/WebSocket paths.
+
+- [x] **Step 4: Inspect a realistic context-pack sample**
+
+Ran a local sample for an Alice WhatsApp reply with a pending quote-check pipeline and a Bob private memory. The output included Alice source/task/KV/graph/RAG context, excluded Bob with a `Different contact scope` reason, and recorded tokenizer fallback metadata.
+
+- [x] **Step 5: Record residual limitations**
+
+Updated the 256K design with implemented behavior and remaining limitations: conservative tokenizer, truncation instead of model summarization, heuristic scoring, client-provided current-source context, and pending online validation.

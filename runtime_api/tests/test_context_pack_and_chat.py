@@ -117,8 +117,8 @@ def test_build_context_pack_uses_token_budget_not_fixed_turn_count():
     assert dialogue_ids == [f"turn-{index}" for index in range(12)]
     assert pack["token_budget"]["model_window"] == 256000
     assert pack["token_budget"]["input_used"] > 0
-    assert pack["sections"][0]["name"] == "same_conversation"
-    assert pack["sections"][0]["tokens_used"] > 0
+    same_conversation = next(section for section in pack["sections"] if section["name"] == "same_conversation")
+    assert same_conversation["tokens_used"] > 0
 
 
 def test_build_context_pack_filters_cross_contact_context_before_ranking():
@@ -186,6 +186,70 @@ def test_build_context_pack_truncates_oversized_items_with_source_trace():
     assert pack["warnings"][0]["type"] == "truncated"
 
 
+def test_build_context_pack_includes_source_task_layers_and_trace_fields():
+    from app.main import build_context_pack
+
+    pack = build_context_pack(
+        "可以",
+        base_context=[
+            {"layer": "working_memory", "key": "reply_style", "value": "简洁"},
+            {
+                "layer": "entity_graph",
+                "event_id": "graph-1",
+                "subject": "Alice",
+                "predicate": "works_on",
+                "object": "PHONE_1",
+            },
+            {
+                "layer": "vector_recall",
+                "event_id": "rag-1",
+                "summary": "Alice 周五会确认 PHONE_1 报价。",
+            },
+        ],
+        assistant_context=[
+            {
+                "layer": "assistant_dialogue",
+                "event_id": "turn-confirm",
+                "conversation_id": "conv-layered",
+                "role": "assistant",
+                "content": "我可以先帮你整理回复草稿，要发给 Alice 吗？",
+            }
+        ],
+        conversation_id="conv-layered",
+        source_context=[
+            {
+                "layer": "current_source_thread",
+                "event_id": "visible-wa",
+                "source_type": "whatsapp",
+                "content": "Alice: Friday works for me.",
+            }
+        ],
+        task_context=[
+            {
+                "layer": "task_trace",
+                "event_id": "trace-1",
+                "pipeline_id": "reply_pipeline",
+                "status": "needs_confirmation",
+            }
+        ],
+        request_scope={"counterparty_ids": ["alice"], "source_type": "whatsapp"},
+    )
+
+    section_names = [section["name"] for section in pack["sections"]]
+    assert pack["context_pack_id"].startswith("ctx_")
+    assert "current_request" in section_names
+    assert "source_context" in section_names
+    assert "task_context" in section_names
+    assert "kv_profile" in section_names
+    assert "knowledge_graph_context" in section_names
+    assert "rag_event_memory" in section_names
+    assert pack["retrieval_modes"]["source_context"] == 1
+    assert pack["scope_filters_applied"]["counterparty_ids"] == ["alice"]
+    assert pack["assistant_dialogue"][0]["inclusion_reason"]
+    assert pack["source_context"][0]["content"] == "Alice: Friday works for me."
+    assert pack["task_context"][0]["pipeline_id"] == "reply_pipeline"
+
+
 def test_normalize_client_delta_dedupes_current_message_and_keeps_prior_question():
     from app.main import normalize_client_dialogue_context
 
@@ -201,6 +265,112 @@ def test_normalize_client_delta_dedupes_current_message_and_keeps_prior_question
 
     assert [item["role"] for item in normalized] == ["assistant"]
     assert normalized[0]["content"] == "需要我帮你核对成本与利润率数据吗？"
+
+
+def test_chat_endpoint_builds_request_scope_uses_wide_candidates_and_persists_answer_trace(monkeypatch):
+    monkeypatch.setenv("APP_PASSWORD", "secret")
+    from app import main
+
+    retrieve_limits = []
+    snapshots = []
+
+    def fake_persist_turn(conn, redis_client, role, content, conversation_id=None, client_type="web", **kwargs):
+        return {
+            "conversation_id": conversation_id or "conv-scope",
+            "turn_id": f"turn-{role}",
+            "event_id": f"event-{role}",
+        }
+
+    def fake_retrieve_context(message, limit, request_scope=None):
+        retrieve_limits.append((limit, request_scope))
+        return [{"layer": "semantic_memory", "event_id": "alice-memory", "content": "Alice 等报价。"}]
+
+    def fake_task_context(query, conversation_id=None, limit=8):
+        return [{"layer": "task_trace", "event_id": "trace-1", "pipeline_id": "reply_pipeline"}]
+
+    def fake_snapshot(conn, event_id, context_type, context_pack):
+        snapshots.append(context_pack)
+
+    def fake_context_pack(
+        message,
+        base_context,
+        assistant_context=None,
+        conversation_id=None,
+        request_scope=None,
+        source_context=None,
+        task_context=None,
+        **kwargs,
+    ):
+        assert request_scope["counterparty_ids"] == ["alice"]
+        assert request_scope["source_type"] == "whatsapp"
+        assert source_context[0]["source_type"] == "whatsapp"
+        assert task_context[0]["pipeline_id"] == "reply_pipeline"
+        return {
+            "context_pack_id": "ctx-test",
+            "query": message,
+            "memory_context": base_context,
+            "assistant_dialogue": assistant_context or [],
+            "agenda_context": [],
+            "source_context": source_context,
+            "task_context": task_context,
+            "included_event_ids": ["event-user", "alice-memory", "trace-1"],
+            "included_memory_ids": ["alice-memory"],
+            "included_agenda_ids": [],
+            "token_budget": {"input_used": 123},
+            "sections": [{"name": "source_context", "tokens_used": 12, "items": source_context}],
+            "excluded": [],
+            "warnings": [],
+            "reason": "scoped context pack",
+        }
+
+    class FakeQwen:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def chat(self, messages):
+            assert "ctx-test" in messages[1]["content"]
+            return "可以，我会基于 Alice 的当前 WhatsApp 上下文处理。"
+
+    class Conn:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return None
+
+    monkeypatch.setattr(main, "db", lambda: Conn())
+    monkeypatch.setattr(main, "redis_client", lambda: object())
+    monkeypatch.setattr(main, "persist_assistant_turn", fake_persist_turn, raising=False)
+    monkeypatch.setattr(main, "retrieve_context", fake_retrieve_context, raising=False)
+    monkeypatch.setattr(main, "retrieve_assistant_dialogue_context", lambda *args, **kwargs: [])
+    monkeypatch.setattr(main, "retrieve_active_agenda_context", lambda *args, **kwargs: [])
+    monkeypatch.setattr(main, "retrieve_active_task_context", fake_task_context, raising=False)
+    monkeypatch.setattr(main, "persist_context_snapshot", fake_snapshot, raising=False)
+    monkeypatch.setattr(main, "build_context_pack", fake_context_pack, raising=False)
+    monkeypatch.setattr(main, "QwenClient", FakeQwen)
+
+    response = TestClient(main.app).post(
+        "/api/chat",
+        headers={"x-par-password": "secret"},
+        json={
+            "message": "帮我回复 Alice 可以",
+            "conversation_id": "conv-scope",
+            "ui_state": {
+                "source_type": "whatsapp",
+                "counterparty_ids": ["Alice"],
+                "current_source": {
+                    "source_type": "whatsapp",
+                    "conversation_id": "wa-alice",
+                    "content": "Alice: Friday works for me.",
+                },
+            },
+        },
+    )
+
+    assert response.status_code == 200
+    assert retrieve_limits[0][0] >= 80
+    assert retrieve_limits[0][1]["counterparty_ids"] == ["alice"]
+    assert snapshots[0]["final_model_answer_event_id"] == "event-assistant"
 
 
 def json_text(value):
@@ -308,7 +478,7 @@ def test_chat_endpoint_persists_turns_uses_context_pack_and_returns_trace(monkey
 
     monkeypatch.setattr(main, "db", lambda: Conn())
     monkeypatch.setattr(main, "redis_client", lambda: Redis())
-    monkeypatch.setattr(main, "retrieve_context", lambda message, limit: [{"layer": "entity_graph", "subject": "alex"}])
+    monkeypatch.setattr(main, "retrieve_context", lambda message, limit, request_scope=None: [{"layer": "entity_graph", "subject": "alex"}])
     monkeypatch.setattr(main, "retrieve_assistant_dialogue_context", lambda *args, **kwargs: [])
     monkeypatch.setattr(main, "persist_assistant_turn", fake_persist_turn, raising=False)
     monkeypatch.setattr(main, "build_context_pack", fake_context_pack, raising=False)
@@ -379,7 +549,7 @@ def test_chat_messages_alias_uses_same_chat_pipeline(monkeypatch):
 
     monkeypatch.setattr(main, "db", lambda: Conn())
     monkeypatch.setattr(main, "redis_client", lambda: object())
-    monkeypatch.setattr(main, "retrieve_context", lambda message, limit: [])
+    monkeypatch.setattr(main, "retrieve_context", lambda message, limit, request_scope=None: [])
     monkeypatch.setattr(main, "retrieve_assistant_dialogue_context", lambda *args, **kwargs: [])
     monkeypatch.setattr(main, "retrieve_active_agenda_context", lambda *args, **kwargs: [])
     monkeypatch.setattr(main, "persist_assistant_turn", fake_persist_turn, raising=False)

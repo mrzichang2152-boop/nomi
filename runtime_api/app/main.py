@@ -158,6 +158,7 @@ class ChatIn(BaseModel):
     client_type: str = Field(default="web", max_length=40)
     client_context: list[dict[str, Any]] = Field(default_factory=list)
     client_context_delta: list[dict[str, Any]] = Field(default_factory=list)
+    ui_state: dict[str, Any] = Field(default_factory=dict)
 
 
 class ToolRouteIn(BaseModel):
@@ -6189,15 +6190,27 @@ def resolve_context_budget(context_budget: Optional[dict[str, Any]] = None) -> d
 def section_token_cap(budget: dict[str, int], section_name: str) -> int:
     target = max(int(budget.get("input_target", 1)), 1)
     fractions = {
-        "same_conversation": 0.24,
-        "memory_context": 0.28,
-        "agenda_context": 0.12,
+        "current_request": 0.06,
+        "same_conversation": 0.16,
+        "source_context": 0.22,
+        "task_context": 0.09,
+        "agenda_context": 0.05,
+        "kv_profile": 0.04,
+        "knowledge_graph_context": 0.08,
+        "rag_event_memory": 0.22,
+        "memory_context": 0.04,
         "provenance": 0.04,
     }
     minimums = {
+        "current_request": 4000,
         "same_conversation": 4000,
-        "memory_context": 4000,
+        "source_context": 4000,
+        "task_context": 2000,
         "agenda_context": 2000,
+        "kv_profile": 1000,
+        "knowledge_graph_context": 2000,
+        "rag_event_memory": 4000,
+        "memory_context": 1000,
         "provenance": 1000,
     }
     cap = max(int(target * fractions.get(section_name, 0.1)), minimums.get(section_name, 1000))
@@ -6217,6 +6230,38 @@ def normalize_scope_values(values: Any) -> set[str]:
     return result
 
 
+def sorted_scope_values(values: Any) -> list[str]:
+    return sorted(normalize_scope_values(values))
+
+
+def normalize_counterparty_values(values: Any) -> set[str]:
+    cleaned: set[str] = set()
+    for value in normalize_scope_values(values):
+        trimmed = re.sub(r"\s+(可以|需要|确认|好的|好|不用|不要|ok|yes)$", "", value).strip()
+        if trimmed:
+            cleaned.add(trimmed)
+    return cleaned
+
+
+def context_item_counterparties(item: dict[str, Any]) -> set[str]:
+    values: list[Any] = []
+    values.extend(normalize_scope_values(item.get("counterparty_ids")))
+    metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
+    scope = metadata.get("memory_scope") if isinstance(metadata.get("memory_scope"), dict) else {}
+    if scope:
+        values.extend(normalize_scope_values(scope.get("counterparty_ids")))
+        values.extend(normalize_scope_values(scope.get("related_entities")))
+        values.extend([scope.get("conversation_label"), scope.get("speaker")])
+    raw_data = item.get("raw_data") if isinstance(item.get("raw_data"), dict) else {}
+    if raw_data:
+        values.extend([raw_data.get("chat_name"), raw_data.get("sender"), raw_data.get("speaker")])
+    for key in ("subject", "object"):
+        value = item.get(key)
+        if value:
+            values.append(value)
+    return normalize_scope_values(values)
+
+
 def context_item_scope_exclusion(
     item: dict[str, Any],
     request_scope: Optional[dict[str, Any]],
@@ -6224,7 +6269,7 @@ def context_item_scope_exclusion(
     if not request_scope:
         return None
     allowed_counterparties = normalize_scope_values(request_scope.get("counterparty_ids"))
-    item_counterparties = normalize_scope_values(item.get("counterparty_ids"))
+    item_counterparties = context_item_counterparties(item)
     if not allowed_counterparties or not item_counterparties:
         return None
     visibility = str(item.get("visibility_scope") or "").lower()
@@ -6239,6 +6284,85 @@ def context_item_scope_exclusion(
             f"{sorted(item_counterparties)} not in request scope {sorted(allowed_counterparties)}"
         )
     return None
+
+
+def infer_request_scope(message: str, ui_state: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+    ui_state = ui_state or {}
+    policy = infer_memory_access_policy(message, explicit_context=ui_state)
+    counterparties: set[str] = set()
+    counterparties.update(normalize_counterparty_values(ui_state.get("counterparty_ids")))
+    counterparties.update(normalize_counterparty_values(ui_state.get("counterparty_id")))
+    counterparties.update(normalize_counterparty_values(ui_state.get("contact_id")))
+    counterparties.update(normalize_counterparty_values(ui_state.get("contact_name")))
+    counterparties.update(normalize_counterparty_values(policy.get("target_entities")))
+    current_source = ui_state.get("current_source") if isinstance(ui_state.get("current_source"), dict) else {}
+    if current_source:
+        counterparties.update(normalize_counterparty_values(current_source.get("counterparty_ids")))
+        counterparties.update(normalize_counterparty_values(current_source.get("counterparty_id")))
+        counterparties.update(normalize_counterparty_values(current_source.get("contact_name")))
+    source_type = str(ui_state.get("source_type") or current_source.get("source_type") or "").strip().lower()
+    active_task_ids = sorted_scope_values(ui_state.get("active_task_ids") or ui_state.get("active_task_id"))
+    topic_ids = sorted_scope_values(ui_state.get("topic_ids") or ui_state.get("topic_id"))
+    return {
+        "primary_scope": str(ui_state.get("primary_scope") or ("contact_scoped" if counterparties else "assistant_conversation")),
+        "source_type": source_type,
+        "conversation_id": str(ui_state.get("conversation_id") or current_source.get("conversation_id") or "").strip(),
+        "counterparty_ids": sorted(counterparties),
+        "active_task_ids": active_task_ids,
+        "topic_ids": topic_ids,
+        "output_context": policy.get("output_context"),
+    }
+
+
+def normalize_ui_state_source_context(
+    ui_state: Optional[dict[str, Any]],
+    request_scope: dict[str, Any],
+) -> list[dict[str, Any]]:
+    ui_state = ui_state or {}
+    raw_items: list[dict[str, Any]] = []
+    current_source = ui_state.get("current_source")
+    if isinstance(current_source, dict):
+        raw_items.append(current_source)
+    source_context = ui_state.get("source_context")
+    if isinstance(source_context, list):
+        raw_items.extend([item for item in source_context if isinstance(item, dict)])
+    normalized: list[dict[str, Any]] = []
+    for index, item in enumerate(raw_items):
+        content = str(item.get("content") or item.get("text") or item.get("summary") or "").strip()
+        if not content and not item.get("raw_data"):
+            continue
+        normalized.append(
+            {
+                "layer": "current_source_thread",
+                "source": "ui_state",
+                "event_id": str(item.get("event_id") or f"ui-source-{index}"),
+                "source_type": str(item.get("source_type") or request_scope.get("source_type") or "").strip().lower(),
+                "conversation_id": str(item.get("conversation_id") or request_scope.get("conversation_id") or ""),
+                "counterparty_ids": sorted_scope_values(item.get("counterparty_ids") or request_scope.get("counterparty_ids")),
+                "content": truncate_text_by_token_budget(content or json.dumps(item.get("raw_data"), ensure_ascii=False), 4000),
+            }
+        )
+    return normalized
+
+
+def context_section_name_for_memory_item(item: dict[str, Any]) -> str:
+    layer = str(item.get("layer") or "").lower()
+    if layer == "working_memory":
+        return "kv_profile"
+    if layer == "entity_graph":
+        return "knowledge_graph_context"
+    if layer in {"vector_recall", "bm25_recall", "semantic_memory", "timeline"}:
+        return "rag_event_memory"
+    return "memory_context"
+
+
+def retrieval_modes_for_pack(sections: list[dict[str, Any]]) -> dict[str, int]:
+    modes: dict[str, int] = {}
+    for section in sections:
+        items = section.get("items") or []
+        if items:
+            modes[str(section.get("name") or "unknown")] = len(items)
+    return modes
 
 
 def pack_context_section(
@@ -6256,6 +6380,7 @@ def pack_context_section(
         source_id = source_id_for_context_item(item, f"{section_name}-{index}")
         next_item = dict(item)
         next_item.setdefault("source_id", source_id)
+        next_item.setdefault("inclusion_reason", f"Included in {section_name} by scope, relevance, and token budget.")
         content = next_item.get("content")
         if isinstance(content, str) and estimate_context_tokens(content) > single_item_limit:
             next_item["content"] = truncate_text_by_token_budget(content, single_item_limit)
@@ -6448,6 +6573,120 @@ def retrieve_active_agenda_context(
     return relevant_agenda_items(query, candidates, limit=limit)
 
 
+def retrieve_active_task_context(
+    query: str,
+    conversation_id: Optional[str] = None,
+    limit: int = 8,
+) -> list[dict[str, Any]]:
+    pattern = f"%{query}%"
+    conversation_text = str(conversation_id or "")
+    items: list[dict[str, Any]] = []
+    try:
+        with db() as conn:
+            if not hasattr(conn, "execute"):
+                return []
+            suggestion_rows = conn.execute(
+                """
+                SELECT id, source_event_id, title, body, priority, status, metadata, created_at, updated_at
+                FROM proactive_suggestions
+                WHERE status = 'open'
+                  AND (title ILIKE %s OR body ILIKE %s OR metadata::text ILIKE %s)
+                ORDER BY priority DESC, created_at DESC
+                LIMIT %s
+                """,
+                (pattern, pattern, f"%{conversation_text}%" if conversation_text else pattern, limit),
+            ).fetchall()
+            route_rows = conn.execute(
+                """
+                SELECT id, request, route_type, capability_id, pipeline_id, risk_permission,
+                       confirmation_required, task_route_decision, openclaw_task_packet,
+                       clarification, context_summary, created_at,
+                       source_event_ids, conversation_id, suggestion_id, agenda_item_ids
+                FROM task_route_traces
+                WHERE conversation_id = %s
+                   OR request ILIKE %s
+                   OR context_summary::text ILIKE %s
+                ORDER BY created_at DESC
+                LIMIT %s
+                """,
+                (conversation_text, pattern, pattern, limit),
+            ).fetchall()
+            execution_rows = conn.execute(
+                """
+                SELECT id, task_trace_id, request, route_type, capability_id, pipeline_id, status,
+                       required_slots, resolved_slots, missing_slots, risk, execution_guard,
+                       source_event_ids, conversation_id, suggestion_id, agenda_item_ids, result, created_at
+                FROM pipeline_execution_results
+                WHERE conversation_id = %s
+                   OR request ILIKE %s
+                   OR result::text ILIKE %s
+                ORDER BY created_at DESC
+                LIMIT %s
+                """,
+                (conversation_text, pattern, pattern, limit),
+            ).fetchall()
+    except (psycopg.Error, AttributeError):
+        return []
+
+    for row in suggestion_rows:
+        items.append(
+            {
+                "layer": "proactive_suggestion",
+                "event_id": str(row[1]) if row[1] else str(row[0]),
+                "suggestion_id": str(row[0]),
+                "title": row[2],
+                "content": row[3],
+                "priority": row[4],
+                "status": row[5],
+                "metadata": row[6] or {},
+                "created_at": row[7].isoformat() if hasattr(row[7], "isoformat") else row[7],
+                "inclusion_reason": "Open proactive suggestion relevant to current conversation or query.",
+            }
+        )
+    for row in route_rows:
+        items.append(
+            {
+                "layer": "task_trace",
+                "event_id": str(row[0]),
+                "trace_id": str(row[0]),
+                "request": row[1],
+                "route_type": row[2],
+                "capability_id": row[3],
+                "pipeline_id": row[4],
+                "risk_permission": row[5],
+                "confirmation_required": bool(row[6]),
+                "source_event_ids": [str(item) for item in (row[12] or [])],
+                "conversation_id": str(row[13]) if row[13] else None,
+                "suggestion_id": str(row[14]) if row[14] else None,
+                "agenda_item_ids": [str(item) for item in (row[15] or [])],
+                "inclusion_reason": "Recent task routing trace relevant to current conversation or query.",
+            }
+        )
+    for row in execution_rows:
+        items.append(
+            {
+                "layer": "pipeline_execution",
+                "event_id": str(row[0]),
+                "execution_id": str(row[0]),
+                "task_trace_id": str(row[1]) if row[1] else None,
+                "request": row[2],
+                "route_type": row[3],
+                "capability_id": row[4],
+                "pipeline_id": row[5],
+                "status": row[6],
+                "resolved_slots": row[8] or {},
+                "missing_slots": row[9] or [],
+                "source_event_ids": [str(item) for item in (row[12] or [])],
+                "conversation_id": str(row[13]) if row[13] else None,
+                "suggestion_id": str(row[14]) if row[14] else None,
+                "agenda_item_ids": [str(item) for item in (row[15] or [])],
+                "result": row[16] or {},
+                "inclusion_reason": "Recent pipeline execution result relevant to current conversation or query.",
+            }
+        )
+    return items[:limit]
+
+
 def collect_context_ids(items: list[dict[str, Any]]) -> list[str]:
     ids: list[str] = []
     for item in items:
@@ -6465,6 +6704,8 @@ def build_context_pack(
     assistant_context: Optional[list[dict[str, Any]]] = None,
     conversation_id: Optional[str] = None,
     agenda_context: Optional[list[dict[str, Any]]] = None,
+    source_context: Optional[list[dict[str, Any]]] = None,
+    task_context: Optional[list[dict[str, Any]]] = None,
     max_dialogue_items: int = 64,
     context_budget: Optional[dict[str, Any]] = None,
     request_scope: Optional[dict[str, Any]] = None,
@@ -6472,6 +6713,9 @@ def build_context_pack(
     budget = resolve_context_budget(context_budget)
     assistant_context = assistant_context or []
     agenda_context = agenda_context or []
+    source_context = source_context or []
+    task_context = task_context or []
+    request_scope = request_scope or {}
     selected_dialogue = relevant_assistant_dialogue_items(
         message,
         assistant_context,
@@ -6490,6 +6734,20 @@ def build_context_pack(
             continue
         scoped_memory.append(item)
 
+    current_request_item = {
+        "source_id": "current-request",
+        "layer": "current_request",
+        "role": "user",
+        "content": truncate_text_by_token_budget(message, min(16000, budget["single_item_token_limit"])),
+        "inclusion_reason": "Always included as the active user request.",
+    }
+    packed_request, request_section = pack_context_section(
+        "current_request",
+        [current_request_item],
+        budget,
+        warnings,
+        excluded,
+    )
     packed_dialogue, dialogue_section = pack_context_section(
         "same_conversation",
         selected_dialogue,
@@ -6497,9 +6755,16 @@ def build_context_pack(
         warnings,
         excluded,
     )
-    packed_memory, memory_section = pack_context_section(
-        "memory_context",
-        scoped_memory,
+    packed_source, source_section = pack_context_section(
+        "source_context",
+        source_context,
+        budget,
+        warnings,
+        excluded,
+    )
+    packed_task, task_section = pack_context_section(
+        "task_context",
+        task_context,
         budget,
         warnings,
         excluded,
@@ -6511,10 +6776,20 @@ def build_context_pack(
         warnings,
         excluded,
     )
-    sections = [dialogue_section, memory_section, agenda_section]
+    memory_sections: list[dict[str, Any]] = []
+    packed_memory: list[dict[str, Any]] = []
+    for section_name in ["kv_profile", "knowledge_graph_context", "rag_event_memory", "memory_context"]:
+        section_items = [item for item in scoped_memory if context_section_name_for_memory_item(item) == section_name]
+        packed_items, section = pack_context_section(section_name, section_items, budget, warnings, excluded)
+        packed_memory.extend(packed_items)
+        memory_sections.append(section)
+    sections = [request_section, dialogue_section, source_section, task_section, agenda_section] + memory_sections
     input_used = sum(int(section.get("tokens_used") or 0) for section in sections)
     included_event_ids = (
-        collect_context_ids(packed_dialogue)
+        collect_context_ids(packed_request)
+        + collect_context_ids(packed_dialogue)
+        + collect_context_ids(packed_source)
+        + collect_context_ids(packed_task)
         + collect_context_ids(packed_memory)
         + collect_context_ids(packed_agenda)
     )
@@ -6525,10 +6800,14 @@ def build_context_pack(
     included_agenda_ids = [str(item.get("id")) for item in packed_agenda if item.get("id")]
     return {
         "query": message,
+        "context_pack_id": f"ctx_{uuid.uuid4().hex}",
         "conversation_id": conversation_id,
-        "request_scope": request_scope or {},
+        "request_scope": request_scope,
+        "current_request": packed_request,
         "memory_context": packed_memory,
         "assistant_dialogue": packed_dialogue,
+        "source_context": packed_source,
+        "task_context": packed_task,
         "agenda_context": packed_agenda,
         "included_event_ids": included_event_ids,
         "included_memory_ids": list(dict.fromkeys(included_memory_ids)),
@@ -6537,6 +6816,9 @@ def build_context_pack(
         "sections": sections,
         "excluded": excluded,
         "warnings": warnings,
+        "retrieval_modes": retrieval_modes_for_pack(sections),
+        "scope_filters_applied": request_scope,
+        "fallback_modes": {"tokenizer": "conservative_char_estimator"},
         "reason": "bounded context pack: active conversation, relevant assistant dialogue, active agenda, scoped memory, and source ids",
     }
 
@@ -6625,7 +6907,7 @@ def persist_context_snapshot(
     )
 
 
-def retrieve_context(query: str, limit: int) -> list[dict[str, Any]]:
+def retrieve_context(query: str, limit: int, request_scope: Optional[dict[str, Any]] = None) -> list[dict[str, Any]]:
     pattern = f"%{query}%"
     graph_pattern = normalize_retrieval_pattern(query)
     patterns = token_patterns(query)
@@ -6717,7 +6999,7 @@ def retrieve_context(query: str, limit: int) -> list[dict[str, Any]]:
                 (query_vector, plan.vector_limit),
             ).fetchall()
     context = build_reasoning_context(state_rows, timeline_rows, semantic_rows, fact_rows, bm25_rows, vector_rows)
-    policy = infer_memory_access_policy(query)
+    policy = infer_memory_access_policy(query, explicit_context=request_scope or {})
     scoped_context = filter_context_by_memory_access_policy(context, policy)
     return rerank_context(query, scoped_context)[: max(limit, 1)]
 
@@ -6735,7 +7017,10 @@ async def chat(body: ChatIn, x_par_password: Optional[str] = Header(default=None
             conversation_id=body.conversation_id,
             client_type=body.client_type,
         )
-    context = retrieve_context(body.message, body.limit)
+    request_scope = infer_request_scope(body.message, body.ui_state)
+    source_context = normalize_ui_state_source_context(body.ui_state, request_scope)
+    context_candidate_limit = max(body.limit, 80)
+    context = retrieve_context(body.message, context_candidate_limit, request_scope=request_scope)
     assistant_context = retrieve_assistant_dialogue_context(
         body.message,
         conversation_id=user_turn["conversation_id"],
@@ -6753,20 +7038,26 @@ async def chat(body: ChatIn, x_par_password: Optional[str] = Header(default=None
         conversation_id=user_turn["conversation_id"],
         limit=6,
     )
+    task_context = retrieve_active_task_context(
+        body.message,
+        conversation_id=user_turn["conversation_id"],
+        limit=8,
+    )
     context_pack = build_context_pack(
         body.message,
         context,
         assistant_context=client_dialogue_context + assistant_context,
         conversation_id=user_turn["conversation_id"],
         agenda_context=agenda_context,
+        source_context=source_context,
+        task_context=task_context,
+        request_scope=request_scope,
         context_budget={"input_target": CONTEXT_INPUT_TARGET_TOKENS, "hard_input_ceiling": CONTEXT_HARD_INPUT_CEILING_TOKENS},
     )
-    with db() as conn:
-        persist_context_snapshot(conn, user_turn["event_id"], "chat_response", context_pack)
     messages = build_chat_messages(body.message, context_pack)
     answer = await QwenClient(MODEL_BASE_URL, MODEL_NAME).chat(messages)
     with db() as conn:
-        persist_assistant_turn(
+        assistant_turn = persist_assistant_turn(
             conn,
             redis_obj,
             role="assistant",
@@ -6774,6 +7065,10 @@ async def chat(body: ChatIn, x_par_password: Optional[str] = Header(default=None
             conversation_id=user_turn["conversation_id"],
             client_type=body.client_type,
         )
+    context_pack["final_model_answer_event_id"] = assistant_turn["event_id"]
+    context_pack["final_model_answer_turn_id"] = assistant_turn["turn_id"]
+    with db() as conn:
+        persist_context_snapshot(conn, user_turn["event_id"], "chat_response", context_pack)
     return {
         "answer": answer,
         "sources": decorate_context_sources(context),
@@ -6785,6 +7080,8 @@ async def chat(body: ChatIn, x_par_password: Optional[str] = Header(default=None
             "assistant_dialogue_count": len(context_pack.get("assistant_dialogue", [])),
             "agenda_context_count": len(context_pack.get("agenda_context", [])),
             "memory_context_count": len(context_pack.get("memory_context", [])),
+            "source_context_count": len(context_pack.get("source_context", [])),
+            "task_context_count": len(context_pack.get("task_context", [])),
             "token_budget": context_pack.get("token_budget", {}),
             "sections": [
                 {
@@ -6796,6 +7093,9 @@ async def chat(body: ChatIn, x_par_password: Optional[str] = Header(default=None
             ],
             "excluded": context_pack.get("excluded", []),
             "warnings": context_pack.get("warnings", []),
+            "context_pack_id": context_pack.get("context_pack_id"),
+            "retrieval_modes": context_pack.get("retrieval_modes", {}),
+            "scope_filters_applied": context_pack.get("scope_filters_applied", {}),
             "reason": context_pack["reason"],
         },
     }
@@ -6899,22 +7199,21 @@ async def stream_chat_to_websocket(
             )
     except psycopg.Error:
         user_turn = transient_assistant_turn("user", conversation_id)
-    context = retrieve_context(message, max(1, min(limit, 30)))
+    request_scope = infer_request_scope(message, {})
+    context = retrieve_context(message, max(80, min(limit, 50)), request_scope=request_scope)
     assistant_context = retrieve_assistant_dialogue_context(message, conversation_id=user_turn["conversation_id"], limit=64)
     agenda_context = retrieve_active_agenda_context(message, conversation_id=user_turn["conversation_id"], limit=6)
+    task_context = retrieve_active_task_context(message, conversation_id=user_turn["conversation_id"], limit=8)
     context_pack = build_context_pack(
         message,
         context,
         assistant_context=assistant_context,
         conversation_id=user_turn["conversation_id"],
         agenda_context=agenda_context,
+        task_context=task_context,
+        request_scope=request_scope,
         context_budget={"input_target": CONTEXT_INPUT_TARGET_TOKENS, "hard_input_ceiling": CONTEXT_HARD_INPUT_CEILING_TOKENS},
     )
-    try:
-        with db() as conn:
-            persist_context_snapshot(conn, user_turn["event_id"], "websocket_chat_response", context_pack)
-    except psycopg.Error:
-        pass
     messages = build_chat_messages(message, context_pack)
     answer_parts: list[str] = []
     async for delta in QwenClient(MODEL_BASE_URL, MODEL_NAME).stream_chat(messages):
@@ -6925,7 +7224,7 @@ async def stream_chat_to_websocket(
     answer = "".join(answer_parts)
     try:
         with db() as conn:
-            persist_assistant_turn(
+            assistant_turn = persist_assistant_turn(
                 conn,
                 redis_obj,
                 role="assistant",
@@ -6933,6 +7232,9 @@ async def stream_chat_to_websocket(
                 conversation_id=user_turn["conversation_id"],
                 client_type=client_type,
             )
+            context_pack["final_model_answer_event_id"] = assistant_turn["event_id"]
+            context_pack["final_model_answer_turn_id"] = assistant_turn["turn_id"]
+            persist_context_snapshot(conn, user_turn["event_id"], "websocket_chat_response", context_pack)
     except psycopg.Error:
         pass
     await websocket.send_json(
@@ -6948,6 +7250,8 @@ async def stream_chat_to_websocket(
                 "assistant_dialogue_count": len(context_pack.get("assistant_dialogue", [])),
                 "agenda_context_count": len(context_pack.get("agenda_context", [])),
                 "memory_context_count": len(context_pack.get("memory_context", [])),
+                "source_context_count": len(context_pack.get("source_context", [])),
+                "task_context_count": len(context_pack.get("task_context", [])),
                 "token_budget": context_pack.get("token_budget", {}),
                 "sections": [
                     {
@@ -6959,6 +7263,9 @@ async def stream_chat_to_websocket(
                 ],
                 "excluded": context_pack.get("excluded", []),
                 "warnings": context_pack.get("warnings", []),
+                "context_pack_id": context_pack.get("context_pack_id"),
+                "retrieval_modes": context_pack.get("retrieval_modes", {}),
+                "scope_filters_applied": context_pack.get("scope_filters_applied", {}),
                 "reason": context_pack["reason"],
             },
         }
