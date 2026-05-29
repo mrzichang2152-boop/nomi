@@ -91,6 +91,124 @@ def test_build_context_pack_includes_relevant_dialogue_and_excludes_unrelated():
     assert "bounded" in pack["reason"]
 
 
+def test_build_context_pack_uses_token_budget_not_fixed_turn_count():
+    from app.main import build_context_pack
+
+    assistant_context = [
+        {
+            "layer": "assistant_dialogue",
+            "event_id": f"turn-{index}",
+            "conversation_id": "conv-budget",
+            "role": "assistant" if index % 2 else "user",
+            "content": f"PHONE_1 报价上下文第 {index} 条，包含成本、利润率和客户反馈。",
+        }
+        for index in range(12)
+    ]
+
+    pack = build_context_pack(
+        "继续核对 PHONE_1 的成本与利润率",
+        base_context=[],
+        assistant_context=assistant_context,
+        conversation_id="conv-budget",
+        context_budget={"input_target": 12000, "hard_input_ceiling": 16000},
+    )
+
+    dialogue_ids = [item["event_id"] for item in pack["assistant_dialogue"]]
+    assert dialogue_ids == [f"turn-{index}" for index in range(12)]
+    assert pack["token_budget"]["model_window"] == 256000
+    assert pack["token_budget"]["input_used"] > 0
+    assert pack["sections"][0]["name"] == "same_conversation"
+    assert pack["sections"][0]["tokens_used"] > 0
+
+
+def test_build_context_pack_filters_cross_contact_context_before_ranking():
+    from app.main import build_context_pack
+
+    pack = build_context_pack(
+        "帮我回复 Alice",
+        base_context=[
+            {
+                "layer": "semantic_memory",
+                "event_id": "alice-event",
+                "content": "Alice 说这周五可以确认报价。",
+                "counterparty_ids": ["alice"],
+                "visibility_scope": "contact_scoped",
+                "sensitivity_level": "medium",
+            },
+            {
+                "layer": "semantic_memory",
+                "event_id": "bob-private",
+                "content": "Bob 私下抱怨 Alice 不靠谱。",
+                "counterparty_ids": ["bob"],
+                "visibility_scope": "contact_scoped",
+                "sensitivity_level": "high",
+            },
+        ],
+        assistant_context=[],
+        conversation_id="conv-alice",
+        request_scope={"counterparty_ids": ["alice"], "primary_scope": "contact_scoped"},
+    )
+
+    memory_text = json_text(pack["memory_context"])
+    assert "Alice 说这周五可以确认报价" in memory_text
+    assert "Bob 私下抱怨" not in memory_text
+    assert pack["excluded"][0]["source_id"] == "bob-private"
+    assert "Different contact scope" in pack["excluded"][0]["reason"]
+
+
+def test_build_context_pack_truncates_oversized_items_with_source_trace():
+    from app.main import build_context_pack
+
+    long_content = "这是一封很长的邮件。" * 400
+    pack = build_context_pack(
+        "总结这封邮件",
+        base_context=[
+            {
+                "layer": "vector_recall",
+                "event_id": "long-email-1",
+                "content": long_content,
+                "source_event_ids": ["long-email-source"],
+            }
+        ],
+        assistant_context=[],
+        context_budget={
+            "input_target": 900,
+            "hard_input_ceiling": 1200,
+            "single_item_token_limit": 80,
+        },
+    )
+
+    packed_item = pack["memory_context"][0]
+    assert packed_item["event_id"] == "long-email-1"
+    assert packed_item["truncated"] is True
+    assert len(packed_item["content"]) < len(long_content)
+    assert pack["warnings"][0]["source_id"] == "long-email-1"
+    assert pack["warnings"][0]["type"] == "truncated"
+
+
+def test_normalize_client_delta_dedupes_current_message_and_keeps_prior_question():
+    from app.main import normalize_client_dialogue_context
+
+    normalized = normalize_client_dialogue_context(
+        [
+            {"role": "assistant", "content": "需要我帮你核对成本与利润率数据吗？"},
+            {"role": "user", "content": "需要"},
+        ],
+        "conv-1",
+        current_message="需要",
+        token_budget=1000,
+    )
+
+    assert [item["role"] for item in normalized] == ["assistant"]
+    assert normalized[0]["content"] == "需要我帮你核对成本与利润率数据吗？"
+
+
+def json_text(value):
+    import json
+
+    return json.dumps(value, ensure_ascii=False, default=str)
+
+
 def test_persist_assistant_turn_creates_private_event_turn_and_queue(monkeypatch):
     monkeypatch.setenv("APP_PASSWORD", "secret")
     from app import main
@@ -155,7 +273,9 @@ def test_chat_endpoint_persists_turns_uses_context_pack_and_returns_trace(monkey
 
     def fake_context_pack(message, base_context, assistant_context=None, conversation_id=None, **kwargs):
         assistant_text = "\n".join(item.get("content", "") for item in assistant_context or [])
+        assert [item.get("role") for item in assistant_context or []] == ["assistant"]
         assert "核对成本与利润率" in assistant_text
+        assert assistant_text.count("需要") == 1
         return {
             "query": message,
             "memory_context": base_context,
@@ -203,7 +323,7 @@ def test_chat_endpoint_persists_turns_uses_context_pack_and_returns_trace(monkey
             "message": "需要",
             "limit": 8,
             "conversation_id": "conv-1",
-            "client_context": [
+            "client_context_delta": [
                 {"role": "assistant", "content": "需要我帮你核对成本与利润率数据吗？"},
                 {"role": "user", "content": "需要"},
             ],

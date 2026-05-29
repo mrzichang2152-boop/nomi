@@ -45,6 +45,12 @@ LOW_VALUE_RAW_RETENTION_DAYS = int(os.getenv("LOW_VALUE_RAW_RETENTION_DAYS", "7"
 ENABLE_OPENCLAW_JOB_RUNNER = os.getenv("ENABLE_OPENCLAW_JOB_RUNNER", "true").lower() == "true"
 OPENCLAW_JOB_RUNNER_INTERVAL_SECONDS = float(os.getenv("OPENCLAW_JOB_RUNNER_INTERVAL_SECONDS", "5"))
 OPENCLAW_JOB_RUNNER_BATCH_SIZE = int(os.getenv("OPENCLAW_JOB_RUNNER_BATCH_SIZE", "2"))
+CONTEXT_MODEL_WINDOW_TOKENS = int(os.getenv("CONTEXT_MODEL_WINDOW_TOKENS", "256000"))
+CONTEXT_OUTPUT_RESERVED_TOKENS = int(os.getenv("CONTEXT_OUTPUT_RESERVED_TOKENS", "32000"))
+CONTEXT_SAFETY_RESERVED_TOKENS = int(os.getenv("CONTEXT_SAFETY_RESERVED_TOKENS", "12000"))
+CONTEXT_INPUT_TARGET_TOKENS = int(os.getenv("CONTEXT_INPUT_TARGET_TOKENS", "208000"))
+CONTEXT_HARD_INPUT_CEILING_TOKENS = int(os.getenv("CONTEXT_HARD_INPUT_CEILING_TOKENS", "224000"))
+CONTEXT_SINGLE_ITEM_TOKEN_LIMIT = int(os.getenv("CONTEXT_SINGLE_ITEM_TOKEN_LIMIT", "8000"))
 
 DEFAULT_COMPOSIO_READONLY_TOOLKITS = [
     "gmail",
@@ -146,11 +152,12 @@ class LoginIn(BaseModel):
 
 
 class ChatIn(BaseModel):
-    message: str = Field(min_length=1, max_length=4000)
-    limit: int = Field(default=12, ge=1, le=30)
+    message: str = Field(min_length=1, max_length=50000)
+    limit: int = Field(default=12, ge=1, le=50)
     conversation_id: Optional[str] = None
     client_type: str = Field(default="web", max_length=40)
     client_context: list[dict[str, Any]] = Field(default_factory=list)
+    client_context_delta: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class ToolRouteIn(BaseModel):
@@ -6118,11 +6125,172 @@ def run_daily_memory_maintenance(
     }
 
 
+def estimate_context_tokens(value: Any) -> int:
+    if value is None:
+        return 0
+    if isinstance(value, str):
+        text = value
+    else:
+        text = json.dumps(value, ensure_ascii=False, default=str)
+    cjk_chars = sum(1 for char in text if "\u4e00" <= char <= "\u9fff")
+    non_cjk_chars = len(text) - cjk_chars
+    return max(1, cjk_chars + (non_cjk_chars + 3) // 4)
+
+
+def truncate_text_by_token_budget(text: str, max_tokens: int) -> str:
+    clean = str(text or "")
+    if estimate_context_tokens(clean) <= max_tokens:
+        return clean
+    if max_tokens <= 8:
+        return clean[: max(max_tokens, 1)]
+    result: list[str] = []
+    used = 0
+    for char in clean:
+        char_tokens = estimate_context_tokens(char)
+        if used + char_tokens > max_tokens - 6:
+            break
+        result.append(char)
+        used += char_tokens
+    return "".join(result).rstrip() + "\n[truncated]"
+
+
+def source_id_for_context_item(item: dict[str, Any], fallback: str) -> str:
+    for key in ("event_id", "id", "memory_id"):
+        value = item.get(key)
+        if value:
+            return str(value)
+    source_event_ids = item.get("source_event_ids") or []
+    if source_event_ids:
+        return str(source_event_ids[0])
+    return fallback
+
+
+def resolve_context_budget(context_budget: Optional[dict[str, Any]] = None) -> dict[str, int]:
+    raw = context_budget or {}
+    model_window = int(raw.get("model_window", CONTEXT_MODEL_WINDOW_TOKENS))
+    output_reserved = int(raw.get("output_reserved", CONTEXT_OUTPUT_RESERVED_TOKENS))
+    safety_reserved = int(raw.get("safety_reserved", CONTEXT_SAFETY_RESERVED_TOKENS))
+    hard_input_ceiling = int(raw.get("hard_input_ceiling", CONTEXT_HARD_INPUT_CEILING_TOKENS))
+    hard_input_ceiling = min(hard_input_ceiling, max(model_window - output_reserved - safety_reserved, 1))
+    input_target = int(raw.get("input_target", CONTEXT_INPUT_TARGET_TOKENS))
+    input_target = min(input_target, hard_input_ceiling)
+    single_item_limit = int(raw.get("single_item_token_limit", CONTEXT_SINGLE_ITEM_TOKEN_LIMIT))
+    single_item_limit = max(1, min(single_item_limit, hard_input_ceiling))
+    return {
+        "model_window": model_window,
+        "output_reserved": output_reserved,
+        "safety_reserved": safety_reserved,
+        "input_target": input_target,
+        "hard_input_ceiling": hard_input_ceiling,
+        "single_item_token_limit": single_item_limit,
+    }
+
+
+def section_token_cap(budget: dict[str, int], section_name: str) -> int:
+    target = max(int(budget.get("input_target", 1)), 1)
+    fractions = {
+        "same_conversation": 0.24,
+        "memory_context": 0.28,
+        "agenda_context": 0.12,
+        "provenance": 0.04,
+    }
+    minimums = {
+        "same_conversation": 4000,
+        "memory_context": 4000,
+        "agenda_context": 2000,
+        "provenance": 1000,
+    }
+    cap = max(int(target * fractions.get(section_name, 0.1)), minimums.get(section_name, 1000))
+    return min(cap, int(budget.get("hard_input_ceiling", target)))
+
+
+def normalize_scope_values(values: Any) -> set[str]:
+    if values is None:
+        return set()
+    if isinstance(values, str):
+        values = [values]
+    result: set[str] = set()
+    for value in values or []:
+        clean = str(value or "").strip().lower()
+        if clean:
+            result.add(clean)
+    return result
+
+
+def context_item_scope_exclusion(
+    item: dict[str, Any],
+    request_scope: Optional[dict[str, Any]],
+) -> Optional[str]:
+    if not request_scope:
+        return None
+    allowed_counterparties = normalize_scope_values(request_scope.get("counterparty_ids"))
+    item_counterparties = normalize_scope_values(item.get("counterparty_ids"))
+    if not allowed_counterparties or not item_counterparties:
+        return None
+    visibility = str(item.get("visibility_scope") or "").lower()
+    sensitivity = str(item.get("sensitivity_level") or "").lower()
+    protected_scope = visibility in {"contact_scoped", "thread_scoped", "private_third_party"} or sensitivity in {
+        "high",
+        "critical",
+    }
+    if protected_scope and allowed_counterparties.isdisjoint(item_counterparties):
+        return (
+            "Different contact scope: candidate counterparties "
+            f"{sorted(item_counterparties)} not in request scope {sorted(allowed_counterparties)}"
+        )
+    return None
+
+
+def pack_context_section(
+    section_name: str,
+    items: list[dict[str, Any]],
+    budget: dict[str, int],
+    warnings: list[dict[str, Any]],
+    excluded: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    cap = section_token_cap(budget, section_name)
+    single_item_limit = int(budget["single_item_token_limit"])
+    packed: list[dict[str, Any]] = []
+    used = 0
+    for index, item in enumerate(items):
+        source_id = source_id_for_context_item(item, f"{section_name}-{index}")
+        next_item = dict(item)
+        next_item.setdefault("source_id", source_id)
+        content = next_item.get("content")
+        if isinstance(content, str) and estimate_context_tokens(content) > single_item_limit:
+            next_item["content"] = truncate_text_by_token_budget(content, single_item_limit)
+            next_item["truncated"] = True
+            warnings.append(
+                {
+                    "type": "truncated",
+                    "source_id": source_id,
+                    "section": section_name,
+                    "reason": "Single item exceeded token budget and was truncated with provenance retained.",
+                }
+            )
+        else:
+            next_item.setdefault("truncated", False)
+        token_count = estimate_context_tokens(next_item)
+        if used + token_count > cap and packed:
+            excluded.append(
+                {
+                    "source_id": source_id,
+                    "section": section_name,
+                    "reason": "Section token budget exceeded after higher-priority items were packed.",
+                }
+            )
+            continue
+        next_item["token_count"] = token_count
+        packed.append(next_item)
+        used += token_count
+    return packed, {"name": section_name, "tokens_used": used, "items": packed}
+
+
 def relevant_assistant_dialogue_items(
     query: str,
     assistant_context: list[dict[str, Any]],
     conversation_id: Optional[str] = None,
-    limit: int = 6,
+    limit: int = 64,
 ) -> list[dict[str, Any]]:
     tokens = set(query_tokens(query))
     is_short_followup = short_followup_query(query)
@@ -6132,7 +6300,7 @@ def relevant_assistant_dialogue_items(
         content = str(item.get("content") or "")
         content_tokens = set(query_tokens(content))
         same_conversation = bool(conversation_id and item_conversation_id == str(conversation_id))
-        from_client_context = item.get("source") == "client_context"
+        from_client_context = item.get("source") in {"client_context", "client_context_delta"}
         is_user_correction = any(marker in content for marker in ["不是", "别提醒", "不用提醒", "以后", "记住", "纠正"])
         overlaps = bool(tokens and tokens.intersection(content_tokens))
         if same_conversation or overlaps or is_user_correction or (is_short_followup and from_client_context):
@@ -6171,26 +6339,43 @@ def short_followup_query(query: str) -> bool:
 def normalize_client_dialogue_context(
     items: list[dict[str, Any]],
     conversation_id: Optional[str],
-    limit: int = 8,
+    limit: Optional[int] = None,
+    current_message: Optional[str] = None,
+    token_budget: Optional[int] = None,
 ) -> list[dict[str, Any]]:
     normalized: list[dict[str, Any]] = []
-    for index, item in enumerate((items or [])[-limit:]):
+    raw_items = list(items or [])
+    if limit is not None:
+        raw_items = raw_items[-limit:]
+    current_clean = str(current_message or "").strip()
+    used_tokens = 0
+    for index, item in enumerate(raw_items):
         role = str(item.get("role") or "").strip().lower()
         if role not in {"user", "assistant"}:
             continue
         content = str(item.get("content") or "").strip()
         if not content:
             continue
+        if role == "user" and current_clean and content == current_clean:
+            continue
+        candidate = {
+            "layer": "assistant_dialogue",
+            "source": "client_context_delta",
+            "event_id": f"client-context-{index}",
+            "conversation_id": str(conversation_id or item.get("conversation_id") or "client-local"),
+            "role": role,
+            "content": truncate_text_by_token_budget(content, 1200),
+        }
+        candidate_tokens = estimate_context_tokens(candidate)
+        if token_budget is not None and normalized and used_tokens + candidate_tokens > token_budget:
+            continue
+        candidate["token_count"] = candidate_tokens
         normalized.append(
             {
-                "layer": "assistant_dialogue",
-                "source": "client_context",
-                "event_id": f"client-context-{index}",
-                "conversation_id": str(conversation_id or item.get("conversation_id") or "client-local"),
-                "role": role,
-                "content": content[:1200],
+                **candidate,
             }
         )
+        used_tokens += candidate_tokens
     return normalized
 
 
@@ -6280,8 +6465,11 @@ def build_context_pack(
     assistant_context: Optional[list[dict[str, Any]]] = None,
     conversation_id: Optional[str] = None,
     agenda_context: Optional[list[dict[str, Any]]] = None,
-    max_dialogue_items: int = 6,
+    max_dialogue_items: int = 64,
+    context_budget: Optional[dict[str, Any]] = None,
+    request_scope: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
+    budget = resolve_context_budget(context_budget)
     assistant_context = assistant_context or []
     agenda_context = agenda_context or []
     selected_dialogue = relevant_assistant_dialogue_items(
@@ -6291,22 +6479,64 @@ def build_context_pack(
         limit=max_dialogue_items,
     )
     selected_agenda = relevant_agenda_items(message, agenda_context, limit=6)
+    excluded: list[dict[str, Any]] = []
+    warnings: list[dict[str, Any]] = []
+    scoped_memory: list[dict[str, Any]] = []
+    for index, item in enumerate(base_context):
+        source_id = source_id_for_context_item(item, f"memory-{index}")
+        exclusion_reason = context_item_scope_exclusion(item, request_scope)
+        if exclusion_reason:
+            excluded.append({"source_id": source_id, "section": "memory_context", "reason": exclusion_reason})
+            continue
+        scoped_memory.append(item)
+
+    packed_dialogue, dialogue_section = pack_context_section(
+        "same_conversation",
+        selected_dialogue,
+        budget,
+        warnings,
+        excluded,
+    )
+    packed_memory, memory_section = pack_context_section(
+        "memory_context",
+        scoped_memory,
+        budget,
+        warnings,
+        excluded,
+    )
+    packed_agenda, agenda_section = pack_context_section(
+        "agenda_context",
+        selected_agenda,
+        budget,
+        warnings,
+        excluded,
+    )
+    sections = [dialogue_section, memory_section, agenda_section]
+    input_used = sum(int(section.get("tokens_used") or 0) for section in sections)
     included_event_ids = (
-        collect_context_ids(selected_dialogue)
-        + collect_context_ids(base_context)
-        + collect_context_ids(selected_agenda)
+        collect_context_ids(packed_dialogue)
+        + collect_context_ids(packed_memory)
+        + collect_context_ids(packed_agenda)
     )
     included_event_ids = list(dict.fromkeys(included_event_ids))
-    included_agenda_ids = [str(item.get("id")) for item in selected_agenda if item.get("id")]
+    included_memory_ids = [
+        source_id_for_context_item(item, f"memory-{index}") for index, item in enumerate(packed_memory)
+    ]
+    included_agenda_ids = [str(item.get("id")) for item in packed_agenda if item.get("id")]
     return {
         "query": message,
         "conversation_id": conversation_id,
-        "memory_context": base_context,
-        "assistant_dialogue": selected_dialogue,
-        "agenda_context": selected_agenda,
+        "request_scope": request_scope or {},
+        "memory_context": packed_memory,
+        "assistant_dialogue": packed_dialogue,
+        "agenda_context": packed_agenda,
         "included_event_ids": included_event_ids,
-        "included_memory_ids": [],
+        "included_memory_ids": list(dict.fromkeys(included_memory_ids)),
         "included_agenda_ids": list(dict.fromkeys(included_agenda_ids)),
+        "token_budget": {**budget, "input_used": input_used},
+        "sections": sections,
+        "excluded": excluded,
+        "warnings": warnings,
         "reason": "bounded context pack: active conversation, relevant assistant dialogue, active agenda, scoped memory, and source ids",
     }
 
@@ -6509,12 +6739,14 @@ async def chat(body: ChatIn, x_par_password: Optional[str] = Header(default=None
     assistant_context = retrieve_assistant_dialogue_context(
         body.message,
         conversation_id=user_turn["conversation_id"],
-        limit=8,
+        limit=64,
     )
+    raw_client_delta = body.client_context_delta or body.client_context
     client_dialogue_context = normalize_client_dialogue_context(
-        body.client_context,
+        raw_client_delta,
         user_turn["conversation_id"],
-        limit=8,
+        current_message=body.message,
+        token_budget=8000,
     )
     agenda_context = retrieve_active_agenda_context(
         body.message,
@@ -6527,6 +6759,7 @@ async def chat(body: ChatIn, x_par_password: Optional[str] = Header(default=None
         assistant_context=client_dialogue_context + assistant_context,
         conversation_id=user_turn["conversation_id"],
         agenda_context=agenda_context,
+        context_budget={"input_target": CONTEXT_INPUT_TARGET_TOKENS, "hard_input_ceiling": CONTEXT_HARD_INPUT_CEILING_TOKENS},
     )
     with db() as conn:
         persist_context_snapshot(conn, user_turn["event_id"], "chat_response", context_pack)
@@ -6547,10 +6780,22 @@ async def chat(body: ChatIn, x_par_password: Optional[str] = Header(default=None
         "conversation_id": user_turn["conversation_id"],
         "context_pack": {
             "included_event_ids": context_pack["included_event_ids"],
+            "included_memory_ids": context_pack.get("included_memory_ids", []),
             "included_agenda_ids": context_pack.get("included_agenda_ids", []),
             "assistant_dialogue_count": len(context_pack.get("assistant_dialogue", [])),
             "agenda_context_count": len(context_pack.get("agenda_context", [])),
             "memory_context_count": len(context_pack.get("memory_context", [])),
+            "token_budget": context_pack.get("token_budget", {}),
+            "sections": [
+                {
+                    "name": section.get("name"),
+                    "tokens_used": section.get("tokens_used", 0),
+                    "item_count": len(section.get("items") or []),
+                }
+                for section in context_pack.get("sections", [])
+            ],
+            "excluded": context_pack.get("excluded", []),
+            "warnings": context_pack.get("warnings", []),
             "reason": context_pack["reason"],
         },
     }
@@ -6655,7 +6900,7 @@ async def stream_chat_to_websocket(
     except psycopg.Error:
         user_turn = transient_assistant_turn("user", conversation_id)
     context = retrieve_context(message, max(1, min(limit, 30)))
-    assistant_context = retrieve_assistant_dialogue_context(message, conversation_id=user_turn["conversation_id"], limit=8)
+    assistant_context = retrieve_assistant_dialogue_context(message, conversation_id=user_turn["conversation_id"], limit=64)
     agenda_context = retrieve_active_agenda_context(message, conversation_id=user_turn["conversation_id"], limit=6)
     context_pack = build_context_pack(
         message,
@@ -6663,6 +6908,7 @@ async def stream_chat_to_websocket(
         assistant_context=assistant_context,
         conversation_id=user_turn["conversation_id"],
         agenda_context=agenda_context,
+        context_budget={"input_target": CONTEXT_INPUT_TARGET_TOKENS, "hard_input_ceiling": CONTEXT_HARD_INPUT_CEILING_TOKENS},
     )
     try:
         with db() as conn:
@@ -6697,10 +6943,22 @@ async def stream_chat_to_websocket(
             "sources": decorate_context_sources(context),
             "context_pack": {
                 "included_event_ids": context_pack["included_event_ids"],
+                "included_memory_ids": context_pack.get("included_memory_ids", []),
                 "included_agenda_ids": context_pack.get("included_agenda_ids", []),
                 "assistant_dialogue_count": len(context_pack.get("assistant_dialogue", [])),
                 "agenda_context_count": len(context_pack.get("agenda_context", [])),
                 "memory_context_count": len(context_pack.get("memory_context", [])),
+                "token_budget": context_pack.get("token_budget", {}),
+                "sections": [
+                    {
+                        "name": section.get("name"),
+                        "tokens_used": section.get("tokens_used", 0),
+                        "item_count": len(section.get("items") or []),
+                    }
+                    for section in context_pack.get("sections", [])
+                ],
+                "excluded": context_pack.get("excluded", []),
+                "warnings": context_pack.get("warnings", []),
                 "reason": context_pack["reason"],
             },
         }

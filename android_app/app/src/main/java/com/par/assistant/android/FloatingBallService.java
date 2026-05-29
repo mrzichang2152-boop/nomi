@@ -245,12 +245,12 @@ public final class FloatingBallService extends Service {
     private void sendMessage(String text) {
         if (text == null || text.trim().isEmpty()) return;
         String trimmed = text.trim();
+        List<FloatingChatContext.Turn> clientContext = chatContext.snapshotDelta(12000);
         addChatMessage("你", trimmed);
         chatContext.addUser(trimmed);
         TextView pending = addChatMessage("Nomi", "正在思考...");
         responseView.setText("");
         String conversationId = activeConversationId;
-        List<FloatingChatContext.Turn> clientContext = chatContext.snapshot(8);
         executor.execute(() -> {
             try {
                 ChatResult result = api().chat(trimmed, conversationId, clientContext);

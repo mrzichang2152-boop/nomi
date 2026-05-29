@@ -48,7 +48,7 @@ final class AssistantApiClient {
                             .put("content", turn.content)
             );
         }
-        body.put("client_context", context);
+        body.put("client_context_delta", context);
         JSONObject json = request("POST", "/api/chat", body, true);
         return new ChatResult(
                 json.optString("answer", json.optString("message", "")),

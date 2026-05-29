@@ -21,4 +21,18 @@ public final class FloatingChatContextTest {
         assertEquals("user", snapshot.get(1).role);
         assertEquals("需要", snapshot.get(1).content);
     }
+
+    @Test
+    public void snapshotsDeltaByCharacterBudgetInsteadOfFixedTurnCount() {
+        FloatingChatContext context = new FloatingChatContext();
+        for (int index = 0; index < 12; index++) {
+            context.addAssistant("第 " + index + " 条：PHONE_1 报价成本与利润率上下文");
+        }
+
+        List<FloatingChatContext.Turn> snapshot = context.snapshotDelta(1200);
+
+        assertEquals(12, snapshot.size());
+        assertEquals("第 0 条：PHONE_1 报价成本与利润率上下文", snapshot.get(0).content);
+        assertEquals("第 11 条：PHONE_1 报价成本与利润率上下文", snapshot.get(11).content);
+    }
 }
