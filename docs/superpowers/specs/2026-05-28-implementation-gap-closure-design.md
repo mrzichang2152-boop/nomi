@@ -1212,8 +1212,12 @@ This pass updates Gap 4 and the newer 256K context-budget design:
 - `build_context_pack()` now includes explicit sections for current request, same conversation, current source/thread, active task state, agenda, KV profile, knowledge graph context, RAG/event memory, and fallback memory context.
 - Active suggestions, task route traces, and pipeline execution results are retrieved into `task_context`.
 - The chat and WebSocket paths request a wider candidate pool before token packing, so the runtime is no longer bounded by the old small client-side recent-turn window.
-- Context snapshots now include `context_pack_id`, retrieval modes, applied scope filters, tokenizer fallback metadata, and final assistant answer ids in the persisted payload.
+- Context snapshots now include `context_pack_id`, retrieval modes, applied scope filters, tokenizer backend/fallback metadata, and final assistant answer ids in the persisted payload.
 - Cross-contact filtering now considers explicit `counterparty_ids` plus inferred memory metadata, raw source fields, and graph subject/object fields before ranking.
+- Token counting now has an optional Qwen/Hugging Face tokenizer path via `CONTEXT_TOKENIZER_MODEL`, with explicit fallback metadata when unavailable.
+- Oversized context items now use extractive provenance summaries instead of plain truncation.
+- Relevance scoring now emits the score vector described by the 256K design and uses it to rank memory/source/task candidates while preserving same-conversation order.
+- Current source/thread context can now fall back to durable local `events` and `semantic_events` retrieval if the client does not send visible source context.
 
 Verified local checks:
 
@@ -1230,10 +1234,10 @@ Manual output inspection:
 - The context pack included Alice source context, the pending task, KV preference, Alice graph edge, and Alice RAG memory.
 - Bob's private memory was excluded with a `Different contact scope` reason.
 - The pack recorded section token counts, retrieval modes, scope filters, and conservative tokenizer fallback.
+- A PHONE_1 margin sample ranked the specific margin memory above generic reply-style memory, generated score vectors, and summarized an oversized email while preserving the actionable final warning.
 
-Remaining limitations:
+Remaining deployment/configuration notes:
 
-- Exact Qwen-tokenizer accounting is still not wired; token counts use a conservative estimator and record that fallback.
-- Overflow handling truncates large items with provenance instead of generating model-assisted summaries.
-- Relevance scoring is still heuristic and does not expose the full scoring vector described in the 256K design.
-- Current source/thread context depends on client-provided `ui_state`; durable WhatsApp/Gmail thread retrieval can be added later.
+- Exact tokenizer use depends on providing the matching tokenizer model in deployment via `CONTEXT_TOKENIZER_MODEL`; `runtime_api` now installs `transformers`, and unavailable/unconfigured tokenizers fall back explicitly.
+- Summaries are deterministic extractive summaries, not extra model calls. This keeps latency and private-data exposure lower for the first production path.
+- Online deployed-server validation still needs to be rerun after these local changes are shipped.

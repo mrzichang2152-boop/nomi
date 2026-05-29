@@ -183,7 +183,155 @@ def test_build_context_pack_truncates_oversized_items_with_source_trace():
     assert packed_item["truncated"] is True
     assert len(packed_item["content"]) < len(long_content)
     assert pack["warnings"][0]["source_id"] == "long-email-1"
-    assert pack["warnings"][0]["type"] == "truncated"
+    assert pack["warnings"][0]["type"] == "summarized"
+
+
+def test_context_tokenizer_uses_loaded_qwen_tokenizer_when_available(monkeypatch):
+    from app import main
+
+    class FakeTokenizer:
+        def encode(self, text, add_special_tokens=False):
+            assert add_special_tokens is False
+            if text == "a":
+                return [10, 11, 12, 13, 14, 15, 16]
+            return list(range(max(1, len(str(text)) // 2)))
+
+    monkeypatch.setattr(main, "_CONTEXT_TOKENIZER", FakeTokenizer(), raising=False)
+    monkeypatch.setattr(main, "_CONTEXT_TOKENIZER_BACKEND", "hf:qwen-test", raising=False)
+
+    pack = main.build_context_pack("a", base_context=[])
+
+    assert main.estimate_context_tokens("a") == 7
+    assert pack["token_budget"]["tokenizer_backend"] == "hf:qwen-test"
+    assert pack["fallback_modes"]["tokenizer"] is None
+
+
+def test_build_context_pack_summarizes_oversized_items_with_provenance():
+    from app.main import build_context_pack
+
+    long_content = (
+        "客户 Alice 明确要求先核对 PHONE_1 的成本和利润率。"
+        + "中间是冗长的邮件正文。" * 260
+        + "最后结论：如果利润率低于 18%，不要直接承诺发货。"
+    )
+    pack = build_context_pack(
+        "总结 Alice 的 PHONE_1 邮件",
+        base_context=[
+            {
+                "layer": "vector_recall",
+                "event_id": "long-email-summary",
+                "content": long_content,
+                "source_event_ids": ["email-source-1"],
+            }
+        ],
+        assistant_context=[],
+        context_budget={
+            "input_target": 900,
+            "hard_input_ceiling": 1200,
+            "single_item_token_limit": 90,
+        },
+    )
+
+    packed_item = pack["memory_context"][0]
+    assert packed_item["event_id"] == "long-email-summary"
+    assert packed_item["truncated"] is True
+    assert packed_item["summary_method"] == "extractive_provenance_summary"
+    assert packed_item["omitted_token_estimate"] > 0
+    assert "Alice" in packed_item["content"]
+    assert "不要直接承诺发货" in packed_item["content"]
+    assert "[summary]" in packed_item["content"]
+    assert pack["warnings"][0]["type"] == "summarized"
+
+
+def test_context_pack_scores_and_ranks_memory_candidates():
+    from app.main import build_context_pack
+
+    pack = build_context_pack(
+        "继续核对 PHONE_1 的利润率",
+        base_context=[
+            {
+                "layer": "semantic_memory",
+                "event_id": "generic-memory",
+                "content": "Alice 喜欢简短回复。",
+                "importance": 0.2,
+            },
+            {
+                "layer": "semantic_memory",
+                "event_id": "phone-margin-memory",
+                "content": "PHONE_1 的成本是 AMOUNT_1，目标利润率至少 18%。",
+                "importance": 0.7,
+                "topic_ids": ["phone_1"],
+            },
+        ],
+        assistant_context=[],
+    )
+
+    ranked_ids = [item["event_id"] for item in pack["memory_context"]]
+    assert ranked_ids[0] == "phone-margin-memory"
+    score = pack["memory_context"][0]["score"]
+    assert set(score) >= {
+        "scope_score",
+        "semantic_score",
+        "recency_score",
+        "importance_score",
+        "active_task_score",
+        "user_correction_score",
+        "risk_penalty",
+        "final_score",
+        "reason",
+    }
+    assert score["semantic_score"] > 0
+    assert score["final_score"] > pack["memory_context"][1]["score"]["final_score"]
+
+
+def test_retrieve_current_source_context_reads_durable_thread_from_events(monkeypatch):
+    from app import main
+
+    class Cursor:
+        def fetchall(self):
+            return [
+                (
+                    "source-event-1",
+                    "whatsapp",
+                    "message",
+                    {"chat_name": "Alice", "sender": "Alice", "text": "Friday works for me."},
+                    "2026-05-29T10:00:00Z",
+                    "Alice 要求周五确认 PHONE_1 报价利润率。",
+                    "quote",
+                    0.91,
+                )
+            ]
+
+    class Conn:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return None
+
+        def execute(self, sql, params=()):
+            assert "FROM events e" in sql
+            assert params[0] == "whatsapp"
+            return Cursor()
+
+    monkeypatch.setattr(main, "db", lambda: Conn())
+
+    result = main.retrieve_current_source_context(
+        "帮我回复 Alice",
+        {
+            "source_type": "whatsapp",
+            "conversation_id": "wa-alice",
+            "counterparty_ids": ["Alice"],
+        },
+        limit=3,
+    )
+
+    assert result[0]["layer"] == "current_source_thread"
+    assert result[0]["source_type"] == "whatsapp"
+    assert result[0]["counterparty_ids"] == ["alice"]
+    assert "PHONE_1 报价利润率" in result[0]["content"]
+    assert result[0]["source_id"] == "source-event-1"
+    assert "durable" in result[0]["inclusion_reason"].lower()
 
 
 def test_build_context_pack_includes_source_task_layers_and_trace_fields():

@@ -409,7 +409,7 @@ The design is implemented only when all of the following are true:
 
 ## Implementation Status
 
-**Runtime status on 2026-05-29:** Partially implemented and locally verified.
+**Runtime status on 2026-05-29:** Implemented locally with deployment configuration notes.
 
 Implemented:
 
@@ -421,19 +421,23 @@ Implemented:
 - Context snapshots now persist after the assistant turn so the payload can include `final_model_answer_event_id` and `final_model_answer_turn_id`.
 - Context pack metadata now includes `context_pack_id`, `retrieval_modes`, `scope_filters_applied`, and `fallback_modes`.
 - Cross-contact filtering uses explicit `counterparty_ids` plus inferred metadata/raw-source entities before ranking, so contact-scoped sensitive memories from another person are excluded by default.
+- Token counting can use a Hugging Face/Qwen tokenizer when `CONTEXT_TOKENIZER_MODEL` is configured; otherwise it records the conservative estimator fallback.
+- Oversized context items now use an extractive provenance summary that preserves the beginning, ending, source id, omitted-token estimate, and summary method.
+- Packed context items now expose a scoring vector with `scope_score`, `semantic_score`, `recency_score`, `importance_score`, `active_task_score`, `user_correction_score`, `risk_penalty`, `final_score`, and `reason`.
+- If a client does not provide visible source context, the runtime can retrieve durable current-source/thread evidence from local `events` plus `semantic_events`.
 
 Verified behavior:
 
 - A short reply such as `可以` can retain the immediately prior Nomi question and pending task context.
 - A WhatsApp-scoped Alice request includes the current Alice thread and excludes Bob's sensitive contact-scoped memory with an explicit exclusion reason.
 - The section budget caps now follow the 256K design distribution more closely: current request, same conversation, source context, task context, agenda, KV, graph, and RAG each have separate token caps.
+- A PHONE_1 margin example ranks the directly relevant margin memory above a generic reply-style memory, and the scoring vector explains why.
+- A long Alice email example is summarized with the actionable opening and final "do not commit shipment below 18% margin" conclusion preserved.
 
-Known residuals:
+Deployment/configuration notes:
 
-- Token counting still uses the conservative character-based estimator, recorded as `fallback_modes.tokenizer = conservative_char_estimator`; it is not yet a Qwen tokenizer match.
-- Oversized items are currently truncated with provenance rather than summarized by a model-assisted summarizer.
-- Candidate scoring is still deterministic/heuristic; it does not yet emit the full `scope_score`, `semantic_score`, `recency_score`, and `risk_penalty` score vector proposed above.
-- Current source context is taken from client `ui_state`; a durable Gmail/WhatsApp thread retriever can be added later for clients that cannot provide the visible thread.
+- Exact deployed-model token accounting requires setting `CONTEXT_TOKENIZER_MODEL` to the tokenizer that matches the Qwen-compatible model endpoint. `runtime_api` now includes `transformers` for this path; if the model name is not configured or cannot be loaded, the runtime intentionally falls back and records the fallback.
+- Summarization is currently deterministic extractive summarization rather than an extra model call. This is intentional for latency and privacy; model-assisted summaries can be layered later if quality measurements justify it.
 - Online deployed-server validation should be rerun after these local changes are deployed.
 
 ## Open Questions

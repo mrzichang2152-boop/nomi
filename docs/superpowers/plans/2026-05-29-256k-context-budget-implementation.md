@@ -14,6 +14,7 @@
 
 **Files:**
 - Modify: `runtime_api/app/main.py`
+- Modify: `runtime_api/requirements.txt`
 - Test: `runtime_api/tests/test_context_pack_and_chat.py`
 
 - [x] **Step 1: Add failing tests**
@@ -153,3 +154,38 @@ Ran a local sample for an Alice WhatsApp reply with a pending quote-check pipeli
 - [x] **Step 5: Record residual limitations**
 
 Updated the 256K design with implemented behavior and remaining limitations: conservative tokenizer, truncation instead of model summarization, heuristic scoring, client-provided current-source context, and pending online validation.
+
+### Task 5: Residual Context Quality Closure
+
+**Files:**
+- Modify: `runtime_api/app/main.py`
+- Modify: `runtime_api/tests/test_context_pack_and_chat.py`
+- Modify: `docs/superpowers/specs/2026-05-29-256k-context-budget-design.md`
+- Modify: `docs/superpowers/specs/2026-05-28-implementation-gap-closure-design.md`
+
+- [x] **Step 1: Add failing tests for the recorded residuals**
+
+Added tests for configurable Qwen/Hugging Face tokenizer use, extractive provenance summaries, scoring vectors plus relevance ranking, and durable current-source/thread retrieval.
+
+- [x] **Step 2: Verify the tests fail for the expected reasons**
+
+The new tests failed because token counting ignored the loaded tokenizer, oversized items had no `summary_method`, memory candidates were not ranked by a scoring vector, and `retrieve_current_source_context()` did not exist.
+
+- [x] **Step 3: Implement the residual behavior**
+
+Added optional tokenizer loading, tokenizer backend metadata, runtime `transformers` dependency, extractive provenance summaries with omitted-token estimates, per-item scoring vectors, memory/source/task ranking, and durable `events`/`semantic_events` source-thread retrieval.
+
+- [x] **Step 4: Inspect actual output quality**
+
+Ran a PHONE_1 margin sample and verified the directly relevant margin memory ranked first, the generic preference ranked last, the long Alice email summary preserved the opening request plus final margin warning, and fallback tokenizer metadata was explicit.
+
+- [x] **Step 5: Re-run regression**
+
+Verified:
+
+```bash
+python3 -m pytest runtime_api/tests/test_context_pack_and_chat.py -q
+python3 -m pytest runtime_api/tests -q
+JAVA_HOME=/opt/homebrew/Cellar/openjdk@17/17.0.19/libexec/openjdk.jdk/Contents/Home gradle :app:testDebugUnitTest
+JAVA_HOME=/opt/homebrew/Cellar/openjdk@17/17.0.19/libexec/openjdk.jdk/Contents/Home gradle :app:assembleDebug
+```

@@ -51,6 +51,11 @@ CONTEXT_SAFETY_RESERVED_TOKENS = int(os.getenv("CONTEXT_SAFETY_RESERVED_TOKENS",
 CONTEXT_INPUT_TARGET_TOKENS = int(os.getenv("CONTEXT_INPUT_TARGET_TOKENS", "208000"))
 CONTEXT_HARD_INPUT_CEILING_TOKENS = int(os.getenv("CONTEXT_HARD_INPUT_CEILING_TOKENS", "224000"))
 CONTEXT_SINGLE_ITEM_TOKEN_LIMIT = int(os.getenv("CONTEXT_SINGLE_ITEM_TOKEN_LIMIT", "8000"))
+CONTEXT_TOKENIZER_MODEL = os.getenv("CONTEXT_TOKENIZER_MODEL", "").strip()
+CONTEXT_TOKENIZER_BACKEND = os.getenv("CONTEXT_TOKENIZER_BACKEND", "auto").strip().lower()
+_CONTEXT_TOKENIZER: Any = None
+_CONTEXT_TOKENIZER_BACKEND = "conservative_char_estimator"
+_CONTEXT_TOKENIZER_LOAD_ATTEMPTED = False
 
 DEFAULT_COMPOSIO_READONLY_TOOLKITS = [
     "gmail",
@@ -6126,6 +6131,36 @@ def run_daily_memory_maintenance(
     }
 
 
+def load_context_tokenizer() -> Any:
+    global _CONTEXT_TOKENIZER, _CONTEXT_TOKENIZER_BACKEND, _CONTEXT_TOKENIZER_LOAD_ATTEMPTED
+    if _CONTEXT_TOKENIZER is not None:
+        return _CONTEXT_TOKENIZER
+    if _CONTEXT_TOKENIZER_LOAD_ATTEMPTED:
+        return None
+    _CONTEXT_TOKENIZER_LOAD_ATTEMPTED = True
+    if CONTEXT_TOKENIZER_BACKEND in {"off", "none", "char", "conservative"}:
+        _CONTEXT_TOKENIZER_BACKEND = "conservative_char_estimator"
+        return None
+    if not CONTEXT_TOKENIZER_MODEL:
+        _CONTEXT_TOKENIZER_BACKEND = "conservative_char_estimator"
+        return None
+    try:
+        from transformers import AutoTokenizer  # type: ignore
+
+        _CONTEXT_TOKENIZER = AutoTokenizer.from_pretrained(CONTEXT_TOKENIZER_MODEL, trust_remote_code=True)
+        _CONTEXT_TOKENIZER_BACKEND = f"hf:{CONTEXT_TOKENIZER_MODEL}"
+        return _CONTEXT_TOKENIZER
+    except Exception:
+        _CONTEXT_TOKENIZER = None
+        _CONTEXT_TOKENIZER_BACKEND = "conservative_char_estimator"
+        return None
+
+
+def context_tokenizer_backend() -> str:
+    load_context_tokenizer()
+    return str(_CONTEXT_TOKENIZER_BACKEND or "conservative_char_estimator")
+
+
 def estimate_context_tokens(value: Any) -> int:
     if value is None:
         return 0
@@ -6133,6 +6168,14 @@ def estimate_context_tokens(value: Any) -> int:
         text = value
     else:
         text = json.dumps(value, ensure_ascii=False, default=str)
+    tokenizer = load_context_tokenizer()
+    if tokenizer is not None:
+        try:
+            return max(1, len(tokenizer.encode(text, add_special_tokens=False)))
+        except TypeError:
+            return max(1, len(tokenizer.encode(text)))
+        except Exception:
+            pass
     cjk_chars = sum(1 for char in text if "\u4e00" <= char <= "\u9fff")
     non_cjk_chars = len(text) - cjk_chars
     return max(1, cjk_chars + (non_cjk_chars + 3) // 4)
@@ -6155,6 +6198,47 @@ def truncate_text_by_token_budget(text: str, max_tokens: int) -> str:
     return "".join(result).rstrip() + "\n[truncated]"
 
 
+def tail_text_by_token_budget(text: str, max_tokens: int) -> str:
+    clean = str(text or "")
+    if estimate_context_tokens(clean) <= max_tokens:
+        return clean
+    if max_tokens <= 8:
+        return clean[-max(max_tokens, 1) :]
+    result: list[str] = []
+    used = 0
+    for char in reversed(clean):
+        char_tokens = estimate_context_tokens(char)
+        if used + char_tokens > max_tokens - 6:
+            break
+        result.append(char)
+        used += char_tokens
+    return "[truncated]\n" + "".join(reversed(result)).lstrip()
+
+
+def summarize_oversized_context_text(text: str, max_tokens: int) -> dict[str, Any]:
+    original_tokens = estimate_context_tokens(text)
+    summary_budget = max(24, max_tokens - 18)
+    head_budget = max(8, summary_budget // 2)
+    tail_budget = max(8, summary_budget - head_budget)
+    head = truncate_text_by_token_budget(text, head_budget).replace("\n[truncated]", "")
+    tail = tail_text_by_token_budget(text, tail_budget).replace("[truncated]\n", "")
+    if tail and tail in head:
+        body = head
+    else:
+        body = f"{head}\n...\n{tail}".strip()
+    summarized = f"[summary]\n{body}\n[/summary]"
+    if estimate_context_tokens(summarized) > max_tokens:
+        summarized = truncate_text_by_token_budget(summarized, max_tokens)
+    summary_tokens = estimate_context_tokens(summarized)
+    return {
+        "content": summarized,
+        "summary_method": "extractive_provenance_summary",
+        "original_token_estimate": original_tokens,
+        "summary_token_estimate": summary_tokens,
+        "omitted_token_estimate": max(0, original_tokens - summary_tokens),
+    }
+
+
 def source_id_for_context_item(item: dict[str, Any], fallback: str) -> str:
     for key in ("event_id", "id", "memory_id"):
         value = item.get(key)
@@ -6166,7 +6250,7 @@ def source_id_for_context_item(item: dict[str, Any], fallback: str) -> str:
     return fallback
 
 
-def resolve_context_budget(context_budget: Optional[dict[str, Any]] = None) -> dict[str, int]:
+def resolve_context_budget(context_budget: Optional[dict[str, Any]] = None) -> dict[str, Any]:
     raw = context_budget or {}
     model_window = int(raw.get("model_window", CONTEXT_MODEL_WINDOW_TOKENS))
     output_reserved = int(raw.get("output_reserved", CONTEXT_OUTPUT_RESERVED_TOKENS))
@@ -6184,6 +6268,7 @@ def resolve_context_budget(context_budget: Optional[dict[str, Any]] = None) -> d
         "input_target": input_target,
         "hard_input_ceiling": hard_input_ceiling,
         "single_item_token_limit": single_item_limit,
+        "tokenizer_backend": context_tokenizer_backend(),
     }
 
 
@@ -6286,6 +6371,131 @@ def context_item_scope_exclusion(
     return None
 
 
+def parse_context_datetime(value: Any) -> Optional[datetime]:
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    if not value:
+        return None
+    text = str(value)
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+
+def context_importance(item: dict[str, Any]) -> float:
+    for key in ("importance", "confidence", "score", "rank"):
+        value = item.get(key)
+        try:
+            if value is not None:
+                return max(0.0, min(float(value), 1.0))
+        except (TypeError, ValueError):
+            continue
+    return 0.0
+
+
+def score_context_item(
+    query: str,
+    item: dict[str, Any],
+    section_name: str,
+    request_scope: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    request_scope = request_scope or {}
+    item_text = context_text(item)
+    tokens = query_tokens(query)
+    semantic_hits = sum(1 for token in tokens if token in item_text)
+    semantic_score = min(1.0, semantic_hits / max(len(tokens), 1)) if tokens else 0.0
+
+    allowed_counterparties = normalize_scope_values(request_scope.get("counterparty_ids"))
+    item_counterparties = context_item_counterparties(item)
+    if allowed_counterparties and item_counterparties:
+        scope_score = 1.0 if not allowed_counterparties.isdisjoint(item_counterparties) else 0.0
+    elif section_name in {"current_request", "same_conversation", "source_context", "task_context", "agenda_context"}:
+        scope_score = 1.0
+    else:
+        scope_score = 0.45
+
+    active_tokens = normalize_scope_values(request_scope.get("active_task_ids")) | normalize_scope_values(
+        request_scope.get("topic_ids")
+    )
+    item_topics = normalize_scope_values(item.get("active_task_ids")) | normalize_scope_values(item.get("topic_ids"))
+    active_task_score = 0.0
+    if active_tokens:
+        if active_tokens.intersection(item_topics):
+            active_task_score = 1.0
+        elif any(token and token in item_text for token in active_tokens):
+            active_task_score = 0.7
+    if section_name == "task_context":
+        active_task_score = max(active_task_score, 0.8)
+
+    timestamp = (
+        parse_context_datetime(item.get("updated_at"))
+        or parse_context_datetime(item.get("created_at"))
+        or parse_context_datetime(item.get("time"))
+        or parse_context_datetime(item.get("timestamp"))
+    )
+    recency_score = 0.0
+    if timestamp:
+        age_days = max((datetime.now(timezone.utc) - timestamp.astimezone(timezone.utc)).total_seconds() / 86400, 0)
+        recency_score = max(0.0, min(1.0, 1.0 / (1.0 + age_days / 30.0)))
+
+    content = str(item.get("content") or item.get("summary") or item.get("value") or "")
+    user_correction_score = 1.0 if any(marker in content for marker in ["不是", "别提醒", "不用提醒", "以后", "记住", "纠正"]) else 0.0
+    sensitivity = str(item.get("sensitivity_level") or "").lower()
+    risk_penalty = 0.25 if sensitivity in {"high", "critical"} else 0.0
+    importance_score = context_importance(item)
+    final_score = (
+        semantic_score * 0.36
+        + scope_score * 0.22
+        + importance_score * 0.16
+        + active_task_score * 0.14
+        + recency_score * 0.08
+        + user_correction_score * 0.04
+        - risk_penalty
+    )
+    final_score = round(max(0.0, final_score), 6)
+    reason_parts = []
+    if semantic_score:
+        reason_parts.append("query terms overlap")
+    if active_task_score:
+        reason_parts.append("matches active task or topic")
+    if scope_score >= 1.0:
+        reason_parts.append("inside active scope")
+    if risk_penalty:
+        reason_parts.append("risk penalty applied")
+    return {
+        "scope_score": round(scope_score, 6),
+        "semantic_score": round(semantic_score, 6),
+        "recency_score": round(recency_score, 6),
+        "importance_score": round(importance_score, 6),
+        "active_task_score": round(active_task_score, 6),
+        "user_correction_score": round(user_correction_score, 6),
+        "risk_penalty": round(risk_penalty, 6),
+        "final_score": final_score,
+        "reason": "; ".join(reason_parts) or "included by section priority and available budget",
+    }
+
+
+def score_context_candidates(
+    query: str,
+    items: list[dict[str, Any]],
+    section_name: str,
+    request_scope: Optional[dict[str, Any]] = None,
+    sort_items: bool = True,
+) -> list[dict[str, Any]]:
+    scored: list[tuple[int, dict[str, Any]]] = []
+    for index, item in enumerate(items):
+        next_item = dict(item)
+        score = score_context_item(query, next_item, section_name, request_scope)
+        next_item["score"] = score
+        next_item.setdefault("inclusion_reason", score["reason"])
+        scored.append((index, next_item))
+    if sort_items:
+        scored.sort(key=lambda pair: (-float(pair[1]["score"]["final_score"]), pair[0]))
+    return [item for _, item in scored]
+
+
 def infer_request_scope(message: str, ui_state: Optional[dict[str, Any]] = None) -> dict[str, Any]:
     ui_state = ui_state or {}
     policy = infer_memory_access_policy(message, explicit_context=ui_state)
@@ -6345,6 +6555,114 @@ def normalize_ui_state_source_context(
     return normalized
 
 
+def dedupe_context_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    seen: set[str] = set()
+    deduped: list[dict[str, Any]] = []
+    for index, item in enumerate(items):
+        source_id = source_id_for_context_item(item, f"context-{index}")
+        if source_id in seen:
+            continue
+        seen.add(source_id)
+        deduped.append(item)
+    return deduped
+
+
+def raw_source_counterparties(raw_data: dict[str, Any], request_scope: dict[str, Any]) -> list[str]:
+    values: list[Any] = [
+        raw_data.get("chat_name"),
+        raw_data.get("sender"),
+        raw_data.get("speaker"),
+        raw_data.get("from"),
+        raw_data.get("to"),
+    ]
+    scope_counterparties = request_scope.get("counterparty_ids")
+    if isinstance(scope_counterparties, list):
+        values.extend(scope_counterparties)
+    elif scope_counterparties:
+        values.append(scope_counterparties)
+    return sorted_scope_values(values)
+
+
+def raw_source_content(raw_data: dict[str, Any], summary: Any) -> str:
+    parts: list[str] = []
+    if summary:
+        parts.append(str(summary))
+    for key in ("text", "message", "body", "subject", "title"):
+        value = raw_data.get(key)
+        if value:
+            parts.append(str(value))
+    if not parts and raw_data:
+        parts.append(json.dumps(raw_data, ensure_ascii=False, default=str))
+    return "\n".join(list(dict.fromkeys(part.strip() for part in parts if part and part.strip())))
+
+
+def retrieve_current_source_context(
+    query: str,
+    request_scope: dict[str, Any],
+    limit: int = 6,
+) -> list[dict[str, Any]]:
+    source_type = str(request_scope.get("source_type") or "").strip().lower()
+    if not source_type:
+        return []
+    patterns: list[str] = []
+    conversation_id = str(request_scope.get("conversation_id") or "").strip()
+    if conversation_id:
+        patterns.append(f"%{conversation_id}%")
+    for counterparty in sorted_scope_values(request_scope.get("counterparty_ids")):
+        patterns.append(f"%{counterparty}%")
+    patterns.extend(token_patterns(query, max_tokens=4))
+    patterns = list(dict.fromkeys(patterns)) or ["%"]
+    clauses = []
+    params: list[Any] = [source_type]
+    for pattern in patterns:
+        clauses.append("(e.raw_data::text ILIKE %s OR COALESCE(s.summary, '') ILIKE %s)")
+        params.extend([pattern, pattern])
+    where = " OR ".join(clauses)
+    try:
+        with db() as conn:
+            if not hasattr(conn, "execute"):
+                return []
+            rows = conn.execute(
+                f"""
+                SELECT e.event_id::text, e.source, e.event_type, e.raw_data, e.timestamp,
+                       s.summary, s.intent, s.importance
+                FROM events e
+                LEFT JOIN semantic_events s ON s.event_id = e.event_id
+                WHERE lower(e.source) = %s
+                  AND ({where})
+                ORDER BY e.timestamp DESC
+                LIMIT %s
+                """,
+                (*params, limit),
+            ).fetchall()
+    except (psycopg.Error, AttributeError):
+        return []
+    items: list[dict[str, Any]] = []
+    for row in rows:
+        raw_data = row[3] if isinstance(row[3], dict) else {}
+        content = raw_source_content(raw_data, row[5])
+        if not content:
+            continue
+        items.append(
+            {
+                "layer": "current_source_thread",
+                "source": "durable_events",
+                "event_id": str(row[0]),
+                "source_id": str(row[0]),
+                "source_type": str(row[1]).lower(),
+                "event_type": row[2],
+                "timestamp": row[4].isoformat() if hasattr(row[4], "isoformat") else row[4],
+                "content": truncate_text_by_token_budget(content, 4000),
+                "counterparty_ids": raw_source_counterparties(raw_data, request_scope),
+                "intent": row[6],
+                "importance": row[7] or 0,
+                "raw_data": raw_data,
+                "inclusion_reason": "Durable current source/thread context matched active scope.",
+            }
+        )
+    return items
+
+
 def context_section_name_for_memory_item(item: dict[str, Any]) -> str:
     layer = str(item.get("layer") or "").lower()
     if layer == "working_memory":
@@ -6380,17 +6698,28 @@ def pack_context_section(
         source_id = source_id_for_context_item(item, f"{section_name}-{index}")
         next_item = dict(item)
         next_item.setdefault("source_id", source_id)
-        next_item.setdefault("inclusion_reason", f"Included in {section_name} by scope, relevance, and token budget.")
+        score = next_item.get("score") if isinstance(next_item.get("score"), dict) else {}
+        next_item.setdefault(
+            "inclusion_reason",
+            str(score.get("reason") or f"Included in {section_name} by scope, relevance, and token budget."),
+        )
         content = next_item.get("content")
         if isinstance(content, str) and estimate_context_tokens(content) > single_item_limit:
-            next_item["content"] = truncate_text_by_token_budget(content, single_item_limit)
+            summary = summarize_oversized_context_text(content, single_item_limit)
+            next_item["content"] = summary["content"]
             next_item["truncated"] = True
+            next_item["summary_method"] = summary["summary_method"]
+            next_item["original_token_estimate"] = summary["original_token_estimate"]
+            next_item["summary_token_estimate"] = summary["summary_token_estimate"]
+            next_item["omitted_token_estimate"] = summary["omitted_token_estimate"]
             warnings.append(
                 {
-                    "type": "truncated",
+                    "type": "summarized",
                     "source_id": source_id,
                     "section": section_name,
-                    "reason": "Single item exceeded token budget and was truncated with provenance retained.",
+                    "reason": "Single item exceeded token budget and was summarized with provenance retained.",
+                    "summary_method": summary["summary_method"],
+                    "omitted_token_estimate": summary["omitted_token_estimate"],
                 }
             )
         else:
@@ -6743,35 +7072,35 @@ def build_context_pack(
     }
     packed_request, request_section = pack_context_section(
         "current_request",
-        [current_request_item],
+        score_context_candidates(message, [current_request_item], "current_request", request_scope),
         budget,
         warnings,
         excluded,
     )
     packed_dialogue, dialogue_section = pack_context_section(
         "same_conversation",
-        selected_dialogue,
+        score_context_candidates(message, selected_dialogue, "same_conversation", request_scope, sort_items=False),
         budget,
         warnings,
         excluded,
     )
     packed_source, source_section = pack_context_section(
         "source_context",
-        source_context,
+        score_context_candidates(message, source_context, "source_context", request_scope),
         budget,
         warnings,
         excluded,
     )
     packed_task, task_section = pack_context_section(
         "task_context",
-        task_context,
+        score_context_candidates(message, task_context, "task_context", request_scope),
         budget,
         warnings,
         excluded,
     )
     packed_agenda, agenda_section = pack_context_section(
         "agenda_context",
-        selected_agenda,
+        score_context_candidates(message, selected_agenda, "agenda_context", request_scope),
         budget,
         warnings,
         excluded,
@@ -6780,6 +7109,7 @@ def build_context_pack(
     packed_memory: list[dict[str, Any]] = []
     for section_name in ["kv_profile", "knowledge_graph_context", "rag_event_memory", "memory_context"]:
         section_items = [item for item in scoped_memory if context_section_name_for_memory_item(item) == section_name]
+        section_items = score_context_candidates(message, section_items, section_name, request_scope)
         packed_items, section = pack_context_section(section_name, section_items, budget, warnings, excluded)
         packed_memory.extend(packed_items)
         memory_sections.append(section)
@@ -6818,7 +7148,11 @@ def build_context_pack(
         "warnings": warnings,
         "retrieval_modes": retrieval_modes_for_pack(sections),
         "scope_filters_applied": request_scope,
-        "fallback_modes": {"tokenizer": "conservative_char_estimator"},
+        "fallback_modes": {
+            "tokenizer": "conservative_char_estimator"
+            if str(budget.get("tokenizer_backend")) == "conservative_char_estimator"
+            else None
+        },
         "reason": "bounded context pack: active conversation, relevant assistant dialogue, active agenda, scoped memory, and source ids",
     }
 
@@ -7018,7 +7352,10 @@ async def chat(body: ChatIn, x_par_password: Optional[str] = Header(default=None
             client_type=body.client_type,
         )
     request_scope = infer_request_scope(body.message, body.ui_state)
-    source_context = normalize_ui_state_source_context(body.ui_state, request_scope)
+    source_context = dedupe_context_items(
+        normalize_ui_state_source_context(body.ui_state, request_scope)
+        + retrieve_current_source_context(body.message, request_scope, limit=6)
+    )
     context_candidate_limit = max(body.limit, 80)
     context = retrieve_context(body.message, context_candidate_limit, request_scope=request_scope)
     assistant_context = retrieve_assistant_dialogue_context(
@@ -7200,6 +7537,7 @@ async def stream_chat_to_websocket(
     except psycopg.Error:
         user_turn = transient_assistant_turn("user", conversation_id)
     request_scope = infer_request_scope(message, {})
+    source_context = retrieve_current_source_context(message, request_scope, limit=6)
     context = retrieve_context(message, max(80, min(limit, 50)), request_scope=request_scope)
     assistant_context = retrieve_assistant_dialogue_context(message, conversation_id=user_turn["conversation_id"], limit=64)
     agenda_context = retrieve_active_agenda_context(message, conversation_id=user_turn["conversation_id"], limit=6)
@@ -7210,6 +7548,7 @@ async def stream_chat_to_websocket(
         assistant_context=assistant_context,
         conversation_id=user_turn["conversation_id"],
         agenda_context=agenda_context,
+        source_context=source_context,
         task_context=task_context,
         request_scope=request_scope,
         context_budget={"input_target": CONTEXT_INPUT_TARGET_TOKENS, "hard_input_ceiling": CONTEXT_HARD_INPUT_CEILING_TOKENS},
