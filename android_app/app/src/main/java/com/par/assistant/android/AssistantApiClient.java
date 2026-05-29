@@ -93,7 +93,7 @@ final class AssistantApiClient {
         HttpURLConnection connection = (HttpURLConnection) new URL(config.baseUrl() + path).openConnection();
         connection.setRequestMethod(method);
         connection.setConnectTimeout(8000);
-        connection.setReadTimeout(20000);
+        connection.setReadTimeout(90000);
         connection.setRequestProperty("content-type", "application/json");
         if (auth) {
             connection.setRequestProperty("x-par-password", config.password());
