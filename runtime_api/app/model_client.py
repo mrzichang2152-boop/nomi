@@ -2,6 +2,14 @@ from typing import Any
 
 import httpx
 import json
+import os
+
+
+def model_request_timeout_seconds() -> float:
+    try:
+        return max(1.0, float(os.getenv("MODEL_REQUEST_TIMEOUT_SECONDS", "180")))
+    except ValueError:
+        return 180.0
 
 
 class QwenClient:
@@ -20,7 +28,7 @@ class QwenClient:
             response = await client.post(
                 f"{self.base_url}/v1/chat/completions",
                 json=payload,
-                timeout=60,
+                timeout=model_request_timeout_seconds(),
             )
             response.raise_for_status()
             data = response.json()
@@ -47,7 +55,7 @@ class QwenClient:
                 "POST",
                 f"{self.base_url}/v1/chat/completions",
                 json=payload,
-                timeout=60,
+                timeout=model_request_timeout_seconds(),
             ) as response:
                 response.raise_for_status()
                 async for line in response.aiter_lines():

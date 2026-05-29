@@ -7392,7 +7392,16 @@ async def chat(body: ChatIn, x_par_password: Optional[str] = Header(default=None
         context_budget={"input_target": CONTEXT_INPUT_TARGET_TOKENS, "hard_input_ceiling": CONTEXT_HARD_INPUT_CEILING_TOKENS},
     )
     messages = build_chat_messages(body.message, context_pack)
-    answer = await QwenClient(MODEL_BASE_URL, MODEL_NAME).chat(messages)
+    try:
+        answer = await QwenClient(MODEL_BASE_URL, MODEL_NAME).chat(messages)
+    except httpx.TimeoutException as exc:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error": "model_timeout",
+                "message": "The model endpoint did not respond before the configured timeout.",
+            },
+        ) from exc
     with db() as conn:
         assistant_turn = persist_assistant_turn(
             conn,

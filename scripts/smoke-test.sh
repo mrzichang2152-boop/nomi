@@ -8,7 +8,7 @@ curl -fsS "$BASE_URL/health"
 echo
 
 echo "Checking assistant page..."
-curl -fsS "$BASE_URL/" | grep -q "PAR"
+curl -fsS "$BASE_URL/" | grep -Eq "Nomi|PAR"
 echo "ok"
 
 echo "Checking chat auth..."

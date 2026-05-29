@@ -521,6 +521,51 @@ def test_chat_endpoint_builds_request_scope_uses_wide_candidates_and_persists_an
     assert snapshots[0]["final_model_answer_event_id"] == "event-assistant"
 
 
+def test_chat_endpoint_returns_503_when_model_times_out(monkeypatch):
+    monkeypatch.setenv("APP_PASSWORD", "secret")
+    from app import main
+
+    def fake_persist_turn(conn, redis_client, role, content, conversation_id=None, client_type="web", **kwargs):
+        return {
+            "conversation_id": conversation_id or "conv-timeout",
+            "turn_id": f"turn-{role}",
+            "event_id": f"event-{role}",
+        }
+
+    class FakeQwen:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def chat(self, messages):
+            raise main.httpx.ReadTimeout("model timed out")
+
+    class Conn:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return None
+
+    monkeypatch.setattr(main, "db", lambda: Conn())
+    monkeypatch.setattr(main, "redis_client", lambda: object())
+    monkeypatch.setattr(main, "persist_assistant_turn", fake_persist_turn, raising=False)
+    monkeypatch.setattr(main, "retrieve_context", lambda message, limit, request_scope=None: [])
+    monkeypatch.setattr(main, "retrieve_assistant_dialogue_context", lambda *args, **kwargs: [])
+    monkeypatch.setattr(main, "retrieve_active_agenda_context", lambda *args, **kwargs: [])
+    monkeypatch.setattr(main, "retrieve_active_task_context", lambda *args, **kwargs: [])
+    monkeypatch.setattr(main, "persist_context_snapshot", lambda *args, **kwargs: None, raising=False)
+    monkeypatch.setattr(main, "QwenClient", FakeQwen)
+
+    response = TestClient(main.app, raise_server_exceptions=False).post(
+        "/api/chat",
+        headers={"x-par-password": "secret"},
+        json={"message": "hello", "conversation_id": "conv-timeout"},
+    )
+
+    assert response.status_code == 503
+    assert "model_timeout" in response.text
+
+
 def json_text(value):
     import json
 

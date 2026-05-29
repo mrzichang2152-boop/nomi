@@ -59,6 +59,37 @@ async def test_qwen_client_reads_openai_compatible_response(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_qwen_client_uses_configured_timeout(monkeypatch):
+    monkeypatch.setenv("MODEL_REQUEST_TIMEOUT_SECONDS", "180")
+    from app.model_client import QwenClient
+
+    calls = []
+
+    class Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"response": "ok"}
+
+    class Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+        async def post(self, url, json, timeout):
+            calls.append(timeout)
+            return Response()
+
+    monkeypatch.setattr("app.model_client.httpx.AsyncClient", Client)
+
+    assert await QwenClient("http://model.local:9161/").chat([{"role": "user", "content": "hi"}]) == "ok"
+    assert calls == [180.0]
+
+
+@pytest.mark.asyncio
 async def test_qwen_client_streams_openai_compatible_chunks(monkeypatch):
     from app.model_client import QwenClient
 
