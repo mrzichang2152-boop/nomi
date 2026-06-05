@@ -34,6 +34,15 @@ from app.assistant_identity.registry import AssistantIdentityRegistry
 from app.assistant_identity.schema import assistant_identity_schema_sql
 from app.assistant_memory import assistant_memory_schema_sql, build_session_search_context
 from app.auth import is_authorized
+from app.delegated_automation.models import (
+    AutomationDecision,
+    DelegationGrant,
+    TargetManifest,
+    parse_datetime,
+)
+from app.delegated_automation.policy import build_execution_trace, evaluate_delegated_action
+from app.delegated_automation.schema import delegated_automation_schema_sql
+from app.delegated_automation.store import InMemoryDelegatedAutomationStore
 from app.model_gateway import ModelGatewayError, default_model_gateway
 from app.model_client import QwenClient
 from app.long_tail_agent import (
@@ -155,6 +164,7 @@ async def lifespan(app: FastAPI):
     ensure_tool_registry_schema()
     ensure_workflow_distillation_schema()
     ensure_openclaw_execution_schema()
+    ensure_delegated_automation_schema()
     ensure_model_gateway_schema()
     text_embedding_with_provider("startup embedding warmup")
     tasks: list[asyncio.Task] = []
@@ -188,6 +198,7 @@ _MODEL_GATEWAY: Any = None
 _LONG_TAIL_EVENT_STORE = build_long_tail_event_store()
 _LONG_TAIL_RUNNER = LongTailGraphRunner(event_store=_LONG_TAIL_EVENT_STORE, verifier=StepVerifier())
 _LONG_TAIL_EFFECT_CONTROLLER = ExternalEffectController(event_store=_LONG_TAIL_EVENT_STORE)
+_DELEGATED_AUTOMATION_STORE = InMemoryDelegatedAutomationStore()
 _ASSISTANT_OUTBOUND_PIPELINE = OutboundMessagePipeline()
 _ASSISTANT_IDENTITY_REGISTRY = AssistantIdentityRegistry()
 _ASSISTANT_INBOX_EVENTS: list[dict[str, Any]] = []
@@ -242,6 +253,29 @@ class ToolRouteIn(BaseModel):
 class PipelineRunIn(BaseModel):
     request: str = Field(min_length=1, max_length=2000)
     context: dict[str, Any] = Field(default_factory=dict)
+
+
+class DelegatedAutomationEvaluateIn(BaseModel):
+    grant_id: str = Field(min_length=1, max_length=160)
+    manifest_id: str = Field(min_length=1, max_length=160)
+    target_id: str = Field(min_length=1, max_length=240)
+    content_evidence_ids: list[str] = Field(default_factory=list)
+    page_state: dict[str, Any] = Field(default_factory=dict)
+    user_paused: bool = False
+    now: Optional[str] = None
+
+
+class DelegatedAutomationTraceIn(BaseModel):
+    decision: dict[str, Any] = Field(default_factory=dict)
+    trace_id: str = Field(min_length=1, max_length=160)
+    status: str = Field(min_length=1, max_length=40)
+    result_summary: str = Field(default="", max_length=2000)
+    evidence_ids: list[str] = Field(default_factory=list)
+    now: Optional[str] = None
+
+
+class DelegatedAutomationPauseIn(BaseModel):
+    reason: str = Field(default="", max_length=500)
 
 
 class ComposioToolExecuteIn(BaseModel):
@@ -6181,6 +6215,12 @@ def ensure_openclaw_execution_schema() -> None:
         )
 
 
+def ensure_delegated_automation_schema() -> None:
+    with db() as conn:
+        for sql in delegated_automation_schema_sql():
+            conn.execute(sql)
+
+
 def default_collector_settings() -> list[str]:
     return ["bookmark", "calendar", "focus", "gmail", "search", "telegram", "whatsapp"]
 
@@ -6778,6 +6818,95 @@ def pipeline_run(body: PipelineRunIn, x_par_password: Optional[str] = Header(def
     result = run_core_pipeline(body.request, body.context)
     result = attach_pipeline_provider_execution(result, body.context)
     return persist_pipeline_execution_result_safely(result)
+
+
+@app.post("/api/delegated-automation/grants")
+def delegated_automation_upsert_grant(
+    body: dict[str, Any],
+    x_par_password: Optional[str] = Header(default=None),
+) -> dict[str, Any]:
+    require_password(x_par_password)
+    grant = DelegationGrant.from_dict(body)
+    stored = _DELEGATED_AUTOMATION_STORE.upsert_grant(grant)
+    return {"grant": stored.to_dict()}
+
+
+@app.get("/api/delegated-automation/grants")
+def delegated_automation_grants(x_par_password: Optional[str] = Header(default=None)) -> dict[str, Any]:
+    require_password(x_par_password)
+    grants = [grant.to_dict() for grant in _DELEGATED_AUTOMATION_STORE.list_grants()]
+    return {"count": len(grants), "grants": grants}
+
+
+@app.post("/api/delegated-automation/manifests")
+def delegated_automation_upsert_manifest(
+    body: dict[str, Any],
+    x_par_password: Optional[str] = Header(default=None),
+) -> dict[str, Any]:
+    require_password(x_par_password)
+    manifest = TargetManifest.from_dict(body)
+    stored = _DELEGATED_AUTOMATION_STORE.upsert_manifest(manifest)
+    return {"manifest": stored.to_dict()}
+
+
+@app.post("/api/delegated-automation/evaluate")
+def delegated_automation_evaluate(
+    body: DelegatedAutomationEvaluateIn,
+    x_par_password: Optional[str] = Header(default=None),
+) -> dict[str, Any]:
+    require_password(x_par_password)
+    grant = _DELEGATED_AUTOMATION_STORE.get_grant(body.grant_id)
+    if grant is None:
+        raise HTTPException(status_code=404, detail="delegation grant not found")
+    manifest = _DELEGATED_AUTOMATION_STORE.get_manifest(body.manifest_id)
+    if manifest is None:
+        raise HTTPException(status_code=404, detail="target manifest not found")
+    now = parse_datetime(body.now) or datetime.now(timezone.utc)
+    decision = evaluate_delegated_action(
+        grant=grant,
+        manifest=manifest,
+        target_id=body.target_id,
+        traces=_DELEGATED_AUTOMATION_STORE.traces_for_grant(grant.grant_id),
+        now=now,
+        page_state=body.page_state,
+        content_evidence_ids=body.content_evidence_ids,
+        user_paused=body.user_paused,
+    )
+    return {"decision": decision.to_dict()}
+
+
+@app.post("/api/delegated-automation/traces")
+def delegated_automation_trace(
+    body: DelegatedAutomationTraceIn,
+    x_par_password: Optional[str] = Header(default=None),
+) -> dict[str, Any]:
+    require_password(x_par_password)
+    decision = AutomationDecision.from_dict(body.decision)
+    if not decision.allowed and body.status == "completed":
+        raise HTTPException(status_code=409, detail="cannot complete a denied delegated action")
+    trace = build_execution_trace(
+        decision=decision,
+        trace_id=body.trace_id,
+        status=body.status,
+        result_summary=body.result_summary,
+        evidence_ids=body.evidence_ids,
+        now=parse_datetime(body.now) or datetime.now(timezone.utc),
+    )
+    stored = _DELEGATED_AUTOMATION_STORE.append_trace(trace)
+    return {"trace": stored.to_dict()}
+
+
+@app.post("/api/delegated-automation/grants/{grant_id}/pause")
+def delegated_automation_pause_grant(
+    grant_id: str,
+    body: DelegatedAutomationPauseIn,
+    x_par_password: Optional[str] = Header(default=None),
+) -> dict[str, Any]:
+    require_password(x_par_password)
+    if _DELEGATED_AUTOMATION_STORE.get_grant(grant_id) is None:
+        raise HTTPException(status_code=404, detail="delegation grant not found")
+    grant = _DELEGATED_AUTOMATION_STORE.pause_grant(grant_id, reason=body.reason)
+    return {"grant": grant.to_dict()}
 
 
 @app.post("/api/agent-tasks/route")
