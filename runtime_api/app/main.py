@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import html
 import json
 import os
 import re
@@ -11,21 +12,49 @@ from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta, timezone
 from dataclasses import dataclass
 from typing import Any, Optional
+from urllib.parse import urlencode
 
 import psycopg
 import redis
 import redis.asyncio as aioredis
 import httpx
-from fastapi import FastAPI, Header, HTTPException, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse
+from fastapi import FastAPI, Header, HTTPException, Query, WebSocket, WebSocketDisconnect
+from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from cryptography.fernet import Fernet, InvalidToken
 from pydantic import BaseModel, Field
+from psycopg.types.json import Jsonb
 
+from app.assistant_identity.api import router as assistant_identity_router
+from app.assistant_identity.contact_resolver import ContactResolver
+from app.assistant_identity.inbox_gateway import AssistantInboxGateway
+from app.assistant_identity.outbound import OutboundMessagePipeline
+from app.assistant_identity.phone_adapter import PhoneCallInstructionBuilder, PhoneWebhookVerifier
+from app.assistant_identity.registry import AssistantIdentityRegistry
+from app.assistant_identity.schema import assistant_identity_schema_sql
+from app.assistant_memory import assistant_memory_schema_sql, build_session_search_context
 from app.auth import is_authorized
+from app.model_gateway import ModelGatewayError, default_model_gateway
 from app.model_client import QwenClient
+from app.long_tail_agent import (
+    ExecutorAdapterRegistry,
+    ExternalEffectController,
+    LongTailEventStore,
+    LongTailGraphRunner,
+    PostgresLongTailLeaseManager,
+    PostgresLongTailEventStore,
+    PostgresLongTailRecoveryScanner,
+    PolicyGate,
+    StepVerifier,
+    long_tail_agent_schema_sql,
+)
 from app.pipelines import run_registered_pipeline
+from app.private_events import private_event_gateway_schema_sql
+from app.task_orchestrator import task_orchestrator_schema_sql
+from app.tool_registry import default_tool_registry, tool_registry_schema_sql
 from app.vector import embedding_status, text_embedding, text_embedding_with_provider, vector_literal
+from app.voice import handle_voice_websocket
+from app.workflow_distillation import workflow_distillation_schema_sql
 
 
 DATABASE_URL = os.environ["DATABASE_URL"]
@@ -45,6 +74,10 @@ LOW_VALUE_RAW_RETENTION_DAYS = int(os.getenv("LOW_VALUE_RAW_RETENTION_DAYS", "7"
 ENABLE_OPENCLAW_JOB_RUNNER = os.getenv("ENABLE_OPENCLAW_JOB_RUNNER", "true").lower() == "true"
 OPENCLAW_JOB_RUNNER_INTERVAL_SECONDS = float(os.getenv("OPENCLAW_JOB_RUNNER_INTERVAL_SECONDS", "5"))
 OPENCLAW_JOB_RUNNER_BATCH_SIZE = int(os.getenv("OPENCLAW_JOB_RUNNER_BATCH_SIZE", "2"))
+ENABLE_LONG_TAIL_RECOVERY_RUNNER = os.getenv("ENABLE_LONG_TAIL_RECOVERY_RUNNER", "true").lower() == "true"
+LONG_TAIL_RECOVERY_INTERVAL_SECONDS = float(os.getenv("LONG_TAIL_RECOVERY_INTERVAL_SECONDS", "10"))
+LONG_TAIL_RECOVERY_BATCH_SIZE = int(os.getenv("LONG_TAIL_RECOVERY_BATCH_SIZE", "10"))
+LONG_TAIL_RECOVERY_LEASE_SECONDS = int(os.getenv("LONG_TAIL_RECOVERY_LEASE_SECONDS", "30"))
 CONTEXT_MODEL_WINDOW_TOKENS = int(os.getenv("CONTEXT_MODEL_WINDOW_TOKENS", "256000"))
 CONTEXT_OUTPUT_RESERVED_TOKENS = int(os.getenv("CONTEXT_OUTPUT_RESERVED_TOKENS", "32000"))
 CONTEXT_SAFETY_RESERVED_TOKENS = int(os.getenv("CONTEXT_SAFETY_RESERVED_TOKENS", "12000"))
@@ -85,7 +118,7 @@ DEFAULT_COMPOSIO_WRITE_TOOLKITS = [
 ]
 
 EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+")
-PHONE_RE = re.compile(r"(?<!\d)(?:\+?\d[\d -]{7,}\d)(?!\d)")
+PHONE_RE = re.compile(r"(?<![\dA-Za-z-])(?:\+?\d[\d -]{7,}\d)(?![\dA-Za-z-])")
 URL_QUERY_RE = re.compile(r"([?&])([^=#&]+)=([^&#]+)")
 SENSITIVE_KEY_RE = re.compile(r"(token|secret|cookie|session|password|passwd|auth|code|验证码|校验码|verification)", re.I)
 INLINE_SECRET_RE = re.compile(r"\b(token|secret|sessionid|session|password|passwd|auth|code)=([^,\s&;]+)", re.I)
@@ -96,7 +129,11 @@ ORDER_ID_RE = re.compile(r"((?:订单号|订单|order(?: id)?)[^\dA-Za-z]{0,8})(
 ID_CARD_RE = re.compile(r"((?:身份证号?|id card)[^\dA-Za-z]{0,8})(\d{17}[\dXx])", re.I)
 PASSPORT_RE = re.compile(r"((?:护照|passport)[^\dA-Za-z]{0,8})([A-Z]{1,2}\d{6,9})", re.I)
 BANK_CARD_RE = re.compile(r"((?:银行卡|卡号|bank card)[^\dA-Za-z]{0,8})(\d(?:[ -]?\d){12,18})", re.I)
-AMOUNT_RE = re.compile(r"(?<![\dA-Za-z_:])(?:¥|￥|RMB\s*)?\d{1,7}(?:\.\d{2})?\s*(?:元|CNY|USD|美元)?(?![\dA-Za-z_:])", re.I)
+AMOUNT_RE = re.compile(
+    r"(?<![\dA-Za-z_:.-])(?:(?:¥|￥|\$|RMB\s*)\d{1,7}(?:\.\d{1,2})?\s*(?:元|CNY|USD|美元)?|\d{1,7}(?:\.\d{1,2})?\s*(?:元|CNY|USD|美元))(?![\dA-Za-z_:.-])",
+    re.I,
+)
+BILL_ID_RE = re.compile(r"\b(?:INV|INVOICE|BILL)[-_A-Z0-9]+\b", re.I)
 CHINESE_ADDRESS_RE = re.compile(
     r"((?:收货地址|地址)[：:\s]*)([^，。；;\\n]{6,80}(?:号|室|楼|层|单元|弄|路|街|大道|巷|村|县|区|市))"
 )
@@ -106,24 +143,55 @@ CHINESE_ADDRESS_RE = re.compile(
 async def lifespan(app: FastAPI):
     ensure_collector_settings_schema()
     ensure_event_private_storage_schema()
+    ensure_private_event_gateway_schema()
+    ensure_assistant_identity_schema()
     ensure_memory_governance_schema()
     ensure_assistant_context_schema()
+    ensure_curated_assistant_memory_schema()
     ensure_proactive_feedback_schema()
     ensure_task_routing_schema()
+    ensure_task_orchestrator_schema()
+    ensure_long_tail_agent_schema()
+    ensure_tool_registry_schema()
+    ensure_workflow_distillation_schema()
     ensure_openclaw_execution_schema()
+    ensure_model_gateway_schema()
     text_embedding_with_provider("startup embedding warmup")
     tasks: list[asyncio.Task] = []
     if ENABLE_DAILY_MAINTENANCE:
         tasks.append(asyncio.create_task(daily_maintenance_loop()))
     if ENABLE_OPENCLAW_JOB_RUNNER:
         tasks.append(asyncio.create_task(openclaw_execution_job_runner_loop()))
+    if ENABLE_LONG_TAIL_RECOVERY_RUNNER and DATABASE_URL != "postgresql://test":
+        tasks.append(asyncio.create_task(long_tail_recovery_runner_loop()))
     yield
     for task in tasks:
         task.cancel()
 
 
-app = FastAPI(title="Personal AI Runtime", version="0.1.0", lifespan=lifespan)
+app = FastAPI(title="Nomi Personal Assistant Runtime", version="0.1.0", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+app.include_router(assistant_identity_router)
+
+
+def build_long_tail_event_store() -> LongTailEventStore:
+    store_mode = os.getenv("LONG_TAIL_EVENT_STORE", "auto").strip().lower()
+    if store_mode == "memory" or DATABASE_URL == "postgresql://test":
+        return LongTailEventStore()
+    return PostgresLongTailEventStore(
+        connection_factory=lambda: psycopg.connect(DATABASE_URL),
+        materialize_events=True,
+    )
+
+
+_MODEL_GATEWAY: Any = None
+_LONG_TAIL_EVENT_STORE = build_long_tail_event_store()
+_LONG_TAIL_RUNNER = LongTailGraphRunner(event_store=_LONG_TAIL_EVENT_STORE, verifier=StepVerifier())
+_LONG_TAIL_EFFECT_CONTROLLER = ExternalEffectController(event_store=_LONG_TAIL_EVENT_STORE)
+_ASSISTANT_OUTBOUND_PIPELINE = OutboundMessagePipeline()
+_ASSISTANT_IDENTITY_REGISTRY = AssistantIdentityRegistry()
+_ASSISTANT_INBOX_EVENTS: list[dict[str, Any]] = []
+_ASSISTANT_OUTBOUND_MESSAGES: list[dict[str, Any]] = []
 
 
 class EventIn(BaseModel):
@@ -176,6 +244,132 @@ class PipelineRunIn(BaseModel):
     context: dict[str, Any] = Field(default_factory=dict)
 
 
+class ComposioToolExecuteIn(BaseModel):
+    toolkit_slug: str = Field(min_length=1, max_length=120)
+    tool_slug: str = Field(min_length=1, max_length=160)
+    arguments: dict[str, Any] = Field(default_factory=dict)
+    session_kind: str = Field(default="readonly", max_length=40)
+    task_id: Optional[str] = None
+    step_id: Optional[str] = None
+
+
+class AssistantGmailSyncIn(BaseModel):
+    identity_id: str = Field(default="nomi_gmail_primary", max_length=120)
+    message: dict[str, Any] = Field(default_factory=dict)
+    user_keys: list[str] = Field(default_factory=list)
+    known_contacts: dict[str, str] = Field(default_factory=dict)
+
+
+class AssistantIdentityPatchIn(BaseModel):
+    display_name: Optional[str] = Field(default=None, max_length=120)
+    status: Optional[str] = Field(default=None, max_length=80)
+
+
+class AssistantWhatsAppWebhookIn(BaseModel):
+    entry: list[dict[str, Any]] = Field(default_factory=list)
+    known_contacts: dict[str, str] = Field(default_factory=dict)
+
+
+class AssistantGmailPubSubIn(BaseModel):
+    message: dict[str, Any] = Field(default_factory=dict)
+
+
+class AssistantPhoneSmsWebhookIn(BaseModel):
+    identity_id: str = Field(default="nomi_phone_primary", max_length=120)
+    provider_message_id: Optional[str] = Field(default=None, max_length=200)
+    from_number: str = Field(default="", max_length=80)
+    to_number: str = Field(default="", max_length=80)
+    body: str = Field(default="", max_length=10000)
+    timestamp: Optional[str] = Field(default=None, max_length=120)
+    known_contacts: dict[str, str] = Field(default_factory=dict)
+    user_keys: list[str] = Field(default_factory=list)
+
+
+class AssistantPhoneCallWebhookIn(BaseModel):
+    identity_id: str = Field(default="nomi_phone_primary", max_length=120)
+    provider_call_id: Optional[str] = Field(default=None, max_length=200)
+    from_number: str = Field(default="", max_length=80)
+    to_number: str = Field(default="", max_length=80)
+    direction: str = Field(default="inbound", max_length=40)
+    status: str = Field(default="received", max_length=80)
+    timestamp: Optional[str] = Field(default=None, max_length=120)
+    known_contacts: dict[str, str] = Field(default_factory=dict)
+    user_keys: list[str] = Field(default_factory=list)
+
+
+class AssistantOutboundDraftIn(BaseModel):
+    identity_id: str = Field(min_length=1, max_length=120)
+    channel: str = Field(min_length=1, max_length=40)
+    recipient: str = Field(min_length=1, max_length=300)
+    subject: str = Field(default="", max_length=500)
+    body_text: str = Field(min_length=1, max_length=10000)
+    source_evidence_ids: list[str] = Field(default_factory=list)
+    risk_notes: list[str] = Field(default_factory=list)
+
+
+class AssistantOutboundDraftPatchIn(BaseModel):
+    subject: Optional[str] = Field(default=None, max_length=500)
+    body_text: Optional[str] = Field(default=None, max_length=10000)
+    risk_notes: Optional[list[str]] = None
+
+
+class AssistantOutboundSendIn(BaseModel):
+    confirmation_token: str = Field(default="", max_length=500)
+
+
+class GmailComposioFetchIn(BaseModel):
+    query: str = Field(default="newer_than:1d", max_length=1000)
+    limit: int = Field(default=20, ge=1, le=50)
+
+
+class AgentTaskCreateIn(BaseModel):
+    original_goal: str = Field(min_length=1, max_length=5000)
+    route_decision: dict[str, Any] = Field(default_factory=dict)
+    plan: dict[str, Any]
+
+
+class AgentTaskCompleteStepIn(BaseModel):
+    executor_result: dict[str, Any]
+
+
+class AgentTaskCancelIn(BaseModel):
+    reason: str = Field(default="", max_length=1000)
+
+
+class AgentTaskHumanInputIn(BaseModel):
+    step_id: Optional[str] = None
+    input_type: str = Field(default="user_response", max_length=80)
+    response: dict[str, Any] = Field(default_factory=dict)
+
+
+class AgentTaskConfirmIn(BaseModel):
+    step_id: Optional[str] = None
+    confirmation: dict[str, Any] = Field(default_factory=dict)
+
+
+class AgentTaskExternalEffectIn(BaseModel):
+    step_id: str = Field(min_length=1, max_length=200)
+    action_request_id: str = Field(min_length=1, max_length=200)
+    effect_type: str = Field(min_length=1, max_length=120)
+    proposal: dict[str, Any] = Field(default_factory=dict)
+
+
+class AgentTaskExternalEffectConfirmIn(BaseModel):
+    confirmation: dict[str, Any] = Field(default_factory=dict)
+
+
+class AgentTaskExternalEffectExecuteIn(BaseModel):
+    execution_payload: dict[str, Any] = Field(default_factory=dict)
+
+
+class AgentTaskExternalEffectCompensationIn(BaseModel):
+    proposal: dict[str, Any] = Field(default_factory=dict)
+
+
+class BrowserOpenIn(BaseModel):
+    source: str = Field(min_length=1, max_length=80)
+
+
 class OpenClawExecuteIn(BaseModel):
     packet: dict[str, Any]
     execution_guard: dict[str, Any] = Field(default_factory=dict)
@@ -198,6 +392,7 @@ class SensitiveFieldReleaseIn(BaseModel):
 class MemoryDeleteIn(BaseModel):
     memory_id: Optional[str] = None
     source: Optional[str] = None
+    state_key: Optional[str] = None
 
 
 class MemoryCorrectionIn(BaseModel):
@@ -266,6 +461,79 @@ class RetrievalPlan:
 
 def db() -> psycopg.Connection:
     return psycopg.connect(DATABASE_URL)
+
+
+def model_gateway():
+    global _MODEL_GATEWAY
+    if _MODEL_GATEWAY is None:
+        _MODEL_GATEWAY = default_model_gateway()
+    return _MODEL_GATEWAY
+
+
+def jsonb_param(value: Any) -> Jsonb | None:
+    if value is None:
+        return None
+    return Jsonb(value)
+
+
+def persist_model_request_trace(
+    conn: psycopg.Connection,
+    *,
+    task_class: str,
+    selected_provider_id: str,
+    status: str,
+    fallback_provider_ids: Optional[list[str]] = None,
+    error_type: str = "",
+    user_visible_message: str = "",
+    context_snapshot_id: Optional[str] = None,
+    input_token_estimate: Optional[int] = None,
+    output_token_estimate: Optional[int] = None,
+    stream_first_token_ms: Optional[int] = None,
+    latency_ms: Optional[int] = None,
+    payload: Optional[dict[str, Any]] = None,
+) -> str:
+    trace_id = str(uuid.uuid4())
+    conn.execute(
+        """
+        INSERT INTO model_request_traces (
+          id, task_class, selected_provider_id, fallback_provider_ids, status,
+          error_type, user_visible_message, context_snapshot_id,
+          input_token_estimate, output_token_estimate, stream_first_token_ms,
+          latency_ms, payload
+        )
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        """,
+        (
+            trace_id,
+            task_class,
+            selected_provider_id,
+            fallback_provider_ids or [],
+            status,
+            error_type,
+            user_visible_message,
+            context_snapshot_id,
+            input_token_estimate,
+            output_token_estimate,
+            stream_first_token_ms,
+            latency_ms,
+            jsonb_param(payload or {}),
+        ),
+    )
+    return trace_id
+
+
+def model_trace_fallbacks(trace: dict[str, Any]) -> list[str]:
+    raw = trace.get("fallback_from") if isinstance(trace, dict) else []
+    if not isinstance(raw, list):
+        return []
+    return [str(item) for item in raw if str(item)]
+
+
+def safe_persist_model_request_trace(conn: psycopg.Connection, **kwargs: Any) -> Optional[str]:
+    try:
+        return persist_model_request_trace(conn, **kwargs)
+    except Exception:
+        return None
 
 
 def redis_client() -> redis.Redis:
@@ -398,6 +666,93 @@ def protect_private_payload(value: dict[str, Any]) -> dict[str, Any]:
 def require_password(x_par_password: Optional[str]) -> None:
     if not is_authorized(x_par_password):
         raise HTTPException(status_code=401, detail="invalid password")
+
+
+def long_tail_runner() -> LongTailGraphRunner:
+    return _LONG_TAIL_RUNNER
+
+
+def long_tail_event_store() -> LongTailEventStore:
+    return _LONG_TAIL_EVENT_STORE
+
+
+def long_tail_effect_controller() -> ExternalEffectController:
+    global _LONG_TAIL_EFFECT_CONTROLLER
+    if _LONG_TAIL_EFFECT_CONTROLLER.event_store is not _LONG_TAIL_EVENT_STORE:
+        _LONG_TAIL_EFFECT_CONTROLLER = ExternalEffectController(event_store=_LONG_TAIL_EVENT_STORE)
+    return _LONG_TAIL_EFFECT_CONTROLLER
+
+
+def require_long_tail_task(task_id: str) -> dict[str, Any]:
+    try:
+        return long_tail_runner().get_task_state(task_id)
+    except KeyError as exc:
+        if long_tail_event_store().task_events(task_id):
+            return long_tail_runner().recover_task(task_id)
+        raise HTTPException(status_code=404, detail="task not found") from exc
+
+
+BROWSER_COMMAND_QUEUE_KEY = "browser:commands"
+BROWSER_OPEN_TARGETS: dict[str, dict[str, str]] = {
+    "whatsapp": {
+        "host_fragment": "web.whatsapp.com",
+        "url": "https://web.whatsapp.com/",
+    },
+    "telegram": {
+        "host_fragment": "web.telegram.org",
+        "url": "https://web.telegram.org/",
+    },
+    "search": {
+        "host_fragment": "google.",
+        "url": "https://www.google.com/",
+    },
+    "shopping": {
+        "host_fragment": "amazon.",
+        "url": "https://www.amazon.com/",
+    },
+}
+
+
+def browser_open_target(source: str) -> dict[str, str]:
+    normalized = (source or "").strip().lower()
+    target = BROWSER_OPEN_TARGETS.get(normalized)
+    if not target:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "unsupported_browser_source",
+                "message": f"{source} is not a supported managed browser login source.",
+                "supported_sources": sorted(BROWSER_OPEN_TARGETS),
+            },
+        )
+    return {"source": normalized, **target}
+
+
+def normalize_browser_command_payload(value: Any) -> Optional[dict[str, Any]]:
+    if value is None:
+        return None
+    if isinstance(value, bytes):
+        value = value.decode("utf-8", errors="replace")
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError:
+            return None
+    if not isinstance(value, dict):
+        return None
+    action = str(value.get("action") or "")
+    source = str(value.get("source") or "")
+    target = BROWSER_OPEN_TARGETS.get(source)
+    if action != "open_url" or not target:
+        return None
+    return {
+        "command_id": str(value.get("command_id") or ""),
+        "action": "open_url",
+        "source": source,
+        "url": target["url"],
+        "host_fragment": target["host_fragment"],
+        "created_at": str(value.get("created_at") or ""),
+    }
 
 
 def tool_permission_policy() -> dict[str, str]:
@@ -1400,7 +1755,65 @@ def normalize_openclaw_gateway_events(data: Any) -> list[dict[str, Any]]:
 
 
 def execute_openclaw_task_packet(packet: dict[str, Any], guard: dict[str, Any]) -> dict[str, Any]:
+    task_id = str(packet.get("task_id") or f"openclaw_{uuid.uuid4().hex}")
+    step_id = str(packet.get("step_id") or "openclaw_task_packet")
+    executor_trace = {
+        "provider": "openclaw",
+        "executor_trace_id": f"openclaw_exec_{uuid.uuid4().hex}",
+        "adapter_mode": "live" if openclaw_enabled() else "dry_run",
+        "permission": guard.get("permission", "read_only"),
+    }
+    registry = ExecutorAdapterRegistry(event_store=long_tail_event_store(), policy_gate=PolicyGate())
+    proposed = registry.propose_action(
+        task_id=task_id,
+        step_id=step_id,
+        adapter="openclaw",
+        action_type="openclaw.run_task_packet",
+        target={
+            "kind": "openclaw_task_packet",
+            "task_id": task_id,
+            "goal_hash": hashlib.sha256(str(packet.get("goal") or "").encode("utf-8")).hexdigest(),
+        },
+        input_summary={
+            "permission": guard.get("permission", "read_only"),
+            "allowed_actions": list(packet.get("allowed_actions") or []),
+            "forbidden_actions": list(packet.get("forbidden_actions") or []),
+            "requires_stop_before": list(packet.get("requires_stop_before") or []),
+            "minimal_context_keys": sorted((packet.get("minimal_context") or {}).keys()),
+        },
+        risk_level=str(guard.get("permission") or "read_only"),
+        expected_effect="Run an OpenClaw step executor under Nomi stop-before-effect rules.",
+        allowed_actions={"openclaw.run_task_packet"},
+        executor_trace=executor_trace,
+    )
+    if not proposed["policy_report"].get("may_execute"):
+        return {
+            "mode": "policy",
+            "status": "blocked",
+            "needs_confirmation": True,
+            "reason": proposed["policy_report"].get("reason", "OpenClaw execution blocked by policy."),
+            "policy_report": proposed["policy_report"],
+        }
+
     if not openclaw_enabled():
+        dry_run_result = {
+            "mode": "dry_run",
+            "status": "blocked",
+            "external_side_effect": False,
+            "reason": "OPENCLAW_ENABLED is not true; live OpenClaw execution is disabled.",
+        }
+        long_tail_event_store().append_event(
+            task_id=task_id,
+            event_type="executor.dry_run_completed",
+            step_id=step_id,
+            payload={
+                "action_request_id": proposed["action_request"]["action_id"],
+                "policy_status": proposed["policy_report"]["status"],
+                "dry_run_result": dry_run_result,
+                "executor_trace": executor_trace,
+            },
+            idempotency_key=f"{proposed['action_request']['idempotency_key']}:dry_run_completed",
+        )
         return {
             "mode": "dry_run",
             "status": "blocked",
@@ -1432,22 +1845,62 @@ def execute_openclaw_task_packet(packet: dict[str, Any], guard: dict[str, Any]) 
         response.raise_for_status()
         data = response.json()
         summary = output_text_from_openclaw_response(data) or json.dumps(data, ensure_ascii=False)[:1000]
-        return {
+        provider_trace_id = data.get("id") if isinstance(data, dict) else None
+        executor_trace["provider_trace_id"] = provider_trace_id
+        result = {
             "mode": "live",
             "status": "completed_read_only",
             "needs_confirmation": bool(guard.get("requires_confirmation", True)),
             "summary": summary,
-            "raw_response_id": data.get("id") if isinstance(data, dict) else None,
+            "raw_response_id": provider_trace_id,
             "events": normalize_openclaw_gateway_events(data),
+            "external_side_effect": False,
         }
+        long_tail_event_store().append_event(
+            task_id=task_id,
+            event_type="executor.live_completed",
+            step_id=step_id,
+            payload={
+                "action_request_id": proposed["action_request"]["action_id"],
+                "policy_status": proposed["policy_report"]["status"],
+                "live_result": {
+                    "mode": result["mode"],
+                    "status": result["status"],
+                    "provider_trace_id": provider_trace_id,
+                    "external_side_effect": False,
+                },
+                "executor_trace": executor_trace,
+            },
+            idempotency_key=f"{proposed['action_request']['idempotency_key']}:live_completed",
+        )
+        return result
     except Exception as exc:
-        return {
+        result = {
             "mode": "live",
             "status": "failed",
             "needs_confirmation": True,
             "summary": "",
             "error": str(exc)[:300],
+            "external_side_effect": False,
         }
+        long_tail_event_store().append_event(
+            task_id=task_id,
+            event_type="executor.live_completed",
+            step_id=step_id,
+            payload={
+                "action_request_id": proposed["action_request"]["action_id"],
+                "policy_status": proposed["policy_report"]["status"],
+                "live_result": {
+                    "mode": result["mode"],
+                    "status": result["status"],
+                    "error": result["error"],
+                    "external_side_effect": False,
+                },
+                "executor_trace": executor_trace,
+            },
+            idempotency_key=f"{proposed['action_request']['idempotency_key']}:live_completed",
+        )
+        return result
 
 
 def classify_openclaw_job_result(
@@ -1487,7 +1940,7 @@ def record_openclaw_execution_event(
         )
         VALUES (%s, %s, %s, %s, %s, now())
         """,
-        (event_id, job_id, event_type, message, safe_payload),
+        (event_id, job_id, event_type, message, jsonb_param(safe_payload)),
     )
     publish_realtime_message_safely(
         {
@@ -1523,7 +1976,7 @@ def enqueue_openclaw_execution_job(
         )
         VALUES (%s, %s, %s, %s, 0, %s, %s, %s, now(), now(), now())
         """,
-        (job_id, task_id, trace_id, "queued", max_attempts, packet, guard),
+        (job_id, task_id, trace_id, "queued", max_attempts, jsonb_param(packet), jsonb_param(guard)),
     )
     record_openclaw_execution_event(
         conn,
@@ -1681,7 +2134,7 @@ def run_openclaw_execution_job_once(
         (
             transition["status"],
             attempt_count,
-            result,
+            jsonb_param(result),
             result.get("error") or result.get("reason"),
             next_attempt,
             completed_at,
@@ -1746,8 +2199,66 @@ async def openclaw_execution_job_runner_loop() -> None:
         await asyncio.sleep(OPENCLAW_JOB_RUNNER_INTERVAL_SECONDS)
 
 
+def build_long_tail_recovery_scanner() -> PostgresLongTailRecoveryScanner:
+    return PostgresLongTailRecoveryScanner(connection_factory=lambda: psycopg.connect(DATABASE_URL))
+
+
+def build_long_tail_lease_manager() -> PostgresLongTailLeaseManager:
+    return PostgresLongTailLeaseManager(connection_factory=lambda: psycopg.connect(DATABASE_URL))
+
+
+def process_due_long_tail_recovery_once(
+    *,
+    scanner: Any = None,
+    lease_manager: Any = None,
+    worker_id: str = "",
+    limit: int = LONG_TAIL_RECOVERY_BATCH_SIZE,
+    lease_seconds: int = LONG_TAIL_RECOVERY_LEASE_SECONDS,
+) -> dict[str, Any]:
+    scanner = scanner or build_long_tail_recovery_scanner()
+    lease_manager = lease_manager or build_long_tail_lease_manager()
+    worker_id = worker_id or f"nomi-long-tail-recovery-{uuid.uuid4().hex[:8]}"
+    task_ids = scanner.due_task_ids(limit=limit)
+    results: list[dict[str, Any]] = []
+    processed = 0
+    skipped = 0
+    failed = 0
+    for task_id in task_ids:
+        lease = lease_manager.claim_task(task_id, worker_id=worker_id, lease_seconds=lease_seconds)
+        if not lease.get("acquired"):
+            skipped += 1
+            results.append({"task_id": task_id, "status": "skipped", "lease": lease})
+            continue
+        try:
+            state = long_tail_runner().recover_task(task_id)
+            processed += 1
+            results.append({"task_id": task_id, "status": "recovered", "state": state, "lease": lease})
+        except Exception as exc:
+            failed += 1
+            results.append({"task_id": task_id, "status": "failed", "error": type(exc).__name__, "lease": lease})
+        finally:
+            lease_manager.release_task(task_id, worker_id=worker_id)
+    return {
+        "processed": processed,
+        "skipped": skipped,
+        "failed": failed,
+        "task_ids": task_ids,
+        "results": results,
+    }
+
+
+async def long_tail_recovery_runner_loop() -> None:
+    while True:
+        try:
+            process_due_long_tail_recovery_once()
+        except Exception:
+            pass
+        await asyncio.sleep(LONG_TAIL_RECOVERY_INTERVAL_SECONDS)
+
+
 def clarification_for_ambiguous_external_effect(request: str, capability: dict[str, Any]) -> dict[str, Any]:
     lowered = request.lower()
+    context = capability.get("_context") if isinstance(capability.get("_context"), dict) else {}
     missing_fields: list[str] = []
     risk_permission = capability.get("risk_permission")
     has_specific_crm_action = any(term in lowered for term in ["hubspot", "salesforce", "加到", "备注", "更新", "创建", "记录"])
@@ -1757,8 +2268,16 @@ def clarification_for_ambiguous_external_effect(request: str, capability: dict[s
         missing_fields.extend(["target_contact", "target_action"])
 
     if capability["id"] == "finance.payment_bill.manage":
-        has_amount = bool(AMOUNT_RE.search(request))
-        has_counterparty = any(term in request for term in ["给", "向", "转给", "付给", "支付给", "收款方"])
+        has_amount = bool(
+            AMOUNT_RE.search(request)
+            or BILL_ID_RE.search(request)
+            or context.get("amount_or_bill")
+            or context.get("bill")
+            or context.get("invoice_id")
+        )
+        has_counterparty = bool(context.get("counterparty") or context.get("payee")) or any(
+            term in request for term in ["给", "向", "转给", "付给", "支付给", "收款方"]
+        )
         if not has_amount:
             missing_fields.append("amount_or_bill")
         if not has_counterparty:
@@ -1777,6 +2296,9 @@ def clarification_for_ambiguous_external_effect(request: str, capability: dict[s
 
 def match_capability(request: str) -> dict[str, Any]:
     lowered = request.lower()
+    explicit_capability_id = explicit_capability_id_for_request(request)
+    if explicit_capability_id:
+        return next(item for item in capability_taxonomy() if item["id"] == explicit_capability_id)
     scored: list[tuple[int, dict[str, Any]]] = []
     for capability in capability_taxonomy():
         score = sum(1 for keyword in capability["keywords"] if str(keyword).lower() in lowered)
@@ -1785,6 +2307,40 @@ def match_capability(request: str) -> dict[str, Any]:
     if scored:
         return sorted(scored, key=lambda item: item[0], reverse=True)[0][1]
     return next(item for item in capability_taxonomy() if item["id"] == "automation.browser.operate")
+
+
+def explicit_capability_id_for_request(request: str) -> Optional[str]:
+    lowered = request.lower()
+    has_ride_intent = any(term in lowered for term in ["打车", "叫车", "uber", "book a ride", "ride"])
+    has_route_intent = any(term in lowered for term in ["查路线", "路线", "怎么去", "导航", "多久到", "要多久", "地图", "route", "directions"])
+    has_payment_intent = bool(BILL_ID_RE.search(request)) or any(
+        term in lowered for term in ["invoice", "bill", "付款", "支付", "账单", "发票", "报销", "转账", "还款", "欠款"]
+    )
+    has_document_intent = any(
+        term in lowered
+        for term in [
+            "报价单",
+            "文档",
+            "文件",
+            "表格",
+            "sheet",
+            "docs",
+            "drive",
+            "pdf",
+            "docx",
+            "xlsx",
+            "总结这个文档",
+        ]
+    )
+    if has_payment_intent:
+        return "finance.payment_bill.manage"
+    if has_document_intent:
+        return "files.document.process"
+    if has_ride_intent:
+        return "local_service.ride.estimate_or_book"
+    if has_route_intent:
+        return "local_service.route.lookup"
+    return None
 
 
 def pipeline_for_capability(capability_id: str) -> Optional[dict[str, Any]]:
@@ -1801,6 +2357,26 @@ def pipeline_for_id(pipeline_id: str) -> Optional[dict[str, Any]]:
     return None
 
 
+def connected_adapters_from_context(context: dict[str, Any]) -> dict[str, set[str]]:
+    raw = context.get("connected_adapters") or {}
+    if not isinstance(raw, dict):
+        return {}
+    normalized: dict[str, set[str]] = {}
+    for adapter, toolkits in raw.items():
+        adapter_id = str(adapter).strip()
+        if not adapter_id:
+            continue
+        if isinstance(toolkits, str):
+            normalized[adapter_id] = {toolkits}
+        elif isinstance(toolkits, (list, tuple, set)):
+            normalized[adapter_id] = {str(toolkit) for toolkit in toolkits if str(toolkit).strip()}
+        elif isinstance(toolkits, dict):
+            normalized[adapter_id] = {str(toolkit) for toolkit, connected in toolkits.items() if connected}
+        else:
+            normalized[adapter_id] = set()
+    return normalized
+
+
 def tools_for_capability(capability: dict[str, Any]) -> list[dict[str, Any]]:
     catalog = {tool["id"]: tool for tool in default_tool_catalog()}
     candidates = [catalog[tool_id] for tool_id in capability.get("tool_ids", []) if tool_id in catalog]
@@ -1810,8 +2386,12 @@ def tools_for_capability(capability: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def route_tool_request(request: str, context: Optional[dict[str, Any]] = None) -> dict[str, Any]:
-    context = context or {}
+    context = enrich_context_from_source_events(context or {})
+    tool_registry_decision = default_tool_registry(
+        connected_adapters=connected_adapters_from_context(context),
+    ).route_request(request, context)
     capability = match_capability(request)
+    capability["_context"] = context
     pipeline = pipeline_for_capability(capability["id"])
     candidate_tools = tools_for_capability(capability)
     clarification = clarification_for_ambiguous_external_effect(request, capability)
@@ -1839,6 +2419,7 @@ def route_tool_request(request: str, context: Optional[dict[str, Any]] = None) -
         "pipeline": pipeline,
         "candidate_tools": candidate_tools,
         "execution_guard": guard,
+        "tool_registry_decision": tool_registry_decision,
         "routing_reason": decision["reason"],
         "context": context,
     }
@@ -1864,6 +2445,7 @@ def extract_after_marker(text: str, markers: list[str]) -> Optional[str]:
 def strip_travel_suffix(value: str) -> str:
     cleaned = value.strip(" ：:，,。.!！?？")
     cleaned = re.sub(r"(要多久|多久到|怎么去|路线|导航|打车|叫车|uber|eta).*$", "", cleaned, flags=re.I)
+    cleaned = re.sub(r"(?:的|地)$", "", cleaned.strip())
     return cleaned.strip(" ：:，,。.!！?？")
 
 
@@ -1879,6 +2461,24 @@ def extract_destination_slot(request: str, context: dict[str, Any]) -> Optional[
     return None
 
 
+def recipient_from_active_scope(context: dict[str, Any]) -> Optional[str]:
+    scope = context.get("active_source_scope") if isinstance(context.get("active_source_scope"), dict) else {}
+    candidates = [
+        scope.get("conversation_label"),
+        scope.get("contact_name"),
+        scope.get("counterparty_name"),
+        scope.get("chat_name"),
+    ]
+    counterparty_ids = scope.get("counterparty_ids")
+    if isinstance(counterparty_ids, list):
+        candidates.extend(counterparty_ids)
+    for candidate in candidates:
+        value = str(candidate or "").strip()
+        if value and value.lower() not in {"unknown", "user", "me"}:
+            return value
+    return None
+
+
 def extract_recipient_slot(request: str, context: dict[str, Any]) -> Optional[str]:
     explicit = context.get("recipient") or context.get("target_contact")
     if explicit:
@@ -1887,7 +2487,9 @@ def extract_recipient_slot(request: str, context: dict[str, Any]) -> Optional[st
     if match:
         recipient = re.split(r"[,，。.!！?？；;]|说|告诉|发", match.group(1).strip(), 1)[0]
         return recipient.strip()
-    return None
+    if any(token in request for token in ["她", "他", "对方", "ta", "TA", "那边"]):
+        return recipient_from_active_scope(context)
+    return recipient_from_active_scope(context)
 
 
 def extract_message_intent_slot(request: str, context: dict[str, Any]) -> Optional[str]:
@@ -1913,11 +2515,15 @@ def extract_channel_slot(request: str, context: dict[str, Any]) -> Optional[str]
 
 def extract_payment_slots(request: str, context: dict[str, Any]) -> dict[str, Any]:
     slots: dict[str, Any] = {}
-    amount = context.get("amount_or_bill") or context.get("amount")
+    amount = context.get("amount_or_bill") or context.get("amount") or context.get("bill") or context.get("invoice_id")
     if not amount:
         amount_match = AMOUNT_RE.search(request)
         if amount_match:
             amount = amount_match.group(0).strip()
+    if not amount:
+        bill_match = BILL_ID_RE.search(request)
+        if bill_match:
+            amount = bill_match.group(0).strip()
     if amount:
         slots["amount_or_bill"] = str(amount)
     counterparty = context.get("counterparty")
@@ -2177,6 +2783,109 @@ def safe_json_dict(value: Any) -> dict[str, Any]:
     return {}
 
 
+PLACEHOLDER_VALUE_RE = re.compile(r"\b(?:EMAIL|PHONE|AMOUNT|TOKEN|CARD|SSN)_\d+\b", re.I)
+
+
+def usable_source_context_text(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    if PLACEHOLDER_VALUE_RE.search(text):
+        return None
+    if text.lower() in {"unknown", "user", "me", "assistant", "nomi"}:
+        return None
+    return text
+
+
+def first_usable_source_value(*values: Any) -> Optional[str]:
+    for value in values:
+        if isinstance(value, list):
+            nested = first_usable_source_value(*value)
+            if nested:
+                return nested
+            continue
+        text = usable_source_context_text(value)
+        if text:
+            return text
+    return None
+
+
+def enrich_context_from_source_events(context: Optional[dict[str, Any]]) -> dict[str, Any]:
+    base_context = dict(context or {})
+    if base_context.get("source_event_context"):
+        return base_context
+    source_event_ids = base_context.get("source_event_ids") or []
+    if isinstance(source_event_ids, str):
+        source_event_ids = [source_event_ids]
+    source_event_ids = [str(item) for item in source_event_ids if item]
+    if not source_event_ids:
+        return base_context
+
+    source_context: list[dict[str, Any]] = []
+    try:
+        with db() as conn:
+            rows = conn.execute(
+                """
+                SELECT e.event_id::TEXT, e.source, e.event_type, e.raw_data,
+                       s.intent, s.summary, s.entities
+                FROM events e
+                LEFT JOIN semantic_events s ON s.event_id = e.event_id
+                WHERE e.event_id = ANY(%s::UUID[])
+                ORDER BY e.timestamp DESC
+                """,
+                (source_event_ids,),
+            ).fetchall()
+    except Exception:
+        return base_context
+
+    for row in rows:
+        raw_data = safe_json_dict(row[3])
+        entities = safe_json_dict(row[6])
+        source = str(row[1] or "")
+        source_context.append(
+            {
+                "event_id": str(row[0]),
+                "source": source,
+                "event_type": row[2],
+                "intent": row[4],
+                "summary": row[5],
+                "entities": entities,
+                "sender": raw_data.get("sender") or raw_data.get("from"),
+                "participants": raw_data.get("participants") or [],
+                "subject": raw_data.get("subject"),
+            }
+        )
+        if not base_context.get("counterparty") and not base_context.get("payee"):
+            counterparty = first_usable_source_value(
+                raw_data.get("payee"),
+                raw_data.get("counterparty"),
+                raw_data.get("sender"),
+                raw_data.get("from"),
+                raw_data.get("chat_name"),
+                raw_data.get("participants"),
+            )
+            if counterparty:
+                base_context["counterparty"] = counterparty
+        if not any(base_context.get(key) for key in ["amount_or_bill", "amount", "bill", "invoice_id"]):
+            amount_or_bill = first_usable_source_value(
+                entities.get("invoice_id"),
+                entities.get("bill_id"),
+                entities.get("amount"),
+                raw_data.get("invoice_id"),
+                raw_data.get("amount"),
+            )
+            if amount_or_bill:
+                base_context["amount_or_bill"] = amount_or_bill
+        if source == "gmail" and not base_context.get("mailbox"):
+            base_context["mailbox"] = "gmail"
+
+    if source_context:
+        base_context["source_event_context"] = source_context
+    return base_context
+
+
 def memory_scope_from_metadata(metadata: dict[str, Any], fallback_scope: str = "") -> str:
     scope = metadata.get("scope")
     if isinstance(scope, dict):
@@ -2326,6 +3035,10 @@ def build_pipeline_execution_result(
         "pipeline_version": (pipeline or {}).get("version") or "2026-05-28",
         "capability_id": route_result.get("capability", {}).get("id"),
         "status": status,
+        "source_event_ids": trace_refs["source_event_ids"],
+        "conversation_id": trace_refs["conversation_id"],
+        "suggestion_id": trace_refs["suggestion_id"],
+        "agenda_item_ids": trace_refs["agenda_item_ids"],
         "input": {
             "user_request": request,
             "source_event_ids": trace_refs["source_event_ids"],
@@ -2410,7 +3123,7 @@ def build_pipeline_execution_result(
 
 
 def run_core_pipeline(request: str, context: Optional[dict[str, Any]] = None) -> dict[str, Any]:
-    context = context or {}
+    context = enrich_context_from_source_events(context or {})
     pipeline_id = context.get("pipeline_id")
     if pipeline_id:
         pipeline = pipeline_for_id(str(pipeline_id))
@@ -2474,10 +3187,10 @@ def persist_task_route_trace(conn: psycopg.Connection, route_result: dict[str, A
             pipeline.get("id"),
             guard.get("permission", decision.get("risk_permission", "")),
             bool(guard.get("requires_confirmation", decision.get("confirmation_required", False))),
-            decision,
-            route_result.get("openclaw_task_packet"),
-            route_result.get("clarification"),
-            minimize_openclaw_context(route_result.get("context") or {}),
+            jsonb_param(decision),
+            jsonb_param(route_result.get("openclaw_task_packet")),
+            jsonb_param(route_result.get("clarification")),
+            jsonb_param(minimize_openclaw_context(route_result.get("context") or {})),
             refs["source_event_ids"],
             refs["conversation_id"],
             refs["suggestion_id"],
@@ -3932,20 +4645,114 @@ def composio_callback_for_toolkit(toolkit_slug: str, session_kind: str) -> Optio
     return f"{callback_url}{separator}toolkit={toolkit_slug}&session_kind={session_kind}"
 
 
-def create_composio_connect_link(toolkit_slug: str, requested_kind: str = "") -> dict[str, Any]:
+def composio_session_connected_toolkit(session: Any, toolkit_slug: str) -> Optional[dict[str, str]]:
+    try:
+        result = session.toolkits()
+    except Exception:
+        return None
+    items = getattr(result, "items", None)
+    if items is None and isinstance(result, dict):
+        items = result.get("items", [])
+    for item in items or []:
+        toolkit = normalize_composio_toolkit(item)
+        if toolkit["slug"].lower() == toolkit_slug.lower() and toolkit["connected"]:
+            return toolkit
+    return None
+
+
+def composio_live_registry() -> ExecutorAdapterRegistry:
+    return ExecutorAdapterRegistry(event_store=long_tail_event_store(), policy_gate=PolicyGate())
+
+
+def composio_link_request_fields(connection_request: Any) -> dict[str, Any]:
+    return {
+        "redirect_url": str(object_value(connection_request, "redirect_url") or object_value(connection_request, "redirectUrl") or ""),
+        "connection_request_id": str(object_value(connection_request, "id") or object_value(connection_request, "link_token") or object_value(connection_request, "linkToken") or ""),
+        "connected_account_id": str(object_value(connection_request, "connected_account_id") or object_value(connection_request, "connectedAccountId") or ""),
+        "expires_at": object_value(connection_request, "expires_at") or object_value(connection_request, "expiresAt"),
+    }
+
+
+def create_composio_connect_link(toolkit_slug: str, requested_kind: str = "", force: bool = False) -> dict[str, Any]:
     slug = toolkit_slug.lower().strip()
     session_kind = choose_composio_session_kind(slug, requested_kind)
     user_id = current_composio_user_id()
     session, policy = get_or_create_composio_session(user_id, session_kind)
+    connected_toolkit = None if force else composio_session_connected_toolkit(session, slug)
+    if connected_toolkit:
+        session_payload = public_composio_session_payload(session, policy)
+        return {
+            "status": "already_connected",
+            "toolkit_slug": slug,
+            "session_kind": session_kind,
+            "user_id": user_id,
+            "redirect_url": "",
+            "connection_request_id": "",
+            "connected_account_id": connected_toolkit.get("connected_account_id", ""),
+            "expires_at": None,
+            "session": session_payload,
+        }
     callback_url = composio_callback_for_toolkit(slug, session_kind)
-    if callback_url:
-        connection_request = session.authorize(slug, callback_url=callback_url)
-    else:
-        connection_request = session.authorize(slug)
-    redirect_url = str(object_value(connection_request, "redirect_url") or object_value(connection_request, "redirectUrl") or "")
-    connection_request_id = str(object_value(connection_request, "id") or object_value(connection_request, "link_token") or object_value(connection_request, "linkToken") or "")
-    connected_account_id = str(object_value(connection_request, "connected_account_id") or object_value(connection_request, "connectedAccountId") or "")
-    expires_at = object_value(connection_request, "expires_at") or object_value(connection_request, "expiresAt")
+    authorized: dict[str, Any] = {}
+
+    def authorize_toolkit(action_request: dict[str, Any]) -> dict[str, Any]:
+        if callback_url:
+            connection_request = session.authorize(slug, callback_url=callback_url)
+        else:
+            connection_request = session.authorize(slug)
+        fields = composio_link_request_fields(connection_request)
+        authorized["fields"] = fields
+        return {
+            "status": "link_created",
+            "toolkit": slug,
+            "session_kind": session_kind,
+            "connection_request_id": fields["connection_request_id"],
+            "connected_account_id_present": bool(fields["connected_account_id"]),
+            "redirect_url_present": bool(fields["redirect_url"]),
+            "callback_url_configured": bool(callback_url),
+            "external_side_effect": False,
+        }
+
+    live = composio_live_registry().execute_live(
+        task_id=f"composio:{session_kind}:{slug}:connect",
+        step_id="create_connect_link",
+        adapter="composio",
+        action_type="composio.authorize_toolkit",
+        target={"kind": "toolkit", "toolkit_slug": slug, "session_kind": session_kind},
+        input_summary={
+            "user_id": user_id,
+            "callback_url_configured": bool(callback_url),
+            "force": bool(force),
+            "mcp_headers_redacted": True,
+        },
+        risk_level="external_draft",
+        expected_effect="Create a Composio connect link only; do not read, write, send, buy, or submit through the connected account.",
+        allowed_actions={"composio.authorize_toolkit"},
+        executor=authorize_toolkit,
+        executor_trace={"provider": "composio", "toolkit": slug, "session_kind": session_kind},
+    )
+    live_result = dict(live.get("live_result") or {})
+    if live.get("status") == "blocked_by_policy" or live_result.get("status") == "blocked_by_policy":
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "composio_connect_blocked_by_policy",
+                "message": live_result.get("reason") or "Composio connect link creation was blocked before external execution.",
+            },
+        )
+    if live_result.get("status") == "failed":
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "code": "composio_connect_failed",
+                "message": live_result.get("summary") or "Composio connect link creation failed.",
+            },
+        )
+    fields = dict(authorized.get("fields") or {})
+    redirect_url = str(fields.get("redirect_url") or "")
+    connection_request_id = str(fields.get("connection_request_id") or "")
+    connected_account_id = str(fields.get("connected_account_id") or "")
+    expires_at = fields.get("expires_at")
     session_payload = public_composio_session_payload(session, policy)
     with db() as conn:
         conn.execute(
@@ -4005,6 +4812,85 @@ def create_composio_connect_link(toolkit_slug: str, requested_kind: str = "") ->
     }
 
 
+def clean_composio_callback_value(value: str, fallback: str = "") -> str:
+    cleaned = re.sub(r"[^a-zA-Z0-9_.-]", "", (value or "").strip())
+    return (cleaned or fallback)[:80]
+
+
+def composio_android_callback_html(toolkit: str, session_kind: str, status: str) -> str:
+    safe_toolkit = clean_composio_callback_value(toolkit, "unknown")
+    safe_session_kind = clean_composio_callback_value(session_kind, "readonly")
+    safe_status = clean_composio_callback_value(status, "success")
+    query = urlencode(
+        {
+            "toolkit": safe_toolkit,
+            "session_kind": safe_session_kind,
+            "status": safe_status,
+        }
+    )
+    deep_link = f"nomi://composio/connected?{query}"
+    intent_link = f"intent://composio/connected?{query}#Intent;scheme=nomi;package=com.par.assistant.android;end"
+    escaped_deep_link = html.escape(deep_link, quote=True)
+    escaped_intent_link = html.escape(intent_link, quote=True)
+    escaped_toolkit = html.escape(safe_toolkit, quote=True)
+    escaped_status = html.escape(safe_status, quote=True)
+    return f"""<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Nomi 授权完成</title>
+  <style>
+    body {{
+      margin: 0;
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: #f8fafc;
+      color: #0f172a;
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }}
+    main {{
+      width: min(88vw, 460px);
+      padding: 28px;
+      border: 1px solid #cbd5e1;
+      border-radius: 18px;
+      background: white;
+      box-shadow: 0 18px 50px rgba(15, 23, 42, 0.12);
+    }}
+    h1 {{ margin: 0 0 10px; font-size: 24px; }}
+    p {{ margin: 0 0 18px; line-height: 1.55; color: #475569; }}
+    a {{
+      display: block;
+      padding: 14px 16px;
+      border-radius: 14px;
+      text-align: center;
+      text-decoration: none;
+      color: white;
+      background: #0f766e;
+      font-weight: 700;
+    }}
+    small {{ display: block; margin-top: 14px; color: #64748b; line-height: 1.5; }}
+  </style>
+</head>
+<body>
+  <main>
+    <h1>授权已返回 Nomi</h1>
+    <p>{escaped_toolkit} 授权状态：{escaped_status}。如果没有自动回到授权列表，请点击下面的按钮。</p>
+    <a href="{escaped_intent_link}">返回 Nomi 授权列表</a>
+    <small>这个页面只负责唤起本机 Nomi，不展示或保存任何账号令牌。</small>
+  </main>
+  <script>
+    setTimeout(function () {{
+      window.location.replace("{escaped_intent_link}");
+    }}, 250);
+  </script>
+  <noscript><a href="{escaped_deep_link}">打开 Nomi</a></noscript>
+</body>
+</html>"""
+
+
 def connection_account_id(connection: Any) -> str:
     connected_account = object_value(connection, "connected_account") or object_value(connection, "connectedAccount")
     return str(object_value(connected_account, "id") or object_value(connection, "connected_account_id") or object_value(connection, "connectedAccountId") or "")
@@ -4030,12 +4916,59 @@ def normalize_composio_toolkit(toolkit: Any) -> dict[str, Any]:
 def sync_composio_toolkits(session_kind: str = "readonly") -> dict[str, Any]:
     user_id = current_composio_user_id()
     session, policy = get_or_create_composio_session(user_id, session_kind)
-    result = session.toolkits()
-    items = getattr(result, "items", None)
-    if items is None and isinstance(result, dict):
-        items = result.get("items", [])
-    toolkits = [normalize_composio_toolkit(item) for item in (items or [])]
     session_payload = public_composio_session_payload(session, policy)
+    synced: dict[str, Any] = {}
+
+    def list_toolkits(action_request: dict[str, Any]) -> dict[str, Any]:
+        result = session.toolkits()
+        items = getattr(result, "items", None)
+        if items is None and isinstance(result, dict):
+            items = result.get("items", [])
+        toolkits = [normalize_composio_toolkit(item) for item in (items or [])]
+        synced["toolkits"] = toolkits
+        return {
+            "status": "toolkits_synced",
+            "session_kind": policy["session_kind"],
+            "toolkit_count": len(toolkits),
+            "connected_count": sum(1 for toolkit in toolkits if toolkit.get("connected")),
+            "external_side_effect": False,
+        }
+
+    live = composio_live_registry().execute_live(
+        task_id=f"composio:{policy['session_kind']}:toolkits:sync",
+        step_id="sync_toolkits",
+        adapter="composio",
+        action_type="composio.list_toolkits",
+        target={"kind": "toolkit_catalog", "session_kind": policy["session_kind"]},
+        input_summary={
+            "user_id": user_id,
+            "session_id": session_payload["session_id"],
+            "mcp_headers_redacted": True,
+        },
+        risk_level="read_only",
+        expected_effect="Read Composio toolkit connection status for the current Nomi owner.",
+        allowed_actions={"composio.list_toolkits"},
+        executor=list_toolkits,
+        executor_trace={"provider": "composio", "session_kind": policy["session_kind"]},
+    )
+    live_result = dict(live.get("live_result") or {})
+    if live.get("status") == "blocked_by_policy" or live_result.get("status") == "blocked_by_policy":
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "composio_toolkits_sync_blocked_by_policy",
+                "message": live_result.get("reason") or "Composio toolkit sync was blocked before external execution.",
+            },
+        )
+    if live_result.get("status") == "failed":
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "code": "composio_toolkits_sync_failed",
+                "message": live_result.get("summary") or "Composio toolkit sync failed.",
+            },
+        )
+    toolkits = list(synced.get("toolkits") or [])
     with db() as conn:
         for toolkit in toolkits:
             conn.execute(
@@ -4066,6 +4999,309 @@ def sync_composio_toolkits(session_kind: str = "readonly") -> dict[str, Any]:
                 ),
             )
     return {"session": session_payload, "toolkits": toolkits}
+
+
+def composio_tool_execution_policy(tool_slug: str) -> dict[str, Any]:
+    slug = (tool_slug or "").strip().upper()
+    read_markers = ("GET", "FETCH", "LIST", "SEARCH", "READ", "RETRIEVE", "QUERY", "FIND")
+    draft_markers = ("DRAFT", "CREATE_DRAFT", "PREPARE_DRAFT")
+    send_markers = ("SEND", "SUBMIT", "PAY", "PURCHASE", "TRANSFER", "DELETE", "REMOVE")
+    if any(marker in slug for marker in draft_markers):
+        return {
+            "risk_level": "external_draft",
+            "action_type": "composio.prepare_draft",
+            "expected_effect": "Prepare or update a third-party draft only; do not send, pay, submit, delete, or finalize anything.",
+        }
+    if any(marker in slug for marker in read_markers):
+        return {
+            "risk_level": "read_only",
+            "action_type": "composio.execute_tool",
+            "expected_effect": "Read data from the connected toolkit and return a scoped result.",
+        }
+    if any(marker in slug for marker in send_markers):
+        return {
+            "risk_level": "external_message" if "SEND" in slug else "external_write",
+            "action_type": "email.send" if "SEND" in slug else "composio.execute_tool",
+            "expected_effect": "This tool may change the external world and requires an explicit external-effect confirmation flow.",
+        }
+    return {
+        "risk_level": "external_write",
+        "action_type": "composio.execute_tool",
+        "expected_effect": "Unknown Composio tool risk; require explicit confirmation before live execution.",
+    }
+
+
+def normalize_composio_tool_result(result: Any) -> Any:
+    if hasattr(result, "model_dump") and callable(result.model_dump):
+        return result.model_dump()
+    if hasattr(result, "dict") and callable(result.dict):
+        return result.dict()
+    if isinstance(result, dict):
+        return {str(key): normalize_composio_tool_result(value) for key, value in result.items()}
+    if isinstance(result, list):
+        return [normalize_composio_tool_result(item) for item in result]
+    if isinstance(result, tuple):
+        return [normalize_composio_tool_result(item) for item in result]
+    if isinstance(result, (str, int, float, bool)) or result is None:
+        return result
+    return str(result)
+
+
+def invoke_composio_session_tool(session: Any, tool_slug: str, arguments: dict[str, Any]) -> Any:
+    if hasattr(session, "execute_tool") and callable(session.execute_tool):
+        return session.execute_tool(tool_slug, arguments)
+    execute = getattr(session, "execute", None)
+    if callable(execute):
+        try:
+            return execute(tool_slug=tool_slug, arguments=arguments)
+        except TypeError:
+            return execute(tool_slug, arguments)
+    tools_attr = getattr(session, "tools", None)
+    if tools_attr is not None and not callable(tools_attr):
+        tools_execute = getattr(tools_attr, "execute", None)
+        if callable(tools_execute):
+            try:
+                return tools_execute(tool_slug=tool_slug, arguments=arguments)
+            except TypeError:
+                return tools_execute(tool_slug, arguments)
+    raise RuntimeError("The active Composio SDK session does not expose a supported tool execution method.")
+
+
+def persist_composio_tool_invocation(
+    *,
+    task_trace_id: str,
+    toolkit_slug: str,
+    tool_slug: str,
+    session_kind: str,
+    status: str,
+    request_payload: dict[str, Any],
+    response_payload: dict[str, Any],
+    error: str = "",
+) -> None:
+    with db() as conn:
+        conn.execute(
+            """
+            INSERT INTO composio_tool_invocations (
+              id, task_trace_id, toolkit_slug, tool_slug, session_kind, status,
+              request, response, error, created_at
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb, %s::jsonb, %s, now())
+            """,
+            (
+                uuid.uuid4(),
+                task_trace_id,
+                toolkit_slug,
+                tool_slug,
+                session_kind,
+                status,
+                json.dumps(request_payload, ensure_ascii=False, default=str),
+                json.dumps(response_payload, ensure_ascii=False, default=str),
+                error[:1000],
+            ),
+        )
+
+
+def execute_composio_tool_call(body: ComposioToolExecuteIn) -> dict[str, Any]:
+    toolkit_slug = body.toolkit_slug.strip().lower()
+    tool_slug = body.tool_slug.strip()
+    requested_kind = body.session_kind.strip().lower() or "readonly"
+    session_kind = choose_composio_session_kind(toolkit_slug, requested_kind)
+    policy = composio_tool_execution_policy(tool_slug)
+    user_id = current_composio_user_id()
+    session, session_policy = get_or_create_composio_session(user_id, session_kind)
+    task_id = (body.task_id or f"composio:{session_kind}:{toolkit_slug}:{tool_slug}").strip()
+    step_id = (body.step_id or "execute_tool").strip()
+    argument_keys = sorted(str(key) for key in body.arguments.keys())
+
+    def run_tool(action_request: dict[str, Any]) -> dict[str, Any]:
+        raw_result = invoke_composio_session_tool(session, tool_slug, dict(body.arguments))
+        normalized_result = normalize_composio_tool_result(raw_result)
+        return {
+            "status": "completed",
+            "toolkit": toolkit_slug,
+            "tool_slug": tool_slug,
+            "result": normalized_result,
+            "external_side_effect": policy["risk_level"] != "read_only",
+        }
+
+    live = composio_live_registry().execute_live(
+        task_id=task_id,
+        step_id=step_id,
+        adapter="composio",
+        action_type=policy["action_type"],
+        target={"kind": "composio_tool", "toolkit_slug": toolkit_slug, "tool_slug": tool_slug},
+        input_summary={
+            "user_id": user_id,
+            "session_kind": session_policy["session_kind"],
+            "argument_keys": argument_keys,
+            "arguments_present": bool(body.arguments),
+        },
+        risk_level=policy["risk_level"],
+        expected_effect=policy["expected_effect"],
+        allowed_actions={"composio.execute_tool", "composio.prepare_draft", "email.send"},
+        executor=run_tool,
+        executor_trace={
+            "provider": "composio",
+            "toolkit": toolkit_slug,
+            "tool_slug": tool_slug,
+            "session_kind": session_policy["session_kind"],
+        },
+    )
+    live_result = dict(live.get("live_result") or {})
+    status = str(live.get("status") or live_result.get("status") or "")
+    request_payload = {
+        "toolkit_slug": toolkit_slug,
+        "tool_slug": tool_slug,
+        "session_kind": session_kind,
+        "arguments": dict(body.arguments),
+        "argument_keys": argument_keys,
+        "task_id": task_id,
+        "step_id": step_id,
+        "risk_level": policy["risk_level"],
+    }
+    response_payload = {
+        "status": status,
+        "live_result": live_result,
+        "policy_report": live.get("policy_report", {}),
+    }
+    if live.get("policy_report", {}).get("status") == "requires_confirmation":
+        persist_composio_tool_invocation(
+            task_trace_id=task_id,
+            toolkit_slug=toolkit_slug,
+            tool_slug=tool_slug,
+            session_kind=session_kind,
+            status="requires_confirmation",
+            request_payload=request_payload,
+            response_payload=response_payload,
+            error=str(live.get("policy_report", {}).get("reason") or ""),
+        )
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "composio_tool_execution_requires_confirmation",
+                "message": live.get("policy_report", {}).get("reason") or "Composio tool execution requires explicit confirmation.",
+                "policy_report": live.get("policy_report", {}),
+            },
+        )
+    if status == "blocked_by_policy" or live_result.get("status") == "blocked_by_policy":
+        persist_composio_tool_invocation(
+            task_trace_id=task_id,
+            toolkit_slug=toolkit_slug,
+            tool_slug=tool_slug,
+            session_kind=session_kind,
+            status="blocked_by_policy",
+            request_payload=request_payload,
+            response_payload=response_payload,
+            error=str(live_result.get("reason") or live.get("policy_report", {}).get("reason") or ""),
+        )
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "composio_tool_execution_blocked_by_policy",
+                "message": live_result.get("reason") or live.get("policy_report", {}).get("reason") or "Composio tool execution was blocked by policy.",
+                "policy_report": live.get("policy_report", {}),
+            },
+        )
+    if live_result.get("status") == "failed":
+        persist_composio_tool_invocation(
+            task_trace_id=task_id,
+            toolkit_slug=toolkit_slug,
+            tool_slug=tool_slug,
+            session_kind=session_kind,
+            status="failed",
+            request_payload=request_payload,
+            response_payload=response_payload,
+            error=str(live_result.get("summary") or live_result.get("error") or ""),
+        )
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "code": "composio_tool_execution_failed",
+                "message": live_result.get("summary") or "Composio tool execution failed.",
+            },
+        )
+    persist_composio_tool_invocation(
+        task_trace_id=task_id,
+        toolkit_slug=toolkit_slug,
+        tool_slug=tool_slug,
+        session_kind=session_kind,
+        status=status or "completed",
+        request_payload=request_payload,
+        response_payload=response_payload,
+    )
+    return {
+        "status": status or "completed",
+        "toolkit_slug": toolkit_slug,
+        "tool_slug": tool_slug,
+        "session_kind": session_kind,
+        "live_result": live_result,
+        "policy_report": live.get("policy_report", {}),
+        "trace": {
+            "action_request": live.get("action_request", {}),
+            "executor_trace": live.get("executor_trace", {}),
+        },
+    }
+
+
+def attach_pipeline_provider_execution(result: dict[str, Any], context: dict[str, Any]) -> dict[str, Any]:
+    context = context or {}
+    if result.get("missing_slots"):
+        return result
+    plan = result.get("provider_call_plan") if isinstance(result.get("provider_call_plan"), dict) else {}
+    if not plan and isinstance(context.get("provider_call_plan"), dict):
+        plan = dict(context["provider_call_plan"])
+    if not plan:
+        return result
+    mode = str(plan.get("mode") or plan.get("status") or "").strip().lower()
+    if mode not in {"execute_read_only", "execute_draft"}:
+        return result
+    provider = str(plan.get("provider") or plan.get("adapter") or "").strip().lower()
+    if provider != "composio":
+        return result
+    toolkit_slug = str(plan.get("toolkit_slug") or "").strip()
+    tool_slug = str(plan.get("tool_slug") or "").strip()
+    if not toolkit_slug or not tool_slug:
+        result["provider_execution"] = {
+            "status": "skipped",
+            "reason": "Explicit Composio provider execution requires toolkit_slug and tool_slug.",
+        }
+        return result
+    session_kind = str(plan.get("session_kind") or ("readonly" if mode == "execute_read_only" else "write")).strip()
+    arguments = plan.get("arguments")
+    if not isinstance(arguments, dict):
+        arguments = plan.get("params") if isinstance(plan.get("params"), dict) else {}
+    try:
+        execution = execute_composio_tool_call(
+            ComposioToolExecuteIn(
+                toolkit_slug=toolkit_slug,
+                tool_slug=tool_slug,
+                arguments=dict(arguments),
+                session_kind=session_kind,
+                task_id=str(result.get("task_trace_id") or context.get("task_id") or ""),
+                step_id=f"{result.get('pipeline_id') or 'pipeline'}:provider_call",
+            )
+        )
+        result["provider_execution"] = execution
+        result.setdefault("provider_calls", []).append(
+            {
+                "provider": "composio",
+                "toolkit_slug": toolkit_slug,
+                "tool_slug": tool_slug,
+                "status": execution.get("status"),
+                "mode": mode,
+            }
+        )
+        return result
+    except HTTPException as exc:
+        detail = exc.detail if isinstance(exc.detail, dict) else {"message": str(exc.detail)}
+        result["provider_execution"] = {
+            "status": detail.get("code") or "failed",
+            "http_status": exc.status_code,
+            "detail": detail,
+            "toolkit_slug": toolkit_slug,
+            "tool_slug": tool_slug,
+        }
+        return result
 
 
 def composio_status_payload() -> dict[str, Any]:
@@ -4134,6 +5370,18 @@ def ensure_event_private_storage_schema() -> None:
         conn.execute("ALTER TABLE events ADD COLUMN IF NOT EXISTS raw_data_private JSONB")
 
 
+def ensure_private_event_gateway_schema() -> None:
+    with db() as conn:
+        for sql in private_event_gateway_schema_sql():
+            conn.execute(sql)
+
+
+def ensure_assistant_identity_schema() -> None:
+    with db() as conn:
+        for sql in assistant_identity_schema_sql():
+            conn.execute(sql)
+
+
 def ensure_memory_governance_schema() -> None:
     with db() as conn:
         conn.execute(
@@ -4153,6 +5401,82 @@ def ensure_memory_governance_schema() -> None:
             """
             CREATE INDEX IF NOT EXISTS memory_audit_log_target_idx
             ON memory_audit_log(target_type, target_id, created_at DESC)
+            """
+        )
+
+
+def ensure_model_gateway_schema() -> None:
+    with db() as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS model_providers (
+              provider_id TEXT PRIMARY KEY,
+              display_name TEXT NOT NULL DEFAULT '',
+              base_url TEXT NOT NULL DEFAULT '',
+              model TEXT NOT NULL DEFAULT '',
+              priority INTEGER NOT NULL DEFAULT 100,
+              enabled BOOLEAN NOT NULL DEFAULT TRUE,
+              supports_streaming BOOLEAN NOT NULL DEFAULT TRUE,
+              supports_tool_calling BOOLEAN NOT NULL DEFAULT FALSE,
+              context_window_tokens INTEGER NOT NULL DEFAULT 0,
+              privacy_tier TEXT NOT NULL DEFAULT '',
+              task_classes TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[],
+              metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+              updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS model_health_checks (
+              id UUID PRIMARY KEY,
+              provider_id TEXT NOT NULL DEFAULT '',
+              status TEXT NOT NULL DEFAULT '',
+              state TEXT NOT NULL DEFAULT '',
+              error_type TEXT NOT NULL DEFAULT '',
+              error TEXT NOT NULL DEFAULT '',
+              latency_ms INTEGER,
+              payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+              created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS model_request_traces (
+              id UUID PRIMARY KEY,
+              task_class TEXT NOT NULL DEFAULT '',
+              selected_provider_id TEXT NOT NULL DEFAULT '',
+              fallback_provider_ids TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[],
+              status TEXT NOT NULL DEFAULT '',
+              error_type TEXT NOT NULL DEFAULT '',
+              user_visible_message TEXT NOT NULL DEFAULT '',
+              context_snapshot_id TEXT,
+              input_token_estimate INTEGER,
+              output_token_estimate INTEGER,
+              stream_first_token_ms INTEGER,
+              latency_ms INTEGER,
+              payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+              created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS model_health_checks_provider_idx
+            ON model_health_checks(provider_id, created_at DESC)
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS model_request_traces_provider_idx
+            ON model_request_traces(selected_provider_id, created_at DESC)
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS model_request_traces_status_idx
+            ON model_request_traces(status, created_at DESC)
             """
         )
 
@@ -4220,6 +5544,12 @@ def ensure_assistant_context_schema() -> None:
             ON context_snapshots(event_id, created_at DESC)
             """
         )
+
+
+def ensure_curated_assistant_memory_schema() -> None:
+    with db() as conn:
+        for sql in assistant_memory_schema_sql():
+            conn.execute(sql)
 
 
 def ensure_proactive_feedback_schema() -> None:
@@ -4358,6 +5688,30 @@ def ensure_task_routing_schema() -> None:
         )
         backfill_explicit_trace_references(conn)
     ensure_pipeline_local_state_schema()
+
+
+def ensure_task_orchestrator_schema() -> None:
+    with db() as conn:
+        for sql in task_orchestrator_schema_sql():
+            conn.execute(sql)
+
+
+def ensure_long_tail_agent_schema() -> None:
+    with db() as conn:
+        for sql in long_tail_agent_schema_sql():
+            conn.execute(sql)
+
+
+def ensure_tool_registry_schema() -> None:
+    with db() as conn:
+        for sql in tool_registry_schema_sql():
+            conn.execute(sql)
+
+
+def ensure_workflow_distillation_schema() -> None:
+    with db() as conn:
+        for sql in workflow_distillation_schema_sql():
+            conn.execute(sql)
 
 
 def backfill_explicit_trace_references(conn: psycopg.Connection) -> None:
@@ -4831,6 +6185,82 @@ def default_collector_settings() -> list[str]:
     return ["bookmark", "calendar", "focus", "gmail", "search", "telegram", "whatsapp"]
 
 
+def collector_capability_profile(source: str) -> dict[str, Any]:
+    profiles: dict[str, dict[str, Any]] = {
+        "gmail": {
+            "mode": "api_or_browser",
+            "adapters": ["composio:gmail", "managed_browser_visible_dom"],
+            "supported_operations": [
+                "full_mailbox_sync_when_connected",
+                "visible_inbox_snapshot",
+                "message_subject_sender_snippet_body_when_available",
+            ],
+            "full_history_guarantee": True,
+            "limitations": [
+                "Full mailbox sync requires a connected Composio Gmail account.",
+                "Browser fallback only captures visible Gmail pages.",
+            ],
+        },
+        "calendar": {
+            "mode": "api_or_browser",
+            "adapters": ["composio:googlecalendar", "managed_browser_visible_dom"],
+            "supported_operations": ["event_read_when_connected", "visible_calendar_snapshot"],
+            "full_history_guarantee": True,
+            "limitations": ["Calendar API reads require Google Calendar authorization."],
+        },
+        "whatsapp": {
+            "mode": "managed_browser_visible_dom",
+            "adapters": ["server_chromium_dom"],
+            "supported_operations": ["visible_chat_list", "opened_conversation_visible_messages", "manual_reply_draft"],
+            "full_history_guarantee": False,
+            "limitations": [
+                "No official full-history WhatsApp API is used in this version.",
+                "Only logged-in, visible, or explicitly opened WhatsApp Web content can be collected.",
+            ],
+        },
+        "telegram": {
+            "mode": "managed_browser_visible_dom",
+            "adapters": ["server_chromium_dom"],
+            "supported_operations": ["visible_chat_list", "opened_conversation_visible_messages"],
+            "full_history_guarantee": False,
+            "limitations": [
+                "No Telegram account API sync is used in this version.",
+                "Only logged-in, visible, or explicitly opened Telegram Web content can be collected.",
+            ],
+        },
+        "search": {
+            "mode": "managed_browser_visible_dom",
+            "adapters": ["server_chromium_dom"],
+            "supported_operations": ["visible_search_page", "query_and_result_snapshot"],
+            "full_history_guarantee": False,
+            "limitations": ["Does not claim browser-wide Google account search history export."],
+        },
+        "bookmark": {
+            "mode": "local_browser_profile",
+            "adapters": ["server_chromium_profile"],
+            "supported_operations": ["bookmark_snapshot"],
+            "full_history_guarantee": False,
+            "limitations": ["Only the managed server browser profile is in scope."],
+        },
+        "focus": {
+            "mode": "local_browser_signal",
+            "adapters": ["server_chromium_focus"],
+            "supported_operations": ["active_url", "title", "visible_text_hint"],
+            "full_history_guarantee": False,
+            "limitations": ["Focus signals are contextual hints, not complete page archives."],
+        },
+    }
+    fallback = {
+        "mode": "unknown",
+        "adapters": [],
+        "supported_operations": [],
+        "full_history_guarantee": False,
+        "limitations": ["No explicit collector capability profile has been declared for this source."],
+    }
+    profile = profiles.get((source or "").strip().lower(), fallback)
+    return json.loads(json.dumps(profile, ensure_ascii=False))
+
+
 def row_to_collector_setting(row: Any) -> dict[str, Any]:
     paused_until = row[2]
     now = datetime.now(timezone.utc)
@@ -4871,6 +6301,7 @@ def merge_collector_status(settings: list[dict[str, Any]], health_rows: list[dic
                 "last_injection_at": health.get("last_injection_at"),
                 "error_count": health.get("error_count", 0),
                 "details": health.get("details", {}),
+                "capability": collector_capability_profile(setting["source"]),
                 "health_updated_at": health.get("health_updated_at"),
             }
         )
@@ -4937,6 +6368,12 @@ def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
+@app.get("/api/model/status")
+def model_status(x_par_password: Optional[str] = Header(default=None)) -> dict[str, Any]:
+    require_password(x_par_password)
+    return model_gateway().status()
+
+
 @app.get("/api/memory/status")
 def memory_status(x_par_password: Optional[str] = Header(default=None)) -> dict[str, Any]:
     require_password(x_par_password)
@@ -4972,6 +6409,363 @@ def tool_catalog(x_par_password: Optional[str] = Header(default=None)) -> dict[s
     }
 
 
+@app.get("/api/assistant-identities")
+def assistant_identities(x_par_password: Optional[str] = Header(default=None)) -> dict[str, Any]:
+    require_password(x_par_password)
+    identities = _ASSISTANT_IDENTITY_REGISTRY.bootstrap_defaults()
+    return {
+        "count": len(identities),
+        "identities": [identity.to_dict() for identity in identities],
+    }
+
+
+@app.post("/api/assistant-identities/{kind}/connect")
+def assistant_identity_connect(
+    kind: str,
+    x_par_password: Optional[str] = Header(default=None),
+) -> dict[str, Any]:
+    require_password(x_par_password)
+    try:
+        identity = _ASSISTANT_IDENTITY_REGISTRY.connect_kind(kind)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="assistant identity kind not found") from exc
+    return {"status": "connected", "identity": identity.to_dict()}
+
+
+@app.patch("/api/assistant-identities/{identity_id}")
+def assistant_identity_patch(
+    identity_id: str,
+    body: AssistantIdentityPatchIn,
+    x_par_password: Optional[str] = Header(default=None),
+) -> dict[str, Any]:
+    require_password(x_par_password)
+    try:
+        identity = _ASSISTANT_IDENTITY_REGISTRY.update(
+            identity_id,
+            display_name=body.display_name,
+            status=body.status,
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="assistant identity not found") from exc
+    return {"status": "updated", "identity": identity.to_dict()}
+
+
+@app.get("/api/assistant-identities/{identity_id}/health")
+def assistant_identity_health(
+    identity_id: str,
+    x_par_password: Optional[str] = Header(default=None),
+) -> dict[str, Any]:
+    require_password(x_par_password)
+    identity = _ASSISTANT_IDENTITY_REGISTRY.get(identity_id)
+    if identity is None:
+        raise HTTPException(status_code=404, detail="assistant identity not found")
+    healthy_statuses = {"connected", "configured", "healthy"}
+    return {
+        "identity_id": identity.identity_id,
+        "kind": identity.kind,
+        "status": identity.status,
+        "healthy": identity.status in healthy_statuses,
+        "capabilities": identity.capabilities,
+    }
+
+
+@app.post("/api/assistant-inbox/gmail/sync")
+def assistant_gmail_sync(
+    body: AssistantGmailSyncIn,
+    x_par_password: Optional[str] = Header(default=None),
+) -> dict[str, Any]:
+    require_password(x_par_password)
+    gateway = AssistantInboxGateway(
+        ContactResolver(user_keys=set(body.user_keys), known_contacts=body.known_contacts)
+    )
+    event = gateway.normalize_gmail(identity_id=body.identity_id, message=body.message)
+    _ASSISTANT_INBOX_EVENTS.append(event)
+    return {"status": "accepted", "event": event}
+
+
+@app.post("/api/assistant-inbox/gmail/pubsub")
+def assistant_gmail_pubsub(
+    body: AssistantGmailPubSubIn,
+    x_par_password: Optional[str] = Header(default=None),
+) -> dict[str, Any]:
+    require_password(x_par_password)
+    message = body.message
+    decoded_payload: dict[str, Any] = {}
+    encoded = str(message.get("data") or "")
+    if encoded:
+        try:
+            padding = "=" * (-len(encoded) % 4)
+            decoded_payload = json.loads(base64.b64decode(encoded + padding).decode("utf-8"))
+        except (ValueError, json.JSONDecodeError):
+            decoded_payload = {"decode_error": True}
+    event = {
+        "event_id": "gmail-pubsub-" + str(message.get("messageId") or uuid.uuid4()),
+        "provider": "gmail_pubsub",
+        "source_type": "assistant_gmail",
+        "source_account_id": "nomi_gmail_primary",
+        "event_type": "assistant_gmail_pubsub_notification",
+        "external_message_id": str(message.get("messageId") or ""),
+        "normalized_payload": decoded_payload,
+        "classification": "provider_status",
+        "suggestion_channel": "assistant_channel_provider_status",
+        "occurred_at": datetime.now(timezone.utc).isoformat(),
+    }
+    _ASSISTANT_INBOX_EVENTS.append(event)
+    return {"status": "accepted", "provider": "gmail_pubsub", "event": event}
+
+
+@app.get("/api/assistant-inbox")
+def assistant_inbox(
+    x_par_password: Optional[str] = Header(default=None),
+    limit: int = Query(default=50, ge=1, le=200),
+) -> dict[str, Any]:
+    require_password(x_par_password)
+    items = list(reversed(_ASSISTANT_INBOX_EVENTS))[:limit]
+    return {"count": len(items), "items": items}
+
+
+@app.get("/api/assistant-inbox/{event_id}")
+def assistant_inbox_detail(
+    event_id: str,
+    x_par_password: Optional[str] = Header(default=None),
+) -> dict[str, Any]:
+    require_password(x_par_password)
+    for event in _ASSISTANT_INBOX_EVENTS:
+        if str(event.get("event_id")) == event_id:
+            return {"event": event}
+    raise HTTPException(status_code=404, detail="assistant inbox event not found")
+
+
+@app.post("/api/assistant-inbox/whatsapp/webhook")
+def assistant_whatsapp_webhook(
+    body: AssistantWhatsAppWebhookIn,
+    x_assistant_webhook_token: Optional[str] = Header(default=None, alias="x-assistant-webhook-token"),
+) -> dict[str, Any]:
+    expected_token = os.getenv("ASSISTANT_WHATSAPP_VERIFY_TOKEN", "").strip()
+    if expected_token and x_assistant_webhook_token != expected_token:
+        raise HTTPException(status_code=403, detail="invalid assistant WhatsApp webhook token")
+    gateway = AssistantInboxGateway(ContactResolver(known_contacts=body.known_contacts))
+    events: list[dict[str, Any]] = []
+    for entry in body.entry:
+        for change in entry.get("changes") or []:
+            value = change.get("value") or {}
+            for message in value.get("messages") or []:
+                text_value = message.get("text")
+                if isinstance(text_value, dict):
+                    text = str(text_value.get("body") or "")
+                else:
+                    text = str(text_value or message.get("body") or "")
+                event = gateway.normalize_whatsapp(
+                    identity_id="nomi_whatsapp_primary",
+                    payload={
+                        "wamid": message.get("id") or message.get("wamid"),
+                        "from": message.get("from") or "",
+                        "text": text,
+                        "timestamp": message.get("timestamp") or datetime.now(timezone.utc).isoformat(),
+                        "type": message.get("type") or "text",
+                    },
+                )
+                events.append(event)
+                _ASSISTANT_INBOX_EVENTS.append(event)
+    return {"status": "accepted", "events": events}
+
+
+def _verify_assistant_phone_webhook_token(token: Optional[str]) -> None:
+    verifier = PhoneWebhookVerifier(os.getenv("ASSISTANT_PHONE_WEBHOOK_TOKEN", "").strip())
+    try:
+        verifier.verify(token or "")
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail="invalid assistant phone webhook token")
+
+
+@app.post("/api/assistant-inbox/phone/sms/webhook")
+def assistant_phone_sms_webhook(
+    body: AssistantPhoneSmsWebhookIn,
+    x_assistant_webhook_token: Optional[str] = Header(default=None, alias="x-assistant-webhook-token"),
+) -> dict[str, Any]:
+    _verify_assistant_phone_webhook_token(x_assistant_webhook_token)
+    gateway = AssistantInboxGateway(
+        ContactResolver(user_keys=set(body.user_keys), known_contacts=body.known_contacts)
+    )
+    event = gateway.normalize_sms(
+        identity_id=body.identity_id,
+        payload={
+            "provider_message_id": body.provider_message_id,
+            "from": body.from_number,
+            "to": body.to_number,
+            "body": body.body,
+            "timestamp": body.timestamp or datetime.now(timezone.utc).isoformat(),
+        },
+    )
+    _ASSISTANT_INBOX_EVENTS.append(event)
+    return {"status": "accepted", "event": event}
+
+
+@app.post("/api/assistant-inbox/phone/calls/inbound")
+def assistant_phone_call_inbound_webhook(
+    body: AssistantPhoneCallWebhookIn,
+    x_assistant_webhook_token: Optional[str] = Header(default=None, alias="x-assistant-webhook-token"),
+) -> dict[str, Any]:
+    _verify_assistant_phone_webhook_token(x_assistant_webhook_token)
+    gateway = AssistantInboxGateway(
+        ContactResolver(user_keys=set(body.user_keys), known_contacts=body.known_contacts)
+    )
+    event = gateway.normalize_phone_call(
+        identity_id=body.identity_id,
+        payload={
+            "provider_call_id": body.provider_call_id,
+            "from": body.from_number,
+            "to": body.to_number,
+            "direction": body.direction or "inbound",
+            "status": body.status or "received",
+            "timestamp": body.timestamp or datetime.now(timezone.utc).isoformat(),
+        },
+    )
+    _ASSISTANT_INBOX_EVENTS.append(event)
+    greeting = PhoneCallInstructionBuilder().build_tts_instruction(
+        script_text="我是 Nomi，张子长的个人助理。请发送短信或邮件说明你的事情，我会转达。",
+        voice="default",
+    )
+    return {"status": "accepted", "event": event, "greeting": greeting}
+
+
+@app.post("/api/assistant-inbox/phone/calls/status")
+def assistant_phone_call_status_webhook(
+    body: AssistantPhoneCallWebhookIn,
+    x_assistant_webhook_token: Optional[str] = Header(default=None, alias="x-assistant-webhook-token"),
+) -> dict[str, Any]:
+    _verify_assistant_phone_webhook_token(x_assistant_webhook_token)
+    event = AssistantInboxGateway(ContactResolver()).normalize_phone_call(
+        identity_id=body.identity_id,
+        payload={
+            "provider_call_id": body.provider_call_id,
+            "from": body.from_number,
+            "to": body.to_number,
+            "direction": body.direction or "outbound",
+            "status": body.status or "unknown",
+            "timestamp": body.timestamp or datetime.now(timezone.utc).isoformat(),
+        },
+    )
+    _ASSISTANT_INBOX_EVENTS.append(event)
+    return {"status": "accepted", "event": event}
+
+
+@app.get("/api/assistant-inbox/phone/calls/{call_instruction_id}/instruction")
+def assistant_phone_call_instruction(
+    call_instruction_id: str,
+    x_par_password: Optional[str] = Header(default=None),
+) -> dict[str, Any]:
+    require_password(x_par_password)
+    script_text = "我是 Nomi，张子长的个人助理。请发送短信或邮件说明你的事情，我会转达。"
+    instruction = PhoneCallInstructionBuilder().build_tts_instruction(script_text=script_text, voice="default")
+    instruction["call_instruction_id"] = call_instruction_id
+    return instruction
+
+
+@app.post("/api/assistant-outbound/drafts")
+def assistant_outbound_create_draft(
+    body: AssistantOutboundDraftIn,
+    x_par_password: Optional[str] = Header(default=None),
+) -> dict[str, Any]:
+    require_password(x_par_password)
+    return _ASSISTANT_OUTBOUND_PIPELINE.prepare_draft(
+        identity_id=body.identity_id,
+        channel=body.channel,
+        recipient=body.recipient,
+        subject=body.subject,
+        body_text=body.body_text,
+        source_evidence_ids=body.source_evidence_ids,
+        risk_notes=body.risk_notes,
+    )
+
+
+@app.patch("/api/assistant-outbound/drafts/{draft_id}")
+def assistant_outbound_patch_draft(
+    draft_id: str,
+    body: AssistantOutboundDraftPatchIn,
+    x_par_password: Optional[str] = Header(default=None),
+) -> dict[str, Any]:
+    require_password(x_par_password)
+    try:
+        draft = _ASSISTANT_OUTBOUND_PIPELINE.get_draft(draft_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="draft not found") from exc
+    if body.subject is not None:
+        draft["subject"] = body.subject
+        draft["confirmation_card"]["subject"] = body.subject
+    if body.body_text is not None:
+        draft["body_text"] = body.body_text
+        draft["confirmation_card"]["body_preview"] = body.body_text
+    if body.risk_notes is not None:
+        draft["risk_notes"] = body.risk_notes
+        draft["confirmation_card"]["risk_notes"] = body.risk_notes
+    return draft
+
+
+@app.post("/api/assistant-outbound/drafts/{draft_id}/send")
+def assistant_outbound_send_draft(
+    draft_id: str,
+    body: AssistantOutboundSendIn,
+    x_par_password: Optional[str] = Header(default=None),
+) -> dict[str, Any]:
+    require_password(x_par_password)
+    try:
+        result = _ASSISTANT_OUTBOUND_PIPELINE.confirm_and_send(
+            draft_id, confirmation_token=body.confirmation_token
+        )
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="draft not found") from exc
+    _ASSISTANT_OUTBOUND_MESSAGES.append(result)
+    return result
+
+
+@app.post("/api/assistant-outbound/drafts/{draft_id}/call")
+def assistant_outbound_call_draft(
+    draft_id: str,
+    body: AssistantOutboundSendIn,
+    x_par_password: Optional[str] = Header(default=None),
+) -> dict[str, Any]:
+    require_password(x_par_password)
+    try:
+        result = _ASSISTANT_OUTBOUND_PIPELINE.confirm_and_call(
+            draft_id, confirmation_token=body.confirmation_token
+        )
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="draft not found") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    _ASSISTANT_OUTBOUND_MESSAGES.append(result)
+    return result
+
+
+@app.post("/api/assistant-outbound/drafts/{draft_id}/cancel")
+def assistant_outbound_cancel_draft(
+    draft_id: str,
+    x_par_password: Optional[str] = Header(default=None),
+) -> dict[str, Any]:
+    require_password(x_par_password)
+    try:
+        return _ASSISTANT_OUTBOUND_PIPELINE.cancel_draft(draft_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="draft not found") from exc
+
+
+@app.get("/api/assistant-outbound/messages")
+def assistant_outbound_messages(
+    x_par_password: Optional[str] = Header(default=None),
+    limit: int = Query(default=50, ge=1, le=200),
+) -> dict[str, Any]:
+    require_password(x_par_password)
+    items = list(reversed(_ASSISTANT_OUTBOUND_MESSAGES))[:limit]
+    return {"count": len(items), "items": items}
+
+
 @app.post("/api/tools/route")
 def tool_route(body: ToolRouteIn, x_par_password: Optional[str] = Header(default=None)) -> dict[str, Any]:
     require_password(x_par_password)
@@ -4981,7 +6775,294 @@ def tool_route(body: ToolRouteIn, x_par_password: Optional[str] = Header(default
 @app.post("/api/pipelines/run")
 def pipeline_run(body: PipelineRunIn, x_par_password: Optional[str] = Header(default=None)) -> dict[str, Any]:
     require_password(x_par_password)
-    return persist_pipeline_execution_result_safely(run_core_pipeline(body.request, body.context))
+    result = run_core_pipeline(body.request, body.context)
+    result = attach_pipeline_provider_execution(result, body.context)
+    return persist_pipeline_execution_result_safely(result)
+
+
+@app.post("/api/agent-tasks/route")
+def agent_task_route(body: ToolRouteIn, x_par_password: Optional[str] = Header(default=None)) -> dict[str, Any]:
+    require_password(x_par_password)
+    decision = route_tool_request(body.request, body.context)
+    if decision.get("route_type") == "openclaw_tool":
+        capability_id = (
+            (decision.get("task_route_decision") or {}).get("capability_id")
+            or (decision.get("capability") or {}).get("id")
+            or "long_tail.agent"
+        )
+        decision = {
+            **decision,
+            "route_type": "long_tail_agent",
+            "legacy_route_type": "openclaw_tool",
+            "capability_id": capability_id,
+        }
+    return decision
+
+
+@app.post("/api/agent-tasks")
+def agent_task_create(body: AgentTaskCreateIn, x_par_password: Optional[str] = Header(default=None)) -> dict[str, Any]:
+    require_password(x_par_password)
+    return long_tail_runner().create_task(
+        original_goal=body.original_goal,
+        route_decision=body.route_decision,
+        plan=body.plan,
+    )
+
+
+@app.get("/api/agent-tasks/{task_id}")
+def agent_task_state(task_id: str, x_par_password: Optional[str] = Header(default=None)) -> dict[str, Any]:
+    require_password(x_par_password)
+    state = require_long_tail_task(task_id)
+    return {"state": state, "event_count": len(long_tail_event_store().task_events(task_id))}
+
+
+@app.get("/api/agent-tasks/{task_id}/events")
+def agent_task_events(task_id: str, x_par_password: Optional[str] = Header(default=None)) -> dict[str, Any]:
+    require_password(x_par_password)
+    require_long_tail_task(task_id)
+    return {"task_id": task_id, "events": long_tail_event_store().task_events(task_id)}
+
+
+@app.post("/api/agent-tasks/{task_id}/run-next")
+def agent_task_run_next(task_id: str, x_par_password: Optional[str] = Header(default=None)) -> dict[str, Any]:
+    require_password(x_par_password)
+    require_long_tail_task(task_id)
+    return long_tail_runner().run_next(task_id)
+
+
+@app.post("/api/agent-tasks/{task_id}/resume")
+def agent_task_resume(task_id: str, x_par_password: Optional[str] = Header(default=None)) -> dict[str, Any]:
+    require_password(x_par_password)
+    state = require_long_tail_task(task_id)
+    if state.get("current_node") == "awaiting_executor":
+        return {"state": state, "message": "Task is waiting for executor result."}
+    return long_tail_runner().run_next(task_id)
+
+
+@app.post("/api/agent-tasks/{task_id}/complete-step")
+def agent_task_complete_step(
+    task_id: str,
+    body: AgentTaskCompleteStepIn,
+    x_par_password: Optional[str] = Header(default=None),
+) -> dict[str, Any]:
+    require_password(x_par_password)
+    require_long_tail_task(task_id)
+    return long_tail_runner().complete_current_step(task_id, executor_result=body.executor_result)
+
+
+@app.post("/api/agent-tasks/{task_id}/finalize")
+def agent_task_finalize(task_id: str, x_par_password: Optional[str] = Header(default=None)) -> dict[str, Any]:
+    require_password(x_par_password)
+    require_long_tail_task(task_id)
+    return long_tail_runner().evaluate_final(task_id)
+
+
+@app.post("/api/agent-tasks/{task_id}/cancel")
+def agent_task_cancel(
+    task_id: str,
+    body: AgentTaskCancelIn,
+    x_par_password: Optional[str] = Header(default=None),
+) -> dict[str, Any]:
+    require_password(x_par_password)
+    require_long_tail_task(task_id)
+    return {"state": long_tail_runner().cancel_task(task_id, reason=body.reason)}
+
+
+@app.post("/api/agent-tasks/{task_id}/human-input")
+def agent_task_human_input(
+    task_id: str,
+    body: AgentTaskHumanInputIn,
+    x_par_password: Optional[str] = Header(default=None),
+) -> dict[str, Any]:
+    require_password(x_par_password)
+    require_long_tail_task(task_id)
+    return long_tail_runner().record_human_input(
+        task_id,
+        step_id=body.step_id,
+        input_type=body.input_type,
+        response=body.response,
+    )
+
+
+@app.post("/api/agent-tasks/{task_id}/external-effects")
+def agent_task_external_effect_propose(
+    task_id: str,
+    body: AgentTaskExternalEffectIn,
+    x_par_password: Optional[str] = Header(default=None),
+) -> dict[str, Any]:
+    require_password(x_par_password)
+    require_long_tail_task(task_id)
+    return long_tail_effect_controller().propose(
+        task_id=task_id,
+        step_id=body.step_id,
+        action_request_id=body.action_request_id,
+        effect_type=body.effect_type,
+        proposal=body.proposal,
+    )
+
+
+@app.post("/api/agent-tasks/{task_id}/external-effects/{effect_id}/confirm")
+def agent_task_external_effect_confirm(
+    task_id: str,
+    effect_id: str,
+    body: AgentTaskExternalEffectConfirmIn,
+    x_par_password: Optional[str] = Header(default=None),
+) -> dict[str, Any]:
+    require_password(x_par_password)
+    require_long_tail_task(task_id)
+    return long_tail_effect_controller().confirm(
+        effect_id,
+        task_id=task_id,
+        confirmation_payload=body.confirmation,
+    )
+
+
+@app.post("/api/agent-tasks/{task_id}/external-effects/{effect_id}/execute")
+def agent_task_external_effect_execute(
+    task_id: str,
+    effect_id: str,
+    body: AgentTaskExternalEffectExecuteIn,
+    x_par_password: Optional[str] = Header(default=None),
+) -> dict[str, Any]:
+    require_password(x_par_password)
+    require_long_tail_task(task_id)
+    return long_tail_effect_controller().execute(
+        effect_id,
+        task_id=task_id,
+        execution_payload=body.execution_payload,
+    )
+
+
+@app.post("/api/agent-tasks/{task_id}/external-effects/{effect_id}/rollback")
+def agent_task_external_effect_rollback(
+    task_id: str,
+    effect_id: str,
+    x_par_password: Optional[str] = Header(default=None),
+) -> dict[str, Any]:
+    require_password(x_par_password)
+    require_long_tail_task(task_id)
+    return long_tail_effect_controller().describe_internal_rollback(effect_id, task_id=task_id)
+
+
+@app.post("/api/agent-tasks/{task_id}/external-effects/{effect_id}/compensation")
+def agent_task_external_effect_compensation(
+    task_id: str,
+    effect_id: str,
+    body: AgentTaskExternalEffectCompensationIn,
+    x_par_password: Optional[str] = Header(default=None),
+) -> dict[str, Any]:
+    require_password(x_par_password)
+    require_long_tail_task(task_id)
+    return long_tail_effect_controller().propose_compensation(
+        effect_id,
+        task_id=task_id,
+        proposal=body.proposal,
+    )
+
+
+@app.post("/api/agent-tasks/{task_id}/confirm")
+def agent_task_confirm(
+    task_id: str,
+    body: AgentTaskConfirmIn,
+    x_par_password: Optional[str] = Header(default=None),
+) -> dict[str, Any]:
+    require_password(x_par_password)
+    require_long_tail_task(task_id)
+    return long_tail_event_store().append_event(
+        task_id=task_id,
+        event_type="external_effect.confirmed",
+        step_id=body.step_id,
+        payload={"confirmation": body.confirmation},
+        idempotency_key=f"{task_id}:api_confirm:{len(long_tail_event_store().task_events(task_id))}",
+    )
+
+
+@app.post("/api/browser/open")
+def browser_open(body: BrowserOpenIn, x_par_password: Optional[str] = Header(default=None)) -> dict[str, Any]:
+    require_password(x_par_password)
+    target = browser_open_target(body.source)
+    task_id = f"browser_login:{target['source']}"
+    step_id = "open_managed_browser"
+    executor_trace = {
+        "provider": "managed_browser",
+        "executor_trace_id": f"browser_exec_{uuid.uuid4().hex}",
+        "adapter_mode": "command_queue",
+        "source": target["source"],
+    }
+    proposed = ExecutorAdapterRegistry(event_store=long_tail_event_store(), policy_gate=PolicyGate()).propose_action(
+        task_id=task_id,
+        step_id=step_id,
+        adapter="browser",
+        action_type="browser.open_url",
+        target={
+            "kind": "managed_login_url",
+            "source": target["source"],
+            "url": target["url"],
+            "host_fragment": target["host_fragment"],
+        },
+        input_summary={"source": target["source"], "host_fragment": target["host_fragment"]},
+        risk_level="read_only",
+        expected_effect="Open a managed local browser login target without submitting forms.",
+        allowed_actions={"browser.open_url"},
+        executor_trace=executor_trace,
+    )
+    if not proposed["policy_report"].get("may_execute"):
+        raise HTTPException(status_code=403, detail=proposed["policy_report"])
+    command = {
+        "command_id": str(uuid.uuid4()),
+        "action": "open_url",
+        "source": target["source"],
+        "url": target["url"],
+        "host_fragment": target["host_fragment"],
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    redis_client().rpush(BROWSER_COMMAND_QUEUE_KEY, json.dumps(command, ensure_ascii=False))
+    long_tail_event_store().append_event(
+        task_id=task_id,
+        event_type="executor.live_completed",
+        step_id=step_id,
+        payload={
+            "action_request_id": proposed["action_request"]["action_id"],
+            "policy_status": proposed["policy_report"]["status"],
+            "live_result": {
+                "mode": "command_queue",
+                "status": "queued",
+                "command_id": command["command_id"],
+                "external_side_effect": False,
+            },
+            "executor_trace": executor_trace,
+        },
+        idempotency_key=f"{proposed['action_request']['idempotency_key']}:live_completed",
+    )
+    return {
+        "status": "queued",
+        "command_id": command["command_id"],
+        "source": target["source"],
+        "target_url": target["url"],
+        "host_fragment": target["host_fragment"],
+    }
+
+
+@app.get("/api/browser/commands/next")
+def browser_command_next(x_par_password: Optional[str] = Header(default=None)) -> dict[str, Any]:
+    require_password(x_par_password)
+    command = normalize_browser_command_payload(redis_client().lpop(BROWSER_COMMAND_QUEUE_KEY))
+    return {"command": command}
+
+
+@app.get("/api/pipelines/registry")
+def pipeline_registry(x_par_password: Optional[str] = Header(default=None)) -> dict[str, Any]:
+    require_password(x_par_password)
+    pipelines = core_pipeline_registry()
+    return {
+        "count": len(pipelines),
+        "pipelines": pipelines,
+        "routing_policy": {
+            "core_pipeline_first": True,
+            "long_tail_fallback": "openclaw_tool",
+            "external_effects_require_confirmation": True,
+        },
+    }
 
 
 @app.get("/api/pipelines/health")
@@ -5184,10 +7265,20 @@ def composio_integration_status(x_par_password: Optional[str] = Header(default=N
 def composio_connect_toolkit(
     toolkit_slug: str,
     session_kind: str = "",
+    force: bool = False,
     x_par_password: Optional[str] = Header(default=None),
 ) -> dict[str, Any]:
     require_password(x_par_password)
-    return create_composio_connect_link(toolkit_slug, requested_kind=session_kind)
+    return create_composio_connect_link(toolkit_slug, requested_kind=session_kind, force=force)
+
+
+@app.get("/api/integrations/composio/callback", response_class=HTMLResponse)
+def composio_connect_callback(
+    toolkit: str = "",
+    session_kind: str = "",
+    status: str = "success",
+) -> HTMLResponse:
+    return HTMLResponse(composio_android_callback_html(toolkit, session_kind, status))
 
 
 @app.get("/api/integrations/composio/toolkits")
@@ -5197,6 +7288,15 @@ def composio_toolkit_connections(
 ) -> dict[str, Any]:
     require_password(x_par_password)
     return sync_composio_toolkits(session_kind=session_kind)
+
+
+@app.post("/api/integrations/composio/tools/execute")
+def composio_tool_execute(
+    body: ComposioToolExecuteIn,
+    x_par_password: Optional[str] = Header(default=None),
+) -> dict[str, Any]:
+    require_password(x_par_password)
+    return execute_composio_tool_call(body)
 
 
 @app.get("/api/memory/debug")
@@ -5357,6 +7457,93 @@ def insert_private_event(
     return event_id, timestamp, protected_raw_data
 
 
+def composio_execution_result_payload(execution: dict[str, Any]) -> Any:
+    live_result = execution.get("live_result") if isinstance(execution, dict) else {}
+    if isinstance(live_result, dict) and "result" in live_result:
+        return live_result.get("result")
+    return live_result
+
+
+def extract_items_from_composio_result(value: Any) -> list[Any]:
+    if isinstance(value, list):
+        return value
+    if isinstance(value, dict):
+        for key in ["messages", "emails", "items", "data", "results"]:
+            nested = value.get(key)
+            if isinstance(nested, list):
+                return nested
+            if isinstance(nested, dict):
+                extracted = extract_items_from_composio_result(nested)
+                if extracted:
+                    return extracted
+        if "result" in value:
+            return extract_items_from_composio_result(value.get("result"))
+    return []
+
+
+def list_from_message_field(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    if isinstance(value, tuple):
+        return [str(item).strip() for item in value if str(item).strip()]
+    text = str(value).strip()
+    if not text:
+        return []
+    return [item.strip() for item in text.split(",") if item.strip()]
+
+
+def gmail_message_payload_from_composio(item: Any) -> dict[str, Any]:
+    if not isinstance(item, dict):
+        return {
+            "message_id": "",
+            "thread_id": "",
+            "subject": "",
+            "from": "",
+            "to": [],
+            "snippet": str(item),
+            "body": str(item),
+            "source_adapter": "composio:gmail",
+            "raw": item,
+        }
+    message_id = str(item.get("message_id") or item.get("messageId") or item.get("id") or "").strip()
+    thread_id = str(item.get("thread_id") or item.get("threadId") or item.get("thread") or "").strip()
+    snippet = str(item.get("snippet") or item.get("preview") or item.get("summary") or "").strip()
+    body = str(item.get("body") or item.get("text") or item.get("plain_text") or item.get("content") or snippet).strip()
+    return {
+        "message_id": message_id,
+        "thread_id": thread_id,
+        "subject": str(item.get("subject") or "").strip(),
+        "from": str(item.get("from") or item.get("sender") or "").strip(),
+        "to": list_from_message_field(item.get("to") or item.get("recipients")),
+        "cc": list_from_message_field(item.get("cc")),
+        "date": str(item.get("date") or item.get("received_at") or item.get("receivedAt") or "").strip(),
+        "snippet": snippet,
+        "body": body,
+        "source_adapter": "composio:gmail",
+        "raw": item,
+    }
+
+
+def persist_gmail_composio_messages(messages: list[Any]) -> list[dict[str, str]]:
+    persisted: list[dict[str, str]] = []
+    redis_obj = redis_client()
+    with db() as conn:
+        ensure_collector_event_allowed(conn, "gmail")
+        for item in messages:
+            raw_data = gmail_message_payload_from_composio(item)
+            event_id, ts, protected_raw_data = insert_private_event(
+                conn,
+                "gmail",
+                "gmail_message_snapshot",
+                raw_data,
+            )
+            enqueue_raw_event(redis_obj, event_id, ts, "gmail", "gmail_message_snapshot", protected_raw_data)
+            persisted.append({"event_id": str(event_id), "message_id": raw_data.get("message_id", "")})
+    return persisted
+
+
 def persist_assistant_turn(
     conn: psycopg.Connection,
     redis_obj: Any,
@@ -5498,6 +7685,42 @@ def collector_status(x_par_password: Optional[str] = Header(default=None)) -> di
         ).fetchall()
     health = [row_to_collector_health(row) for row in rows]
     return {"collectors": merge_collector_status(settings, health)}
+
+
+@app.post("/api/collectors/gmail/composio/fetch")
+def gmail_composio_fetch(
+    body: GmailComposioFetchIn,
+    x_par_password: Optional[str] = Header(default=None),
+) -> dict[str, Any]:
+    require_password(x_par_password)
+    query = body.query.strip() or "newer_than:1d"
+    execution = execute_composio_tool_call(
+        ComposioToolExecuteIn(
+            session_kind="readonly",
+            toolkit_slug="gmail",
+            tool_slug="GMAIL_FETCH_EMAILS",
+            arguments={"query": query, "max_results": body.limit},
+            task_id="collector:gmail:composio_fetch",
+            step_id="gmail_composio_fetch",
+        )
+    )
+    result_payload = composio_execution_result_payload(execution)
+    messages = extract_items_from_composio_result(result_payload)
+    persisted = persist_gmail_composio_messages(messages)
+    return {
+        "status": execution.get("status") or "completed",
+        "source": "gmail",
+        "adapter": "composio:gmail",
+        "query": query,
+        "fetched_count": len(messages),
+        "persisted_count": len(persisted),
+        "events": persisted,
+        "tool_execution": {
+            "status": execution.get("status"),
+            "toolkit_slug": "gmail",
+            "tool_slug": "GMAIL_FETCH_EMAILS",
+        },
+    }
 
 
 @app.patch("/api/collectors/settings/{source}")
@@ -7051,6 +9274,21 @@ def build_context_pack(
         conversation_id=conversation_id,
         limit=max_dialogue_items,
     )
+    session_search = build_session_search_context(
+        current_message=message,
+        conversation_id=str(conversation_id) if conversation_id else None,
+        turns=assistant_context,
+        active_tasks=task_context,
+        token_budget=section_token_cap(budget, "same_conversation"),
+        token_estimator=estimate_context_tokens,
+    )
+    if session_search["short_reply_resolution"]["resolved"]:
+        selected_by_id = {str(item.get("turn_id") or item.get("event_id")): item for item in selected_dialogue}
+        for item in session_search.get("included_turns", []):
+            key = str(item.get("turn_id") or item.get("event_id"))
+            if key not in selected_by_id:
+                selected_dialogue.append({**item, "layer": "assistant_dialogue", "source": "session_search"})
+                selected_by_id[key] = item
     selected_agenda = relevant_agenda_items(message, agenda_context, limit=6)
     excluded: list[dict[str, Any]] = []
     warnings: list[dict[str, Any]] = []
@@ -7148,6 +9386,7 @@ def build_context_pack(
         "warnings": warnings,
         "retrieval_modes": retrieval_modes_for_pack(sections),
         "scope_filters_applied": request_scope,
+        "session_search": session_search,
         "fallback_modes": {
             "tokenizer": "conservative_char_estimator"
             if str(budget.get("tokenizer_backend")) == "conservative_char_estimator"
@@ -7393,7 +9632,30 @@ async def chat(body: ChatIn, x_par_password: Optional[str] = Header(default=None
     )
     messages = build_chat_messages(body.message, context_pack)
     try:
-        answer = await QwenClient(MODEL_BASE_URL, MODEL_NAME).chat(messages)
+        answer_result = await model_gateway().chat(messages)
+        answer = answer_result.text
+        context_pack["model_provider_id"] = answer_result.provider_id
+        context_pack["model_trace"] = answer_result.trace
+    except ModelGatewayError as exc:
+        try:
+            with db() as conn:
+                safe_persist_model_request_trace(
+                    conn,
+                    task_class="chat",
+                    selected_provider_id="",
+                    status="failed",
+                    error_type="model_unavailable",
+                    user_visible_message=exc.to_payload()["message"],
+                    context_snapshot_id=context_pack.get("context_pack_id"),
+                    input_token_estimate=(context_pack.get("token_budget") or {}).get("input_used"),
+                    payload=exc.to_payload(),
+                )
+        except psycopg.Error:
+            pass
+        raise HTTPException(
+            status_code=503,
+            detail=exc.to_payload(),
+        ) from exc
     except httpx.TimeoutException as exc:
         raise HTTPException(
             status_code=503,
@@ -7410,6 +9672,17 @@ async def chat(body: ChatIn, x_par_password: Optional[str] = Header(default=None
             content=answer,
             conversation_id=user_turn["conversation_id"],
             client_type=body.client_type,
+        )
+        safe_persist_model_request_trace(
+            conn,
+            task_class="chat",
+            selected_provider_id=answer_result.provider_id,
+            status="succeeded",
+            fallback_provider_ids=model_trace_fallbacks(answer_result.trace),
+            context_snapshot_id=context_pack.get("context_pack_id"),
+            input_token_estimate=(context_pack.get("token_budget") or {}).get("input_used"),
+            output_token_estimate=estimate_context_tokens(answer),
+            payload={"trace": answer_result.trace, "conversation_id": user_turn["conversation_id"]},
         )
     context_pack["final_model_answer_event_id"] = assistant_turn["event_id"]
     context_pack["final_model_answer_turn_id"] = assistant_turn["turn_id"]
@@ -7450,6 +9723,56 @@ async def chat(body: ChatIn, x_par_password: Optional[str] = Header(default=None
 @app.post("/api/chat/messages")
 async def chat_messages(body: ChatIn, x_par_password: Optional[str] = Header(default=None)) -> dict[str, Any]:
     return await chat(body, x_par_password=x_par_password)
+
+
+@app.get("/api/chat/history")
+def chat_history(
+    x_par_password: Optional[str] = Header(default=None),
+    conversation_id: Optional[str] = None,
+    limit: int = Query(default=80, ge=1, le=200),
+) -> dict[str, Any]:
+    require_password(x_par_password)
+    conversation_uuid: Optional[uuid.UUID] = None
+    if conversation_id:
+        try:
+            conversation_uuid = uuid.UUID(str(conversation_id))
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="invalid conversation_id") from exc
+    with db() as conn:
+        if conversation_uuid is None:
+            latest_row = conn.execute(
+                """
+                SELECT conversation_id FROM assistant_turns
+                WHERE role IN ('user', 'assistant')
+                ORDER BY created_at DESC
+                LIMIT %s
+                """,
+                (1,),
+            ).fetchone()
+            if not latest_row:
+                return {"conversation_id": None, "messages": []}
+            conversation_uuid = latest_row[0]
+        rows = conn.execute(
+            """
+            SELECT id, conversation_id, role, content, event_id, suggestion_id, tool_call_id,
+                   created_at, finalized_at
+            FROM (
+                SELECT id, conversation_id, role, content, event_id, suggestion_id, tool_call_id,
+                       created_at, finalized_at
+                FROM assistant_turns
+                WHERE conversation_id = %s
+                  AND role IN ('user', 'assistant')
+                ORDER BY created_at DESC
+                LIMIT %s
+            ) recent_turns
+            ORDER BY created_at ASC
+            """,
+            (conversation_uuid, limit),
+        ).fetchall()
+    return {
+        "conversation_id": str(conversation_uuid),
+        "messages": [row_to_assistant_turn(row) for row in rows],
+    }
 
 
 def build_chat_messages(message: str, context: list[dict[str, Any]] | dict[str, Any]) -> list[dict[str, str]]:
@@ -7499,6 +9822,11 @@ async def websocket_realtime(websocket: WebSocket, password: Optional[str] = Non
         return
     finally:
         redis_task.cancel()
+
+
+@app.websocket("/ws/voice")
+async def websocket_voice(websocket: WebSocket, password: Optional[str] = None):
+    await handle_voice_websocket(websocket, password)
 
 
 async def redis_realtime_listener(websocket: WebSocket) -> None:
@@ -7564,12 +9892,46 @@ async def stream_chat_to_websocket(
     )
     messages = build_chat_messages(message, context_pack)
     answer_parts: list[str] = []
-    async for delta in QwenClient(MODEL_BASE_URL, MODEL_NAME).stream_chat(messages):
-        if not delta:
-            continue
-        answer_parts.append(delta)
-        await websocket.send_json({"type": "chat_delta", "delta": delta})
+    try:
+        provider_id = ""
+        model_trace: dict[str, Any] = {}
+        async for chunk in model_gateway().stream_chat(messages):
+            delta = chunk.delta
+            provider_id = chunk.provider_id
+            model_trace = chunk.trace
+            if not delta:
+                continue
+            answer_parts.append(delta)
+            await websocket.send_json({"type": "chat_delta", "delta": delta})
+        if provider_id:
+            context_pack["model_provider_id"] = provider_id
+            context_pack["model_trace"] = model_trace
+    except ModelGatewayError as exc:
+        payload = exc.to_payload()
+        try:
+            with db() as conn:
+                safe_persist_model_request_trace(
+                    conn,
+                    task_class="websocket_chat",
+                    selected_provider_id="",
+                    status="failed",
+                    error_type="model_unavailable",
+                    user_visible_message=payload["message"],
+                    context_snapshot_id=context_pack.get("context_pack_id"),
+                    input_token_estimate=(context_pack.get("token_budget") or {}).get("input_used"),
+                    payload=payload,
+                )
+        except psycopg.Error:
+            pass
+        await websocket.send_json({"type": "error", "message": payload["message"], "detail": payload})
+        return
+    except Exception:
+        await websocket.send_json({"type": "error", "message": "模型服务暂时不可用，请稍后重试。"})
+        return
     answer = "".join(answer_parts)
+    if not answer.strip():
+        await websocket.send_json({"type": "error", "message": "模型没有返回内容，请稍后重试。"})
+        return
     try:
         with db() as conn:
             assistant_turn = persist_assistant_turn(
@@ -7583,6 +9945,17 @@ async def stream_chat_to_websocket(
             context_pack["final_model_answer_event_id"] = assistant_turn["event_id"]
             context_pack["final_model_answer_turn_id"] = assistant_turn["turn_id"]
             persist_context_snapshot(conn, user_turn["event_id"], "websocket_chat_response", context_pack)
+            safe_persist_model_request_trace(
+                conn,
+                task_class="websocket_chat",
+                selected_provider_id=context_pack.get("model_provider_id") or "",
+                status="succeeded",
+                fallback_provider_ids=model_trace_fallbacks(context_pack.get("model_trace") or {}),
+                context_snapshot_id=context_pack.get("context_pack_id"),
+                input_token_estimate=(context_pack.get("token_budget") or {}).get("input_used"),
+                output_token_estimate=estimate_context_tokens(answer),
+                payload={"trace": context_pack.get("model_trace") or {}, "conversation_id": user_turn["conversation_id"]},
+            )
     except psycopg.Error:
         pass
     await websocket.send_json(
@@ -8286,16 +10659,64 @@ def delete_memory(
     x_par_password: Optional[str] = Header(default=None),
 ) -> dict[str, Any]:
     require_password(x_par_password)
-    if not body.memory_id and not body.source:
-        raise HTTPException(status_code=400, detail="memory_id or source is required")
+    if not body.memory_id and not body.source and not body.state_key:
+        raise HTTPException(status_code=400, detail="memory_id, source, or state_key is required")
     deleted = 0
     with db() as conn:
         if body.memory_id:
             cur = conn.execute("DELETE FROM semantic_memory WHERE id = %s", (body.memory_id,))
             deleted += cur.rowcount or 0
+            if cur.rowcount:
+                conn.execute(
+                    """
+                    INSERT INTO memory_audit_log (id, action, target_type, target_id, reason, metadata, created_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, now())
+                    """,
+                    (
+                        uuid.uuid4(),
+                        "delete",
+                        "semantic_memory",
+                        body.memory_id,
+                        "deleted from governance API",
+                        json.dumps({}, ensure_ascii=False),
+                    ),
+                )
         if body.source:
             cur = conn.execute("DELETE FROM events WHERE source = %s", (body.source,))
             deleted += cur.rowcount or 0
+            if cur.rowcount:
+                conn.execute(
+                    """
+                    INSERT INTO memory_audit_log (id, action, target_type, target_id, reason, metadata, created_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, now())
+                    """,
+                    (
+                        uuid.uuid4(),
+                        "delete",
+                        "events",
+                        body.source,
+                        "deleted source events from governance API",
+                        json.dumps({"deleted": cur.rowcount}, ensure_ascii=False),
+                    ),
+                )
+        if body.state_key:
+            cur = conn.execute("DELETE FROM memory_states WHERE key = %s", (body.state_key,))
+            deleted += cur.rowcount or 0
+            if cur.rowcount:
+                conn.execute(
+                    """
+                    INSERT INTO memory_audit_log (id, action, target_type, target_id, reason, metadata, created_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, now())
+                    """,
+                    (
+                        uuid.uuid4(),
+                        "delete",
+                        "memory_state",
+                        body.state_key,
+                        "deleted from governance API",
+                        json.dumps({}, ensure_ascii=False),
+                    ),
+                )
     return {"deleted": deleted}
 
 

@@ -1,0 +1,35 @@
+{
+  "suggestion": {
+    "id": "f53f8bdc-7c45-4a32-829e-195d7f1e4155",
+    "source_event_id": "6ea3984e-888f-41dd-90fa-d1b981c54d70",
+    "title": "可能值得关注",
+    "body": "rg-PHONE_1 上次说的见面改到周日上午AMOUNT_1点，地点还是武康路。",
+    "actions": [
+      "查路线",
+      "帮我打车",
+      "稍后提醒"
+    ]
+  },
+  "websocket": {
+    "pong": {
+      "type": "pong"
+    },
+    "pushed_type": "proactive_message",
+    "pushed_title": "可能值得关注",
+    "pushed_body": "rg-PHONE_1 上次说的见面改到周日上午AMOUNT_1点，地点还是武康路。",
+    "pushed_actions": [
+      "查路线",
+      "帮我打车",
+      "稍后提醒"
+    ],
+    "pushed_open_view": "chat"
+  },
+  "route_action": {
+    "status": 500,
+    "error": "Internal Server Error"
+  },
+  "ride_action": {
+    "status": 500,
+    "error": "Internal Server Error"
+  }
+}

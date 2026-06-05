@@ -42,6 +42,219 @@ def test_schema_bootstrap_creates_assistant_context_tables(monkeypatch):
     assert "context_snapshots_event_idx" in combined
 
 
+def test_schema_bootstrap_creates_model_gateway_tables(monkeypatch):
+    monkeypatch.setenv("APP_PASSWORD", "secret")
+    from app import main
+
+    executed = []
+
+    class Cursor:
+        pass
+
+    class Conn:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return None
+
+        def execute(self, sql, params=()):
+            executed.append(" ".join(sql.split()))
+            return Cursor()
+
+    monkeypatch.setattr(main, "db", lambda: Conn())
+
+    main.ensure_model_gateway_schema()
+
+    combined = "\n".join(executed)
+    assert "CREATE TABLE IF NOT EXISTS model_providers" in combined
+    assert "CREATE TABLE IF NOT EXISTS model_health_checks" in combined
+    assert "CREATE TABLE IF NOT EXISTS model_request_traces" in combined
+    assert "model_request_traces_provider_idx" in combined
+
+
+def test_schema_bootstrap_creates_curated_assistant_memory_tables(monkeypatch):
+    monkeypatch.setenv("APP_PASSWORD", "secret")
+    from app import main
+
+    executed = []
+
+    class Cursor:
+        pass
+
+    class Conn:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return None
+
+        def execute(self, sql, params=()):
+            executed.append(" ".join(sql.split()))
+            return Cursor()
+
+    monkeypatch.setattr(main, "db", lambda: Conn())
+
+    main.ensure_curated_assistant_memory_schema()
+
+    combined = "\n".join(executed)
+    assert "CREATE TABLE IF NOT EXISTS assistant_profile_memories" in combined
+    assert "CREATE TABLE IF NOT EXISTS conversation_summaries" in combined
+    assert "CREATE TABLE IF NOT EXISTS conversation_session_index" in combined
+
+
+def test_schema_bootstrap_creates_private_event_gateway_tables(monkeypatch):
+    monkeypatch.setenv("APP_PASSWORD", "secret")
+    from app import main
+
+    executed = []
+
+    class Cursor:
+        pass
+
+    class Conn:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return None
+
+        def execute(self, sql, params=()):
+            executed.append(" ".join(sql.split()))
+            return Cursor()
+
+    monkeypatch.setattr(main, "db", lambda: Conn())
+
+    main.ensure_private_event_gateway_schema()
+
+    combined = "\n".join(executed)
+    assert "CREATE TABLE IF NOT EXISTS source_events" in combined
+    assert "CREATE TABLE IF NOT EXISTS source_cursors" in combined
+    assert "source_events_dedupe_idx" in combined
+
+
+def test_schema_bootstrap_creates_task_orchestrator_tables(monkeypatch):
+    monkeypatch.setenv("APP_PASSWORD", "secret")
+    from app import main
+
+    executed = []
+
+    class Cursor:
+        pass
+
+    class Conn:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return None
+
+        def execute(self, sql, params=()):
+            executed.append(" ".join(sql.split()))
+            return Cursor()
+
+    monkeypatch.setattr(main, "db", lambda: Conn())
+
+    main.ensure_task_orchestrator_schema()
+
+    combined = "\n".join(executed)
+    assert "CREATE TABLE IF NOT EXISTS task_runs" in combined
+    assert "CREATE TABLE IF NOT EXISTS task_steps" in combined
+    assert "CREATE TABLE IF NOT EXISTS notification_outbox" in combined
+
+
+def test_schema_bootstrap_creates_tool_registry_tables(monkeypatch):
+    monkeypatch.setenv("APP_PASSWORD", "secret")
+    from app import main
+
+    executed = []
+
+    class Cursor:
+        pass
+
+    class Conn:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return None
+
+        def execute(self, sql, params=()):
+            executed.append(" ".join(sql.split()))
+            return Cursor()
+
+    monkeypatch.setattr(main, "db", lambda: Conn())
+
+    main.ensure_tool_registry_schema()
+
+    combined = "\n".join(executed)
+    assert "CREATE TABLE IF NOT EXISTS capability_catalog" in combined
+    assert "CREATE TABLE IF NOT EXISTS tool_registry_entries" in combined
+    assert "CREATE TABLE IF NOT EXISTS tool_invocation_traces" in combined
+
+
+def test_schema_bootstrap_creates_workflow_distillation_tables(monkeypatch):
+    monkeypatch.setenv("APP_PASSWORD", "secret")
+    from app import main
+
+    executed = []
+
+    class Cursor:
+        pass
+
+    class Conn:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return None
+
+        def execute(self, sql, params=()):
+            executed.append(" ".join(sql.split()))
+            return Cursor()
+
+    monkeypatch.setattr(main, "db", lambda: Conn())
+
+    main.ensure_workflow_distillation_schema()
+
+    combined = "\n".join(executed)
+    assert "CREATE TABLE IF NOT EXISTS workflow_patterns" in combined
+    assert "CREATE TABLE IF NOT EXISTS pipeline_candidates" in combined
+    assert "CREATE TABLE IF NOT EXISTS skill_evaluation_runs" in combined
+
+
+def test_persist_model_request_trace_records_provider_and_fallbacks(monkeypatch):
+    monkeypatch.setenv("APP_PASSWORD", "secret")
+    from app import main
+
+    executed = []
+
+    class Cursor:
+        pass
+
+    class Conn:
+        def execute(self, sql, params=()):
+            executed.append((" ".join(sql.split()), params))
+            return Cursor()
+
+    trace_id = main.persist_model_request_trace(
+        Conn(),
+        task_class="chat",
+        selected_provider_id="fallback",
+        status="succeeded",
+        fallback_provider_ids=["primary"],
+        payload={"reason": "primary unreachable"},
+    )
+
+    assert trace_id
+    sql, params = executed[0]
+    assert "INSERT INTO model_request_traces" in sql
+    assert params[1] == "chat"
+    assert params[2] == "fallback"
+    assert params[3] == ["primary"]
+    assert params[4] == "succeeded"
+
+
 def test_build_context_pack_includes_relevant_dialogue_and_excludes_unrelated():
     from app.main import build_context_pack
 
@@ -119,6 +332,39 @@ def test_build_context_pack_uses_token_budget_not_fixed_turn_count():
     assert pack["token_budget"]["input_used"] > 0
     same_conversation = next(section for section in pack["sections"] if section["name"] == "same_conversation")
     assert same_conversation["tokens_used"] > 0
+
+
+def test_build_context_pack_exposes_session_search_for_short_reply():
+    from app.main import build_context_pack
+
+    pack = build_context_pack(
+        "需要",
+        base_context=[],
+        assistant_context=[
+            {
+                "layer": "assistant_dialogue",
+                "turn_id": "assistant-question",
+                "event_id": "assistant-question",
+                "conversation_id": "conv-margin",
+                "role": "assistant",
+                "content": "需要我帮你核对成本与利润率数据吗？",
+            }
+        ],
+        conversation_id="conv-margin",
+        task_context=[
+            {
+                "layer": "task_trace",
+                "task_id": "task-margin",
+                "title": "PHONE_1 利润率核对",
+                "status": "waiting_for_user",
+                "conversation_id": "conv-margin",
+            }
+        ],
+    )
+
+    assert pack["session_search"]["short_reply_resolution"]["resolved"] is True
+    assert pack["session_search"]["short_reply_resolution"]["prior_question_turn_id"] == "assistant-question"
+    assert pack["session_search"]["active_tasks"][0]["task_id"] == "task-margin"
 
 
 def test_build_context_pack_filters_cross_contact_context_before_ranking():
@@ -418,6 +664,7 @@ def test_normalize_client_delta_dedupes_current_message_and_keeps_prior_question
 def test_chat_endpoint_builds_request_scope_uses_wide_candidates_and_persists_answer_trace(monkeypatch):
     monkeypatch.setenv("APP_PASSWORD", "secret")
     from app import main
+    from app.model_gateway import ModelAnswer
 
     retrieve_limits = []
     snapshots = []
@@ -471,13 +718,14 @@ def test_chat_endpoint_builds_request_scope_uses_wide_candidates_and_persists_an
             "reason": "scoped context pack",
         }
 
-    class FakeQwen:
-        def __init__(self, *args, **kwargs):
-            pass
-
-        async def chat(self, messages):
+    class FakeGateway:
+        async def chat(self, messages, temperature=0.4):
             assert "ctx-test" in messages[1]["content"]
-            return "可以，我会基于 Alice 的当前 WhatsApp 上下文处理。"
+            return ModelAnswer(
+                text="可以，我会基于 Alice 的当前 WhatsApp 上下文处理。",
+                provider_id="test-provider",
+                trace={"fallback_from": []},
+            )
 
     class Conn:
         def __enter__(self):
@@ -495,7 +743,7 @@ def test_chat_endpoint_builds_request_scope_uses_wide_candidates_and_persists_an
     monkeypatch.setattr(main, "retrieve_active_task_context", fake_task_context, raising=False)
     monkeypatch.setattr(main, "persist_context_snapshot", fake_snapshot, raising=False)
     monkeypatch.setattr(main, "build_context_pack", fake_context_pack, raising=False)
-    monkeypatch.setattr(main, "QwenClient", FakeQwen)
+    monkeypatch.setattr(main, "model_gateway", lambda: FakeGateway())
 
     response = TestClient(main.app).post(
         "/api/chat",
@@ -524,6 +772,7 @@ def test_chat_endpoint_builds_request_scope_uses_wide_candidates_and_persists_an
 def test_chat_endpoint_returns_503_when_model_times_out(monkeypatch):
     monkeypatch.setenv("APP_PASSWORD", "secret")
     from app import main
+    from app.model_gateway import ModelGatewayError
 
     def fake_persist_turn(conn, redis_client, role, content, conversation_id=None, client_type="web", **kwargs):
         return {
@@ -532,12 +781,12 @@ def test_chat_endpoint_returns_503_when_model_times_out(monkeypatch):
             "event_id": f"event-{role}",
         }
 
-    class FakeQwen:
-        def __init__(self, *args, **kwargs):
-            pass
-
-        async def chat(self, messages):
-            raise main.httpx.ReadTimeout("model timed out")
+    class FailingGateway:
+        async def chat(self, messages, temperature=0.4):
+            raise ModelGatewayError(
+                "primary timeout",
+                [{"provider_id": "primary", "error_type": "timeout", "error": "model timed out"}],
+            )
 
     class Conn:
         def __enter__(self):
@@ -554,7 +803,7 @@ def test_chat_endpoint_returns_503_when_model_times_out(monkeypatch):
     monkeypatch.setattr(main, "retrieve_active_agenda_context", lambda *args, **kwargs: [])
     monkeypatch.setattr(main, "retrieve_active_task_context", lambda *args, **kwargs: [])
     monkeypatch.setattr(main, "persist_context_snapshot", lambda *args, **kwargs: None, raising=False)
-    monkeypatch.setattr(main, "QwenClient", FakeQwen)
+    monkeypatch.setattr(main, "model_gateway", lambda: FailingGateway())
 
     response = TestClient(main.app, raise_server_exceptions=False).post(
         "/api/chat",
@@ -563,7 +812,8 @@ def test_chat_endpoint_returns_503_when_model_times_out(monkeypatch):
     )
 
     assert response.status_code == 503
-    assert "model_timeout" in response.text
+    assert "model_unavailable" in response.text
+    assert "模型服务暂时不可用" in response.text
 
 
 def json_text(value):
@@ -622,6 +872,7 @@ def test_persist_assistant_turn_creates_private_event_turn_and_queue(monkeypatch
 def test_chat_endpoint_persists_turns_uses_context_pack_and_returns_trace(monkeypatch):
     monkeypatch.setenv("APP_PASSWORD", "secret")
     from app import main
+    from app.model_gateway import ModelAnswer
 
     persisted_turns = []
     snapshots = []
@@ -650,14 +901,15 @@ def test_chat_endpoint_persists_turns_uses_context_pack_and_returns_trace(monkey
     def fake_snapshot(conn, event_id, context_type, context_pack):
         snapshots.append((event_id, context_type, context_pack["included_event_ids"]))
 
-    class FakeQwen:
-        def __init__(self, *args, **kwargs):
-            pass
-
-        async def chat(self, messages):
+    class FakeGateway:
+        async def chat(self, messages, temperature=0.4):
             assert "bounded context pack" in messages[1]["content"]
             assert "核对成本与利润率" in messages[1]["content"]
-            return "好的，我会继续按“核对成本与利润率”这个方向处理。"
+            return ModelAnswer(
+                text="好的，我会继续按“核对成本与利润率”这个方向处理。",
+                provider_id="test-provider",
+                trace={"fallback_from": []},
+            )
 
     class Conn:
         def __enter__(self):
@@ -676,7 +928,7 @@ def test_chat_endpoint_persists_turns_uses_context_pack_and_returns_trace(monkey
     monkeypatch.setattr(main, "persist_assistant_turn", fake_persist_turn, raising=False)
     monkeypatch.setattr(main, "build_context_pack", fake_context_pack, raising=False)
     monkeypatch.setattr(main, "persist_context_snapshot", fake_snapshot, raising=False)
-    monkeypatch.setattr(main, "QwenClient", FakeQwen)
+    monkeypatch.setattr(main, "model_gateway", lambda: FakeGateway())
 
     client = TestClient(main.app)
     response = client.post(
@@ -706,6 +958,7 @@ def test_chat_endpoint_persists_turns_uses_context_pack_and_returns_trace(monkey
 def test_chat_messages_alias_uses_same_chat_pipeline(monkeypatch):
     monkeypatch.setenv("APP_PASSWORD", "secret")
     from app import main
+    from app.model_gateway import ModelAnswer
 
     def fake_persist_turn(conn, redis_client, role, content, conversation_id=None, client_type="web", **kwargs):
         return {
@@ -725,13 +978,14 @@ def test_chat_messages_alias_uses_same_chat_pipeline(monkeypatch):
             "reason": "bounded context pack: alias route",
         }
 
-    class FakeQwen:
-        def __init__(self, *args, **kwargs):
-            pass
-
-        async def chat(self, messages):
+    class FakeGateway:
+        async def chat(self, messages, temperature=0.4):
             assert "alias route" in messages[1]["content"]
-            return "别名路由也走同一个对话管线。"
+            return ModelAnswer(
+                text="别名路由也走同一个对话管线。",
+                provider_id="test-provider",
+                trace={"fallback_from": []},
+            )
 
     class Conn:
         def __enter__(self):
@@ -748,7 +1002,7 @@ def test_chat_messages_alias_uses_same_chat_pipeline(monkeypatch):
     monkeypatch.setattr(main, "persist_assistant_turn", fake_persist_turn, raising=False)
     monkeypatch.setattr(main, "build_context_pack", fake_context_pack, raising=False)
     monkeypatch.setattr(main, "persist_context_snapshot", lambda *args, **kwargs: None, raising=False)
-    monkeypatch.setattr(main, "QwenClient", FakeQwen)
+    monkeypatch.setattr(main, "model_gateway", lambda: FakeGateway())
 
     response = TestClient(main.app).post(
         "/api/chat/messages",
@@ -761,3 +1015,82 @@ def test_chat_messages_alias_uses_same_chat_pipeline(monkeypatch):
     assert body["conversation_id"] == "conv-alias"
     assert body["answer"] == "别名路由也走同一个对话管线。"
     assert body["context_pack"]["included_event_ids"] == ["event-user"]
+
+
+def test_chat_history_endpoint_restores_latest_conversation_when_client_has_no_id(monkeypatch):
+    monkeypatch.setenv("APP_PASSWORD", "secret")
+    from datetime import datetime, timezone
+    import uuid
+
+    from app import main
+
+    conversation_id = uuid.UUID("11111111-1111-1111-1111-111111111111")
+    executed = []
+
+    class Cursor:
+        def __init__(self, rows):
+            self.rows = rows
+
+        def fetchone(self):
+            return self.rows[0] if self.rows else None
+
+        def fetchall(self):
+            return self.rows
+
+    class Conn:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return None
+
+        def execute(self, sql, params=()):
+            compact_sql = " ".join(sql.split())
+            executed.append((compact_sql, params))
+            if "SELECT conversation_id FROM assistant_turns" in compact_sql:
+                assert params == (1,)
+                return Cursor([(conversation_id,)])
+            if "FROM assistant_turns" in compact_sql and "WHERE conversation_id = %s" in compact_sql:
+                assert params == (conversation_id, 20)
+                return Cursor(
+                    [
+                        (
+                            uuid.UUID("22222222-2222-2222-2222-222222222222"),
+                            conversation_id,
+                            "user",
+                            "需要",
+                            uuid.UUID("33333333-3333-3333-3333-333333333333"),
+                            None,
+                            None,
+                            datetime(2026, 5, 29, 8, 0, tzinfo=timezone.utc),
+                            None,
+                        ),
+                        (
+                            uuid.UUID("44444444-4444-4444-4444-444444444444"),
+                            conversation_id,
+                            "assistant",
+                            "好的，我会继续核对成本与利润率。",
+                            uuid.UUID("55555555-5555-5555-5555-555555555555"),
+                            None,
+                            None,
+                            datetime(2026, 5, 29, 8, 0, 5, tzinfo=timezone.utc),
+                            datetime(2026, 5, 29, 8, 0, 5, tzinfo=timezone.utc),
+                        ),
+                    ]
+                )
+            raise AssertionError(f"unexpected SQL: {compact_sql}")
+
+    monkeypatch.setattr(main, "db", lambda: Conn())
+
+    response = TestClient(main.app).get(
+        "/api/chat/history?limit=20",
+        headers={"x-par-password": "secret"},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["conversation_id"] == str(conversation_id)
+    assert [message["role"] for message in body["messages"]] == ["user", "assistant"]
+    assert body["messages"][0]["content"] == "需要"
+    assert body["messages"][1]["content"] == "好的，我会继续核对成本与利润率。"
+    assert any("SELECT conversation_id FROM assistant_turns" in sql for sql, _ in executed)

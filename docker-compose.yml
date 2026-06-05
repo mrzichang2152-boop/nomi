@@ -62,6 +62,10 @@ services:
       RAW_DATA_ENCRYPTION_KEY: ${RAW_DATA_ENCRYPTION_KEY:-}
       COMPOSIO_API_KEY: ${COMPOSIO_API_KEY:-}
       COMPOSIO_API_BASE_URL: ${COMPOSIO_API_BASE_URL:-https://backend.composio.dev}
+      COMPOSIO_USER_ID: ${COMPOSIO_USER_ID:-nomi_owner}
+      COMPOSIO_CALLBACK_URL: ${COMPOSIO_CALLBACK_URL:-}
+      COMPOSIO_READONLY_TOOLKITS: ${COMPOSIO_READONLY_TOOLKITS:-gmail,googlecalendar,googledrive,googledocs,googlesheets,googletasks,google_maps,github,slack,notion}
+      COMPOSIO_WRITE_TOOLKITS: ${COMPOSIO_WRITE_TOOLKITS:-gmail,googlecalendar,googledrive,googledocs,googlesheets,googletasks,github,slack,notion,todoist,linear,jira}
       EMBEDDING_PROVIDER: ${EMBEDDING_PROVIDER:-fastembed}
       FASTEMBED_MODEL: ${FASTEMBED_MODEL:-sentence-transformers/all-MiniLM-L6-v2}
       ENABLE_DAILY_MAINTENANCE: ${ENABLE_DAILY_MAINTENANCE:-true}
@@ -93,7 +97,7 @@ services:
       MODEL_ROUTER_URL: http://model-router:8090
       MODEL_BASE_URL: ${MODEL_BASE_URL:-http://localhost:9161}
       MODEL_NAME: ${MODEL_NAME:-qwen3.6}
-      REDIS_START_ID: ${REDIS_START_ID:-$}
+      REDIS_START_ID: ${REDIS_START_ID:-0-0}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       EMBEDDING_PROVIDER: ${EMBEDDING_PROVIDER:-fastembed}
       FASTEMBED_MODEL: ${FASTEMBED_MODEL:-sentence-transformers/all-MiniLM-L6-v2}
@@ -137,10 +141,10 @@ services:
       RUNTIME_API_URL: http://runtime-api:8080
       RUNTIME_API_PASSWORD: ${APP_PASSWORD:-par-dev}
       DISPLAY: :99
-      SCREEN_WIDTH: "1920"
-      SCREEN_HEIGHT: "1080"
-      CHROMIUM_WINDOW_WIDTH: "1920"
-      CHROMIUM_WINDOW_HEIGHT: "1080"
+      SCREEN_WIDTH: "1080"
+      SCREEN_HEIGHT: "1920"
+      CHROMIUM_WINDOW_WIDTH: "1080"
+      CHROMIUM_WINDOW_HEIGHT: "1920"
       CHROMIUM_HEADLESS: "false"
       CHROMIUM_CDP_URL: http://127.0.0.1:9222
       GMAIL_AUTO_OPEN: ${GMAIL_AUTO_OPEN:-true}

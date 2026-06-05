@@ -77,6 +77,18 @@ def test_route_pipeline_execution_returns_read_only_contract(monkeypatch):
     assert result["risk"]["confirmation_required"] is False
 
 
+def test_route_words_do_not_get_stolen_by_ride_pipeline(monkeypatch):
+    monkeypatch.setenv("APP_PASSWORD", "secret")
+    monkeypatch.setenv("PIPELINE_SLOT_MODEL_ENABLED", "0")
+    from app import main
+
+    result = main.run_core_pipeline("查去武康路的路线")
+
+    assert result["pipeline_id"] == "route_pipeline"
+    assert result["status"] == "completed_read_only"
+    assert result["resolved_slots"]["destination"] == "武康路"
+
+
 def test_ride_pipeline_execution_requires_pickup_before_booking(monkeypatch):
     monkeypatch.setenv("APP_PASSWORD", "secret")
     from app import main
@@ -105,6 +117,118 @@ def test_vague_payment_pipeline_execution_asks_for_missing_fields(monkeypatch):
     assert "付款" in result["input"]["user_request"]
 
 
+def test_invoice_request_routes_to_payment_bill_pipeline(monkeypatch):
+    monkeypatch.setenv("APP_PASSWORD", "secret")
+    monkeypatch.setenv("PIPELINE_SLOT_MODEL_ENABLED", "0")
+    from app import main
+
+    result = main.run_core_pipeline(
+        "帮我处理 INV-RG-1001",
+        {"counterparty": "Ridge Logistics"},
+    )
+
+    assert result["route_type"] == "core_pipeline"
+    assert result["pipeline_id"] == "payment_bill_pipeline"
+    assert result["resolved_slots"]["amount_or_bill"] == "INV-RG-1001"
+    assert result["resolved_slots"]["counterparty"] == "Ridge Logistics"
+
+
+def test_invoice_request_uses_source_event_sender_as_counterparty(monkeypatch):
+    monkeypatch.setenv("APP_PASSWORD", "secret")
+    monkeypatch.setenv("PIPELINE_SLOT_MODEL_ENABLED", "0")
+    from app import main
+
+    source_event_id = "11111111-1111-1111-1111-111111111111"
+
+    def handler(sql, params):
+        if "FROM events e" in sql and "LEFT JOIN semantic_events s" in sql:
+            return Cursor(
+                [
+                    (
+                        source_event_id,
+                        "gmail",
+                        "gmail_thread_snapshot",
+                        {
+                            "sender": "RG_CFO",
+                            "from": "EMAIL_1",
+                            "participants": ["RG_CFO"],
+                            "subject": "Invoice INV-RG-AMOUNT_1 due",
+                            "body": "Invoice INV-RG-AMOUNT_1 is due next Tuesday.",
+                        },
+                        "付款",
+                        "Invoice INV-RG-AMOUNT_1 is due next Tuesday.",
+                        {
+                            "primary_label": "payment",
+                            "invoice_id": "INV-RG-AMOUNT_1",
+                            "amount": "AMOUNT_1",
+                        },
+                    )
+                ]
+            )
+        return Cursor([])
+
+    install_fake_db(monkeypatch, main, handler)
+
+    result = main.run_core_pipeline(
+        "帮我处理 INV-RG-1001",
+        {"source_event_ids": [source_event_id]},
+    )
+
+    assert result["route_type"] == "core_pipeline"
+    assert result["pipeline_id"] == "payment_bill_pipeline"
+    assert result["status"] == "confirmation_required"
+    assert result["resolved_slots"]["amount_or_bill"] == "INV-RG-1001"
+    assert result["resolved_slots"]["counterparty"] == "RG_CFO"
+
+
+def test_quotation_document_request_routes_to_document_pipeline(monkeypatch):
+    monkeypatch.setenv("APP_PASSWORD", "secret")
+    monkeypatch.setenv("PIPELINE_SLOT_MODEL_ENABLED", "0")
+    from app import main
+
+    result = main.run_core_pipeline("帮我找一下 PHONE_1 报价单，并总结给我")
+
+    assert result["route_type"] == "core_pipeline"
+    assert result["pipeline_id"] == "document_file_pipeline"
+    assert result["status"] == "completed_read_only"
+    assert result["resolved_slots"]["document_intent"] in {"summary", "summarize"}
+    assert result["resolved_slots"]["file_or_query"] == "PHONE_1 报价单"
+
+
+def test_quotation_document_request_strips_trailing_conjunction_with_punctuation(monkeypatch):
+    monkeypatch.setenv("APP_PASSWORD", "secret")
+    monkeypatch.setenv("PIPELINE_SLOT_MODEL_ENABLED", "0")
+    from app import main
+
+    result = main.run_core_pipeline("帮我找一下 PHONE_1 报价单，并总结给我。")
+
+    assert result["pipeline_id"] == "document_file_pipeline"
+    assert result["resolved_slots"]["file_or_query"] == "PHONE_1 报价单"
+
+
+def test_reply_pipeline_uses_active_scope_as_recipient_without_model(monkeypatch):
+    monkeypatch.setenv("APP_PASSWORD", "secret")
+    monkeypatch.setenv("PIPELINE_SLOT_MODEL_ENABLED", "0")
+    from app import main
+
+    result = main.run_core_pipeline(
+        "帮我回复她，就说周五八点可以",
+        {
+            "active_source_scope": {
+                "source": "whatsapp",
+                "conversation_id": "chat-alice",
+                "conversation_label": "Alice",
+                "counterparty_ids": ["alice"],
+            }
+        },
+    )
+
+    assert result["pipeline_id"] == "reply_pipeline"
+    assert result["status"] == "draft_ready"
+    assert result["resolved_slots"]["recipient"] == "Alice"
+    assert result["resolved_slots"]["message_intent"] == "周五八点可以"
+
+
 def test_pipeline_run_endpoint_returns_execution_contract(monkeypatch):
     monkeypatch.setenv("APP_PASSWORD", "secret")
     from app import main
@@ -121,6 +245,26 @@ def test_pipeline_run_endpoint_returns_execution_contract(monkeypatch):
     assert body["status"] == "completed_read_only"
     assert body["resolved_slots"]["destination"] == "武康路"
     assert body["input"]["source_event_ids"] == ["evt-1"]
+
+
+def test_pipeline_result_exposes_explicit_source_references_top_level(monkeypatch):
+    monkeypatch.setenv("APP_PASSWORD", "secret")
+    from app import main
+
+    result = main.run_core_pipeline(
+        "查路线去武康路",
+        {
+            "source_event_ids": ["evt-1"],
+            "conversation_id": "conv-1",
+            "suggestion_id": "sug-1",
+            "agenda_item_ids": ["agenda-1"],
+        },
+    )
+
+    assert result["source_event_ids"] == ["evt-1"]
+    assert result["conversation_id"] == "conv-1"
+    assert result["suggestion_id"] == "sug-1"
+    assert result["agenda_item_ids"] == ["agenda-1"]
 
 
 def test_hybrid_slot_parser_uses_model_when_rules_are_missing(monkeypatch):
@@ -304,6 +448,67 @@ def test_local_writeback_executor_records_governance_audit_tables(monkeypatch):
     assert any("INSERT INTO provider_call_traces" in sql for sql, _ in executed)
     assert any("INSERT INTO confirmation_ledger" in sql for sql, _ in executed)
     assert any("INSERT INTO pipeline_health_metrics" in sql for sql, _ in executed)
+
+
+def test_pipeline_run_executes_explicit_composio_readonly_provider_plan(monkeypatch):
+    monkeypatch.setenv("APP_PASSWORD", "secret")
+    monkeypatch.setenv("COMPOSIO_API_KEY", "test-key")
+    monkeypatch.setenv("PIPELINE_EXECUTION_TEST_PERSIST", "1")
+    from app import main
+
+    captured = {}
+
+    class FakeSession:
+        def execute_tool(self, tool_slug, arguments):
+            captured["tool_slug"] = tool_slug
+            captured["arguments"] = dict(arguments)
+            return {"emails": [{"subject": "报价截止提醒"}]}
+
+    def handler(sql, params):
+        return Cursor()
+
+    executed = install_fake_db(monkeypatch, main, handler)
+    monkeypatch.setattr(
+        main,
+        "get_or_create_composio_session",
+        lambda user_id, session_kind: (
+            FakeSession(),
+            {
+                "session_kind": session_kind,
+                "toolkits": {"enable": ["gmail"]},
+                "tags": {"enable": ["readOnlyHint"], "disable": ["destructiveHint"]},
+                "manage_connections": False,
+            },
+        ),
+    )
+
+    response = TestClient(main.app).post(
+        "/api/pipelines/run",
+        headers={"x-par-password": "secret"},
+        json={
+            "request": "审计并读取最近邮件",
+            "context": {
+                "pipeline_id": "governance_audit_pipeline",
+                "task_id": "task-email-read",
+                "provider_call_plan": {
+                    "mode": "execute_read_only",
+                    "provider": "composio",
+                    "toolkit_slug": "gmail",
+                    "tool_slug": "GMAIL_FETCH_EMAILS",
+                    "arguments": {"query": "newer_than:1d"},
+                },
+            },
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["provider_execution"]["status"] == "completed"
+    assert payload["provider_execution"]["tool_slug"] == "GMAIL_FETCH_EMAILS"
+    assert payload["provider_execution"]["live_result"]["result"]["emails"][0]["subject"] == "报价截止提醒"
+    assert captured == {"tool_slug": "GMAIL_FETCH_EMAILS", "arguments": {"query": "newer_than:1d"}}
+    assert any("INSERT INTO composio_tool_invocations" in sql for sql, _ in executed)
+    assert any("INSERT INTO pipeline_execution_results" in sql for sql, _ in executed)
 
 
 def test_pipeline_results_include_contract_version(monkeypatch):
@@ -609,6 +814,83 @@ def test_task_route_trace_persists_explicit_references(monkeypatch):
     assert params[12] == "conv-1"
     assert params[13] == "sug-1"
     assert params[14] == ["agenda-1"]
+
+
+def test_route_tool_request_includes_capability_first_tool_registry_decision(monkeypatch):
+    monkeypatch.setenv("APP_PASSWORD", "secret")
+    from app import main
+
+    route = main.route_tool_request(
+        "帮我发邮件给 Alice 说报价明天给",
+        {"connected_adapters": {"composio": []}},
+    )
+
+    registry_decision = route["tool_registry_decision"]
+    assert registry_decision["capability_id"] == "email.send_draft"
+    assert registry_decision["selected_adapter"] == "composio"
+    assert registry_decision["route_type"] == "connect_required"
+    assert registry_decision["connect_action"]["toolkit"] == "gmail"
+    assert registry_decision["confirmation_required"] is True
+
+
+def test_task_route_trace_serializes_jsonb_payloads_before_psycopg(monkeypatch):
+    monkeypatch.setenv("APP_PASSWORD", "secret")
+    from app import main
+
+    def handler(sql, params):
+        if "INSERT INTO task_route_traces" in sql:
+            for index in [7, 8, 9, 10]:
+                value = params[index]
+                if value is not None:
+                    assert not isinstance(value, dict)
+                    assert hasattr(value, "obj")
+        return Cursor()
+
+    install_fake_db(monkeypatch, main, handler)
+    route = main.route_tool_request(
+        "打开一个不支持 MCP 的长尾网站",
+        {"source_event_ids": ["evt-1"], "context_pack": {"facts": [{"a": 1}]}},
+    )
+    main.persist_task_route_trace(main.db(), route)
+
+
+def test_openclaw_job_serializes_jsonb_payloads_before_psycopg(monkeypatch):
+    monkeypatch.setenv("APP_PASSWORD", "secret")
+    from app import main
+
+    def handler(sql, params):
+        if "INSERT INTO openclaw_execution_jobs" in sql:
+            assert not isinstance(params[5], dict)
+            assert not isinstance(params[6], dict)
+            assert params[5].obj["task_id"] == "task-1"
+        if "INSERT INTO openclaw_execution_events" in sql:
+            assert not isinstance(params[4], dict)
+            assert params[4].obj["task_id"] == "task-1"
+        return Cursor()
+
+    install_fake_db(monkeypatch, main, handler)
+    result = main.enqueue_openclaw_execution_job(
+        main.db(),
+        packet={"task_id": "task-1", "action": "read_page", "input": {"url": "https://example.com"}},
+        guard={"permission": "read_only", "requires_confirmation": False},
+    )
+
+    assert result["task_id"] == "task-1"
+    assert result["status"] == "queued"
+
+
+def test_pipeline_registry_endpoint_exposes_core_pipeline_contract(monkeypatch):
+    monkeypatch.setenv("APP_PASSWORD", "secret")
+    from app import main
+
+    response = TestClient(main.app).get("/api/pipelines/registry", headers={"x-par-password": "secret"})
+
+    assert response.status_code == 200
+    body = response.json()
+    pipeline_ids = [pipeline["id"] for pipeline in body["pipelines"]]
+    assert body["count"] == 18
+    assert "route_pipeline" in pipeline_ids
+    assert "document_file_pipeline" in pipeline_ids
 
 
 def test_event_trace_uses_explicit_refs_and_returns_pipeline_executions(monkeypatch):

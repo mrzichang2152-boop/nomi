@@ -3,6 +3,9 @@
   font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
   background: #f4f6f8;
   color: #172033;
+  --app-height: 100dvh;
+  --keyboard-bottom: 0px;
+  --mobile-sidebar-height: 154px;
 }
 
 * {
@@ -11,6 +14,7 @@
 
 body {
   margin: 0;
+  min-height: var(--app-height, 100dvh);
 }
 
 button,
@@ -35,7 +39,7 @@ button:hover {
 
 .shell,
 .app-panel {
-  min-height: 100vh;
+  min-height: var(--app-height, 100dvh);
 }
 
 .app-panel {
@@ -82,7 +86,7 @@ button:hover {
 
 .login-panel {
   display: grid;
-  min-height: 100vh;
+  min-height: var(--app-height, 100dvh);
   place-items: center;
   padding: 24px;
 }
@@ -118,7 +122,7 @@ button:hover {
 
 .workspace {
   min-width: 0;
-  height: 100vh;
+  height: var(--app-height, 100dvh);
   overflow: hidden;
 }
 
@@ -135,6 +139,10 @@ button:hover {
 
 #chatView.active {
   grid-template-rows: minmax(0, 1fr) auto;
+}
+
+#agendaView.active {
+  grid-template-rows: auto auto minmax(0, 1fr);
 }
 
 .view-header {
@@ -205,7 +213,10 @@ button:hover {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
   gap: 12px;
-  padding: 16px 24px;
+  position: sticky;
+  bottom: 0;
+  z-index: 5;
+  padding: 16px 24px max(16px, env(safe-area-inset-bottom));
   background: white;
   border-top: 1px solid #d7dee8;
 }
@@ -329,6 +340,77 @@ button:hover {
   background: #f0fdfa;
 }
 
+.long-tail-delivery {
+  display: grid;
+  gap: 10px;
+}
+
+.long-tail-action-card {
+  width: min(100%, 560px);
+  margin-top: 10px;
+  border-color: #99f6e4;
+  background: #f0fdfa;
+}
+
+.long-tail-action-card .actions {
+  justify-content: flex-start;
+}
+
+.long-tail-action-card button {
+  background: #0f766e;
+  color: white;
+}
+
+.agenda-card {
+  border-left: 4px solid #14b8a6;
+}
+
+.agenda-day-tabs {
+  display: grid;
+  grid-template-columns: repeat(7, minmax(82px, 1fr));
+  gap: 8px;
+  padding: 4px 24px 12px;
+  overflow-x: auto;
+}
+
+.agenda-day-tab {
+  position: relative;
+  display: grid;
+  gap: 2px;
+  min-width: 82px;
+  text-align: center;
+  background: #eef2f7;
+  color: #344054;
+}
+
+.agenda-day-tab span,
+.agenda-day-tab strong {
+  display: block;
+}
+
+.agenda-day-tab strong {
+  margin: 0;
+}
+
+.agenda-day-tab em {
+  position: absolute;
+  top: -5px;
+  right: -5px;
+  min-width: 20px;
+  min-height: 20px;
+  border-radius: 999px;
+  padding: 2px 6px;
+  background: #14b8a6;
+  color: white;
+  font-size: 12px;
+  font-style: normal;
+}
+
+.agenda-day-tab.active {
+  background: #1f8a70;
+  color: white;
+}
+
 .sources {
   margin-top: 10px;
   color: #59677a;
@@ -377,7 +459,7 @@ button:hover {
   }
 
   .nav-actions {
-    grid-template-columns: repeat(6, minmax(0, 1fr));
+    grid-template-columns: repeat(7, minmax(0, 1fr));
   }
 
   .nav-button {
@@ -386,7 +468,7 @@ button:hover {
   }
 
   .workspace {
-    height: calc(100vh - 154px);
+    height: calc(var(--app-height, 100dvh) - var(--mobile-sidebar-height, 154px));
   }
 
   #governanceFilters,

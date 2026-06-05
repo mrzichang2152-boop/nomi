@@ -45,15 +45,22 @@ final class ConfigPrefs {
     }
 
     static String remoteBrowserUrl(Context context) {
-        String baseUrl = baseUrlOrDefault(context);
+        return remoteBrowserUrlFor(baseUrlOrDefault(context));
+    }
+
+    static String remoteBrowserUrlFor(String baseUrl) {
         try {
             URL url = new URL(baseUrl);
             String protocol = url.getProtocol();
             String host = url.getHost();
             if (host == null || host.isEmpty()) return baseUrl;
-            return protocol + "://" + host + ":6080/vnc.html";
+            return protocol + "://" + host + ":6080/vnc.html" + noVncQuery();
         } catch (Exception ignored) {
-            return DEFAULT_BASE_URL + ":6080/vnc.html";
+            return DEFAULT_BASE_URL + ":6080/vnc.html" + noVncQuery();
         }
+    }
+
+    private static String noVncQuery() {
+        return "?autoconnect=1&resize=scale&quality=6&compression=2&show_dot=1";
     }
 }

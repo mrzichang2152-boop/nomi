@@ -3,6 +3,7 @@ import hashlib
 import json
 import os
 import re
+import time
 from urllib.parse import parse_qs, urlparse
 from datetime import datetime, timezone
 from typing import Optional
@@ -48,10 +49,15 @@ MANAGED_PAGE_CATALOG = {
         "host_fragment": "google.",
         "url": "https://www.google.com/",
     },
+    "shopping": {
+        "host_fragment": "amazon.",
+        "url": "https://www.amazon.com/",
+    },
 }
 SEEN_EVENTS: set[str] = set()
 FOCUS_STATE: dict[str, dict[str, object]] = {}
 SEARCH_STATE: dict[str, dict[str, str]] = {}
+MANUAL_BROWSER_FOCUS: dict[str, object] = {"source": "", "until": 0.0}
 WHATSAPP_UI_LINES = {
     "所有",
     "未读",
@@ -219,6 +225,29 @@ def missing_managed_page_targets(targets: list[dict[str, str]], open_urls: list[
     return missing
 
 
+def filter_managed_targets_for_manual_login(
+    targets: list[dict[str, str]],
+    manual_source: str,
+) -> list[dict[str, str]]:
+    source = (manual_source or "").strip().lower()
+    if not source:
+        return targets
+    return [target for target in targets if target.get("source") == source]
+
+
+def mark_manual_browser_focus(source: str, ttl_seconds: float = 600.0) -> None:
+    MANUAL_BROWSER_FOCUS["source"] = (source or "").strip().lower()
+    MANUAL_BROWSER_FOCUS["until"] = time.monotonic() + ttl_seconds
+
+
+def active_manual_browser_focus_source() -> str:
+    source = str(MANUAL_BROWSER_FOCUS.get("source") or "")
+    until = float(MANUAL_BROWSER_FOCUS.get("until") or 0.0)
+    if source and until > time.monotonic():
+        return source
+    return ""
+
+
 def source_for_page_url(url: str) -> Optional[str]:
     parsed = urlparse(url)
     if "mail.google.com" in parsed.netloc:
@@ -272,6 +301,7 @@ async def main() -> None:
                     )
 
                 asyncio.create_task(collector_loop(client, context))
+                asyncio.create_task(browser_command_loop(client, context))
 
                 while True:
                     page_count = sum(len(context.pages) for context in browser.contexts)
@@ -310,8 +340,101 @@ async def ensure_page_open(context, host_fragment: str, url: str) -> None:
     await page.goto(url, wait_until="domcontentloaded", timeout=30000)
 
 
+def browser_command_target(source: str) -> Optional[dict[str, str]]:
+    normalized = (source or "").strip().lower()
+    target = MANAGED_PAGE_CATALOG.get(normalized)
+    if not target:
+        return None
+    return {"source": normalized, **target}
+
+
+async def execute_browser_open_command(context, command: dict) -> dict[str, str]:
+    if not isinstance(command, dict) or command.get("action") != "open_url":
+        return {"status": "ignored", "source": "", "url": ""}
+    target = browser_command_target(str(command.get("source") or ""))
+    if not target:
+        return {"status": "ignored", "source": str(command.get("source") or ""), "url": ""}
+    host_fragment = target["host_fragment"]
+    url = target["url"]
+    mark_manual_browser_focus(target["source"])
+    page = current_browser_page(context)
+    if page is not None:
+        await close_other_pages(context, page)
+        if host_fragment in page.url:
+            await page.bring_to_front()
+            return {"status": "focused", "source": target["source"], "url": url}
+        await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+        await page.bring_to_front()
+        return {"status": "navigated", "source": target["source"], "url": url}
+    page = await context.new_page()
+    await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+    await page.bring_to_front()
+    return {"status": "opened", "source": target["source"], "url": url}
+
+
+def current_browser_page(context):
+    pages = list(getattr(context, "pages", []))
+    if pages:
+        return pages[0]
+    return None
+
+
+async def close_other_pages(context, keep_page) -> None:
+    for page in list(getattr(context, "pages", [])):
+        if page is keep_page:
+            continue
+        try:
+            await page.close()
+        except Exception:
+            pass
+
+
+async def fetch_browser_command(client: httpx.AsyncClient) -> Optional[dict]:
+    response = await client.get(
+        f"{RUNTIME_API_URL}/api/browser/commands/next",
+        headers=runtime_api_headers(),
+        timeout=5,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    command = payload.get("command")
+    return command if isinstance(command, dict) else None
+
+
+async def browser_command_loop(client: httpx.AsyncClient, context) -> None:
+    while True:
+        try:
+            command = await fetch_browser_command(client)
+            if command:
+                result = await execute_browser_open_command(context, command)
+                source = result.get("source") or str(command.get("source") or "runtime")
+                await report_health(
+                    client,
+                    source,
+                    "degraded" if result.get("status") in {"opened", "focused", "navigated"} else "failed",
+                    {
+                        "browser_command": command.get("command_id"),
+                        "command_result": result,
+                        "message": "Remote browser has been navigated for user login.",
+                    },
+                )
+                await asyncio.sleep(0.1)
+                continue
+        except Exception as exc:
+            await report_health(
+                client,
+                "runtime",
+                "degraded",
+                {"message": f"browser command loop error: {exc}"},
+            )
+        await asyncio.sleep(1)
+
+
 async def ensure_managed_pages(client: httpx.AsyncClient, context, settings: dict[str, dict]) -> None:
-    targets = managed_page_targets(settings)
+    targets = filter_managed_targets_for_manual_login(
+        managed_page_targets(settings),
+        active_manual_browser_focus_source(),
+    )
     missing_targets = missing_managed_page_targets(targets, [page.url for page in context.pages])
     for target in missing_targets:
         try:

@@ -3,8 +3,9 @@ import os
 import re
 import time
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Optional
+from zoneinfo import ZoneInfo
 
 import httpx
 import psycopg
@@ -21,9 +22,17 @@ MODEL_NAME = os.getenv("MODEL_NAME", "qwen3.6")
 MODEL_ROUTER_URL = os.getenv("MODEL_ROUTER_URL", "").rstrip("/")
 REDIS_START_ID = os.getenv("REDIS_START_ID", "$")
 REALTIME_CHANNEL = os.getenv("REALTIME_CHANNEL", "par:realtime")
+WORKER_STREAM_KEY = os.getenv("WORKER_STREAM_KEY", "events:raw")
+WORKER_CHECKPOINT_KEY = os.getenv("WORKER_CHECKPOINT_KEY", "events:raw:worker:last_id")
+WORKER_DEADLETTER_STREAM = os.getenv("WORKER_DEADLETTER_STREAM", "events:deadletter")
+USER_TIMEZONE_NAME = os.getenv("USER_TIMEZONE", "Asia/Shanghai")
+try:
+    USER_TIMEZONE = ZoneInfo(USER_TIMEZONE_NAME)
+except Exception:
+    USER_TIMEZONE = timezone(timedelta(hours=8))
 
 EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+")
-PHONE_RE = re.compile(r"(?<!\d)(?:\+?\d[\d -]{7,}\d)(?!\d)")
+PHONE_RE = re.compile(r"(?<![\dA-Za-z-])(?:\+?\d[\d -]{7,}\d)(?![\dA-Za-z-])")
 URL_QUERY_RE = re.compile(r"([?&])([^=#&]+)=([^&#]+)")
 SENSITIVE_KEY_RE = re.compile(r"(token|secret|cookie|session|password|passwd|auth|code|验证码|校验码|verification)", re.I)
 INLINE_SECRET_RE = re.compile(r"\b(token|secret|sessionid|session|password|passwd|auth|code)=([^,\s&;]+)", re.I)
@@ -34,12 +43,20 @@ ORDER_ID_RE = re.compile(r"((?:订单号|订单|order(?: id)?)[^\dA-Za-z]{0,8})(
 ID_CARD_RE = re.compile(r"((?:身份证号?|id card)[^\dA-Za-z]{0,8})(\d{17}[\dXx])", re.I)
 PASSPORT_RE = re.compile(r"((?:护照|passport)[^\dA-Za-z]{0,8})([A-Z]{1,2}\d{6,9})", re.I)
 BANK_CARD_RE = re.compile(r"((?:银行卡|卡号|bank card)[^\dA-Za-z]{0,8})(\d(?:[ -]?\d){12,18})", re.I)
-AMOUNT_RE = re.compile(r"(?<![\dA-Za-z_:])(?:¥|￥|RMB\s*)?\d{1,7}(?:\.\d{2})?\s*(?:元|CNY|USD|美元)?(?![\dA-Za-z_:])", re.I)
+AMOUNT_RE = re.compile(
+    r"(?<![\dA-Za-z_:.-])(?:(?:¥|￥|\$|RMB\s*)\d{1,7}(?:\.\d{1,2})?\s*(?:元|CNY|USD|美元)?|\d{1,7}(?:\.\d{1,2})?\s*(?:元|CNY|USD|美元))(?![\dA-Za-z_:.-])",
+    re.I,
+)
 CHINESE_ADDRESS_RE = re.compile(
     r"((?:收货地址|地址)[：:\s]*)([^，。；;\\n]{6,80}(?:号|室|楼|层|单元|弄|路|街|大道|巷|村|县|区|市))"
 )
 ENTITY_CLEAN_RE = re.compile(r"^[\s\W_]+|[\s\W_]+$")
 EXACT_TIME_RE = re.compile(r"\d{1,2}[:：点]\d{0,2}|[一二三四五六七八九十两]{1,3}点|上午|下午|晚上|中午|早上")
+TIME_OF_DAY_RE = re.compile(r"(上午|下午|晚上|中午|早上)?\s*([0-2]?\d|[一二三四五六七八九十两]{1,3})\s*(?:点|[:：])\s*([0-5]?\d)?")
+WEEKDAY_RE = re.compile(r"(下周)?(?:周|星期|礼拜)([一二三四五六日天])")
+WEEKDAY_LABELS = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
+CHINESE_WEEKDAYS = {"一": 0, "二": 1, "三": 2, "四": 3, "五": 4, "六": 5, "日": 6, "天": 6}
+CHINESE_DIGITS = {"零": 0, "一": 1, "二": 2, "两": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9}
 AGENDA_MODEL_DISABLED_VALUES = {"0", "false", "off", "no", "disabled"}
 AGENDA_TYPES = {"appointment", "deadline", "todo", "payment", "travel", "shopping", "followup", "reminder"}
 AGENDA_OPERATIONS = {
@@ -92,6 +109,25 @@ EVENT_LABEL_PRIORITY = [
     "low_value",
 ]
 LOW_VALUE_EVENT_LABELS = {"ordinary_chat", "low_value"}
+LOW_VALUE_TELEMETRY_EVENT_TYPES = {
+    "browser_network_event",
+    "browser_focus_event",
+    "browser_snapshot",
+    "whatsapp_snapshot",
+    "whatsapp_open_chat_snapshot",
+}
+INTENT_ALIASES = {
+    "约定": "social_plan",
+    "日程": "schedule",
+    "付款": "payment_reminder",
+    "待办": "task_request",
+    "截止日期": "task_request",
+    "出行": "travel_plan",
+    "购物": "shopping_intent",
+    "用户指令": "user_instruction",
+    "偏好更新": "preference_update",
+    "用户反馈": "user_feedback",
+}
 
 
 def mask_value(value: Any) -> Any:
@@ -313,6 +349,10 @@ def rule_event_labels(source: str, event_type: str, raw_data: dict[str, Any], se
         if label in EVENT_LABELS and label not in labels:
             labels.append(label)
 
+    if event_type in LOW_VALUE_TELEMETRY_EVENT_TYPES:
+        add("low_value")
+        return labels
+
     if any(marker in text for marker in ["取消", "不去了", "不用去了"]) or any(marker in lowered for marker in ["cancel", "canceled", "cancelled"]):
         add("cancel")
     if any(marker in text for marker in ["改到", "改成", "换到", "推迟", "提前"]) or "reschedule" in lowered:
@@ -355,8 +395,9 @@ def primary_event_label(labels: list[str]) -> str:
 
 
 def intent_for_primary_label(primary_label: str, current_intent: str) -> str:
-    if current_intent and current_intent != "generic_event":
-        return current_intent
+    normalized_intent = INTENT_ALIASES.get(str(current_intent or "").strip(), current_intent)
+    if normalized_intent and normalized_intent != "generic_event":
+        return normalized_intent
     return {
         "payment": "payment_reminder",
         "appointment": "social_plan",
@@ -366,7 +407,7 @@ def intent_for_primary_label(primary_label: str, current_intent: str) -> str:
         "shopping": "shopping_intent",
         "cancel": "schedule",
         "reschedule": "schedule",
-    }.get(primary_label, current_intent or "generic_event")
+    }.get(primary_label, normalized_intent or "generic_event")
 
 
 def enrich_semantic_classification(
@@ -463,7 +504,10 @@ def parse_model_json(text: str) -> dict[str, Any]:
 def extract_semantics(source: str, event_type: str, raw_data: dict[str, Any]) -> dict[str, Any]:
     fallback = rule_extract_semantics(source, event_type, raw_data)
     fallback["raw_data"] = raw_data
-    fallback = enrich_semantic_classification(source, event_type, raw_data, fallback, parser_mode="rules_only")
+    fallback_parser_mode = "rules_only_telemetry" if event_type in LOW_VALUE_TELEMETRY_EVENT_TYPES else "rules_only"
+    fallback = enrich_semantic_classification(source, event_type, raw_data, fallback, parser_mode=fallback_parser_mode)
+    if event_type in LOW_VALUE_TELEMETRY_EVENT_TYPES:
+        return fallback
     if source in {"locomo_seed", "locomo_conversation", "longmemeval_conversation"}:
         return fallback
     prompt = {
@@ -486,9 +530,12 @@ def extract_semantics(source: str, event_type: str, raw_data: dict[str, Any]) ->
     ]
     try:
         parsed = parse_model_json(call_model(messages))
+        model_entities = parsed.get("entities") if isinstance(parsed.get("entities"), dict) else {}
+        merged_entities = dict(fallback.get("entities") or {})
+        merged_entities.update(model_entities)
         semantic = {
             "intent": str(parsed.get("intent") or fallback["intent"])[:120],
-            "entities": parsed.get("entities") if isinstance(parsed.get("entities"), dict) else fallback["entities"],
+            "entities": merged_entities,
             "importance": float(parsed.get("importance", fallback["importance"])),
             "summary": str(parsed.get("summary") or fallback["summary"])[:500],
             "model_version": f"{MODEL_MODE}:{MODEL_NAME}",
@@ -499,7 +546,7 @@ def extract_semantics(source: str, event_type: str, raw_data: dict[str, Any]) ->
             event_type,
             raw_data,
             semantic,
-            model_entities=parsed.get("entities") if isinstance(parsed.get("entities"), dict) else {},
+            model_entities=model_entities,
             parser_mode="hybrid_model_rules",
         )
         warnings = semantic["entities"].get("classification_trace", {}).get("validation_warnings", [])
@@ -519,8 +566,32 @@ def extract_semantics(source: str, event_type: str, raw_data: dict[str, Any]) ->
 
 
 def suggestion_actions_for_event(intent: str, source: str, suggestion_type: str, summary: str) -> list[dict[str, Any]]:
-    text = f"{intent} {source} {suggestion_type} {summary}".lower()
-    if intent in {"social_plan", "schedule"} or any(marker in text for marker in ["见面", "路线", "street", "road"]):
+    normalized_intent = INTENT_ALIASES.get(str(intent or "").strip(), intent)
+    text = f"{normalized_intent} {intent} {source} {suggestion_type} {summary}".lower()
+    if intent in {"cancel", "canceled", "cancelled", "取消"} or any(
+        marker in text for marker in ["取消", "不去了", "不用去了", "cancel", "canceled", "cancelled"]
+    ):
+        return [
+            {
+                "id": "snooze",
+                "label": "稍后提醒",
+                "kind": "local",
+                "risk": "local_only",
+                "requires_confirmation": False,
+                "next_step": "snooze_suggestion",
+            },
+            {
+                "id": "open_source",
+                "label": "查看原消息",
+                "kind": "source_review",
+                "risk": "read_only",
+                "requires_confirmation": False,
+                "next_step": "open_source_event",
+            },
+        ]
+    if normalized_intent in {"social_plan", "schedule", "travel_plan"} or suggestion_type in {"social_followup", "calendar_reminder"} or any(
+        marker in text for marker in ["见面", "路线", "street", "road"]
+    ):
         return [
             {
                 "id": "route_lookup",
@@ -547,7 +618,7 @@ def suggestion_actions_for_event(intent: str, source: str, suggestion_type: str,
                 "next_step": "snooze_suggestion",
             },
         ]
-    if source == "gmail" or intent in {"payment_reminder", "email_verification", "task_request"}:
+    if source == "gmail" or normalized_intent in {"payment_reminder", "email_verification", "task_request"}:
         return [
             {
                 "id": "add_reminder",
@@ -590,10 +661,16 @@ def suggestion_for_event(event_id: str, semantic: dict[str, Any]) -> Optional[di
     summary = semantic["summary"].strip()
     display_summary = summary.rstrip("。.!！?？")
     importance = float(semantic["importance"])
-    intent = semantic["intent"]
+    raw_intent = str(semantic["intent"])
+    intent = INTENT_ALIASES.get(raw_intent.strip(), raw_intent)
     entities = semantic.get("entities", {})
     source = str(entities.get("source") or "")
-    if importance < 0.55 and intent not in {"social_plan", "schedule", "research_interest"}:
+    labels = set(normalize_string_list(entities.get("labels")))
+    primary_label = str(entities.get("primary_label") or "").strip()
+    if primary_label:
+        labels.add(primary_label)
+    is_appointment_like = intent in {"social_plan", "schedule"} or "appointment" in labels or "travel" in labels
+    if importance < 0.55 and intent not in {"social_plan", "schedule", "research_interest"} and not is_appointment_like:
         return None
 
     suggestion_type = "attention"
@@ -614,7 +691,7 @@ def suggestion_for_event(event_id: str, semantic: dict[str, Any]) -> Optional[di
         title = "跟进日程安排"
         body = f"这条信息可能需要跟进：{display_summary}。"
         expires_in = timedelta(days=2)
-    elif intent == "social_plan":
+    elif intent == "social_plan" or is_appointment_like:
         suggestion_type = "social_followup"
         title = "跟进近期安排"
         body = f"这条信息可能需要跟进：{display_summary}。"
@@ -631,6 +708,8 @@ def suggestion_for_event(event_id: str, semantic: dict[str, Any]) -> Optional[di
         "priority": min(max(importance, 0), 1),
         "metadata": {
             "intent": intent,
+            "source": source or "unknown",
+            "event_type": str(entities.get("event_type") or ""),
             "entities": entities,
             "suggestion_type": suggestion_type,
             "confidence": round(confidence, 3),
@@ -1177,13 +1256,20 @@ def agenda_operation_for_text(text: str) -> str:
 
 def agenda_type_for_semantic(semantic: dict[str, Any], text: str) -> Optional[str]:
     intent = str(semantic.get("intent") or "")
-    if intent in {"social_plan", "schedule"} or any(marker in text for marker in ["见面", "吃饭", "约", "会议", "开会", "碰面"]):
+    entities = semantic.get("entities") if isinstance(semantic.get("entities"), dict) else {}
+    labels = set(normalize_string_list(entities.get("labels")))
+    primary_label = str(entities.get("primary_label") or "").strip()
+    if primary_label:
+        labels.add(primary_label)
+    if intent in {"social_plan", "schedule", "约定", "日程"} or "appointment" in labels or any(
+        marker in text for marker in ["见面", "见一下", "吃饭", "约", "会议", "开会", "碰面"]
+    ):
         return "appointment"
-    if intent in {"payment_reminder"} or any(marker in text for marker in ["付款", "支付", "账单", "发票", "还款"]):
+    if intent in {"payment_reminder", "付款"} or "payment" in labels or any(marker in text for marker in ["付款", "支付", "账单", "发票", "还款"]):
         return "payment"
-    if intent in {"task_request", "user_instruction"} or any(marker in text for marker in ["待办", "帮我", "提醒", "处理"]):
+    if intent in {"task_request", "user_instruction", "待办"} or "todo" in labels or any(marker in text for marker in ["待办", "帮我", "提醒", "处理"]):
         return "todo"
-    if any(marker in text for marker in ["截止", "deadline", "due", "到期"]):
+    if "deadline" in labels or any(marker in text for marker in ["截止", "deadline", "due", "到期"]):
         return "deadline"
     return None
 
@@ -1243,6 +1329,16 @@ def agenda_dedupe_key_for_semantic(
     return f"agenda:{dedupe_seed}"
 
 
+def should_skip_agenda_candidate(semantic: dict[str, Any], raw_data: dict[str, Any]) -> bool:
+    entities = semantic.get("entities") if isinstance(semantic.get("entities"), dict) else {}
+    source = agenda_source_for_semantic(semantic, raw_data)
+    role = str(raw_data.get("role") or entities.get("role") or entities.get("person") or "").strip().lower()
+    intent = str(semantic.get("intent") or "").strip()
+    if source == "nomi_chat" and role == "assistant":
+        return True
+    return intent == "assistant_response"
+
+
 def agenda_model_enabled() -> bool:
     return os.getenv("AGENDA_MODEL_ENABLED", "1").strip().lower() not in AGENDA_MODEL_DISABLED_VALUES
 
@@ -1289,7 +1385,104 @@ def agenda_candidate_copy(candidate: Optional[dict[str, Any]]) -> Optional[dict[
     return json.loads(json.dumps(candidate, ensure_ascii=False))
 
 
-def agenda_certainty_and_missing(text: str, place: str, agenda_type: str, operation: str) -> tuple[str, list[str], dict[str, Any]]:
+def parse_event_local_datetime(timestamp: str) -> datetime:
+    try:
+        value = str(timestamp or "").replace("Z", "+00:00")
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        parsed = datetime.now(timezone.utc)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(USER_TIMEZONE)
+
+
+def chinese_hour_to_int(value: str) -> Optional[int]:
+    value = str(value or "").strip()
+    if not value:
+        return None
+    if value.isdigit():
+        hour = int(value)
+        return hour if 0 <= hour <= 23 else None
+    if value == "十":
+        return 10
+    if "十" in value:
+        before, after = value.split("十", 1)
+        tens = CHINESE_DIGITS.get(before, 1 if before == "" else 0)
+        ones = CHINESE_DIGITS.get(after, 0) if after else 0
+        hour = tens * 10 + ones
+        return hour if 0 <= hour <= 23 else None
+    hour = CHINESE_DIGITS.get(value)
+    return hour if hour is not None and 0 <= hour <= 23 else None
+
+
+def extract_time_of_day(text: str) -> Optional[tuple[int, int]]:
+    match = TIME_OF_DAY_RE.search(text)
+    if not match:
+        if "中午" in text:
+            return (12, 0)
+        return None
+    period, raw_hour, raw_minute = match.groups()
+    hour = chinese_hour_to_int(raw_hour)
+    if hour is None:
+        return None
+    minute = int(raw_minute or "0")
+    if period in {"下午", "晚上"} and 1 <= hour < 12:
+        hour += 12
+    if period == "中午" and hour < 11:
+        hour += 12
+    return (hour, minute)
+
+
+def resolve_agenda_date(text: str, event_dt: datetime) -> Optional[date]:
+    if "后天" in text:
+        return (event_dt + timedelta(days=2)).date()
+    if "明天" in text:
+        return (event_dt + timedelta(days=1)).date()
+    if "今天" in text or "今晚" in text:
+        return event_dt.date()
+    weekday_match = WEEKDAY_RE.search(text)
+    if not weekday_match:
+        return None
+    next_week, raw_weekday = weekday_match.groups()
+    target_weekday = CHINESE_WEEKDAYS.get(raw_weekday)
+    if target_weekday is None:
+        return None
+    days_until = (target_weekday - event_dt.weekday()) % 7
+    if next_week:
+        days_until += 7
+    return (event_dt + timedelta(days=days_until)).date()
+
+
+def resolved_agenda_time_window(text: str, timestamp: str) -> dict[str, Any]:
+    event_dt = parse_event_local_datetime(timestamp)
+    target_date = resolve_agenda_date(text, event_dt)
+    time_of_day = extract_time_of_day(text)
+    if target_date is None:
+        return {"source_event_timestamp": event_dt.isoformat()}
+
+    resolved: dict[str, Any] = {
+        "date": target_date.isoformat(),
+        "weekday": WEEKDAY_LABELS[target_date.weekday()],
+        "source_event_timestamp": event_dt.isoformat(),
+    }
+    if time_of_day:
+        hour, minute = time_of_day
+        start = datetime(
+            target_date.year,
+            target_date.month,
+            target_date.day,
+            hour,
+            minute,
+            tzinfo=USER_TIMEZONE,
+        )
+        resolved["start"] = start.isoformat(timespec="seconds")
+        resolved["display"] = f"{target_date.isoformat()} {resolved['weekday']} {hour:02d}:{minute:02d}"
+    else:
+        resolved["display"] = f"{target_date.isoformat()} {resolved['weekday']}"
+    return resolved
+
+
+def agenda_certainty_and_missing(text: str, place: str, agenda_type: str, operation: str, timestamp: str = "") -> tuple[str, list[str], dict[str, Any]]:
     has_exact_time = bool(EXACT_TIME_RE.search(text))
     has_fuzzy_time = any(marker in text for marker in ["周末", "下周", "周日", "周六", "改天", "找时间", "有空", "明后天"])
     missing_fields: list[str] = []
@@ -1305,11 +1498,14 @@ def agenda_certainty_and_missing(text: str, place: str, agenda_type: str, operat
         "has_exact_time": has_exact_time,
         "has_fuzzy_time": has_fuzzy_time,
     }
+    time_window.update(resolved_agenda_time_window(text, timestamp))
     return certainty, missing_fields, time_window
 
 
 def agenda_candidate_from_semantic(event_id: str, timestamp: str, semantic: dict[str, Any]) -> Optional[dict[str, Any]]:
     raw_data = semantic.get("raw_data") if isinstance(semantic.get("raw_data"), dict) else {}
+    if should_skip_agenda_candidate(semantic, raw_data):
+        return None
     text = semantic_text(semantic)
     agenda_type = agenda_type_for_semantic(semantic, text)
     if not agenda_type:
@@ -1317,7 +1513,7 @@ def agenda_candidate_from_semantic(event_id: str, timestamp: str, semantic: dict
     place = extract_place(text, raw_data)
     participants = extract_agenda_participants(raw_data, semantic)
     operation = agenda_operation_for_text(text)
-    certainty, missing_fields, time_window = agenda_certainty_and_missing(text, place, agenda_type, operation)
+    certainty, missing_fields, time_window = agenda_certainty_and_missing(text, place, agenda_type, operation, timestamp)
     status = "canceled" if operation == "cancel" else "scheduled"
     title = str(semantic.get("summary") or text or agenda_type).strip()[:180]
     source = agenda_source_for_semantic(semantic, raw_data)
@@ -1474,7 +1670,7 @@ def validated_model_fields_for_agenda(
     else:
         place = rule_place
 
-    rule_certainty, rule_missing_fields, rule_time_window = agenda_certainty_and_missing(text, place, agenda_type, operation)
+    rule_certainty, rule_missing_fields, rule_time_window = agenda_certainty_and_missing(text, place, agenda_type, operation, timestamp)
     model_certainty = str(model_candidate.get("certainty") or "").strip()
     if model_certainty not in AGENDA_CERTAINTIES:
         model_certainty = rule_certainty
@@ -1573,6 +1769,8 @@ def hybrid_agenda_candidate_from_semantic(event_id: str, timestamp: str, semanti
     validated, validation_warnings = validated_model_fields_for_agenda(rule_candidate, model_candidate, semantic, timestamp)
     warnings = model_warnings + validation_warnings
     if not validated:
+        if "model_said_not_agenda" in warnings:
+            return None
         return rules_fallback_agenda_candidate(rule_candidate, model_candidate, warnings)
     if event_id not in validated["source_event_ids"]:
         validated["source_event_ids"].append(event_id)
@@ -1788,22 +1986,95 @@ def persist_semantics(conn: psycopg.Connection, event_id: str, timestamp: str, s
     )
 
 
+def _decode_redis_value(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return str(value)
+
+
+def resolve_start_id(redis_client: Any) -> str:
+    checkpoint = ""
+    try:
+        checkpoint = _decode_redis_value(redis_client.get(WORKER_CHECKPOINT_KEY)).strip()
+    except Exception:
+        checkpoint = ""
+    if checkpoint:
+        return checkpoint
+    configured = str(REDIS_START_ID or "").strip()
+    if not configured or configured == "$":
+        return "0-0"
+    return configured
+
+
+def record_worker_checkpoint(redis_client: Any, message_id: str) -> None:
+    try:
+        redis_client.set(WORKER_CHECKPOINT_KEY, message_id)
+    except Exception as exc:
+        print(f"worker checkpoint write failed message_id={message_id} error={exc!r}", flush=True)
+
+
+def deadletter_stream_entry(redis_client: Any, message_id: str, fields: dict[str, Any], error: Exception) -> None:
+    try:
+        redis_client.xadd(
+            WORKER_DEADLETTER_STREAM,
+            {
+                "message_id": message_id,
+                "event_id": str(fields.get("event_id") or ""),
+                "source": str(fields.get("source") or ""),
+                "event_type": str(fields.get("event_type") or ""),
+                "timestamp": str(fields.get("timestamp") or ""),
+                "error": repr(error)[:1000],
+                "raw_data": str(fields.get("raw_data") or "")[:10000],
+            },
+        )
+    except Exception as exc:
+        print(f"worker deadletter write failed message_id={message_id} error={exc!r}", flush=True)
+
+
+def process_stream_entry(redis_client: Any, message_id: str, fields: dict[str, Any]) -> bool:
+    try:
+        raw_data = json.loads(fields["raw_data"])
+        masked = mask_value(raw_data)
+        semantic = extract_semantics(fields["source"], fields["event_type"], masked)
+        semantic["raw_data"] = masked
+        with psycopg.connect(DATABASE_URL) as conn:
+            persist_semantics(conn, fields["event_id"], fields["timestamp"], semantic, redis_client=redis_client)
+        record_worker_checkpoint(redis_client, message_id)
+        print(
+            "worker processed "
+            f"message_id={message_id} event_id={fields.get('event_id')} "
+            f"source={fields.get('source')} event_type={fields.get('event_type')} "
+            f"intent={semantic.get('intent')}",
+            flush=True,
+        )
+        return True
+    except Exception as exc:
+        deadletter_stream_entry(redis_client, message_id, fields, exc)
+        record_worker_checkpoint(redis_client, message_id)
+        print(
+            "worker failed "
+            f"message_id={message_id} event_id={fields.get('event_id')} "
+            f"source={fields.get('source')} event_type={fields.get('event_type')} "
+            f"error={exc!r}",
+            flush=True,
+        )
+        return False
+
+
 def main() -> None:
     client = redis.Redis.from_url(REDIS_URL, decode_responses=True)
-    last_id = REDIS_START_ID
+    last_id = resolve_start_id(client)
+    print(f"worker starting stream={WORKER_STREAM_KEY} start_id={last_id}", flush=True)
     while True:
-        messages = client.xread({"events:raw": last_id}, count=10, block=5000)
+        messages = client.xread({WORKER_STREAM_KEY: last_id}, count=10, block=5000)
         if not messages:
             continue
         for _, entries in messages:
             for message_id, fields in entries:
+                process_stream_entry(client, message_id, fields)
                 last_id = message_id
-                raw_data = json.loads(fields["raw_data"])
-                masked = mask_value(raw_data)
-                semantic = extract_semantics(fields["source"], fields["event_type"], masked)
-                semantic["raw_data"] = masked
-                with psycopg.connect(DATABASE_URL) as conn:
-                    persist_semantics(conn, fields["event_id"], fields["timestamp"], semantic, redis_client=client)
         time.sleep(0.1)
 
 

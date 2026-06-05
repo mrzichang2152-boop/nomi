@@ -1,11 +1,14 @@
 const passwordKey = "par-password";
+const conversationKey = "nomi-conversation-id";
 const loginPanel = document.querySelector("#loginPanel");
 const appPanel = document.querySelector("#appPanel");
 const loginForm = document.querySelector("#loginForm");
 const loginError = document.querySelector("#loginError");
 const passwordInput = document.querySelector("#passwordInput");
+const sidebar = document.querySelector(".sidebar");
 const chatForm = document.querySelector("#chatForm");
 const messageInput = document.querySelector("#messageInput");
+const chatSubmitButton = document.querySelector("#chatForm button[type='submit']");
 const messages = document.querySelector("#messages");
 const searchForm = document.querySelector("#searchForm");
 const searchInput = document.querySelector("#searchInput");
@@ -15,10 +18,13 @@ const governanceQuery = document.querySelector("#governanceQuery");
 const governanceSource = document.querySelector("#governanceSource");
 const governanceSensitive = document.querySelector("#governanceSensitive");
 const governanceContent = document.querySelector("#governanceContent");
+const agendaContent = document.querySelector("#agendaContent");
+const agendaDayTabs = document.querySelector("#agendaDayTabs");
 const suggestionsContent = document.querySelector("#suggestionsContent");
 const collectorsContent = document.querySelector("#collectorsContent");
 const toolsContent = document.querySelector("#toolsContent");
 const refreshGovernance = document.querySelector("#refreshGovernance");
+const refreshAgenda = document.querySelector("#refreshAgenda");
 const refreshSuggestions = document.querySelector("#refreshSuggestions");
 const refreshCollectors = document.querySelector("#refreshCollectors");
 const refreshTools = document.querySelector("#refreshTools");
@@ -34,7 +40,17 @@ let realtimeSocket = null;
 let realtimeReady = false;
 let activeAssistantNode = null;
 let approvedSensitiveFields = {};
+let agendaItems = [];
+let selectedAgendaDate = "";
+let chatConversationId = localStorage.getItem(conversationKey) || "";
+let chatHistoryLoaded = false;
+let viewportMetricsBound = false;
+let realtimeChatWatchdog = null;
+let realtimeChatHadDelta = false;
+let lastTouchSubmitAt = 0;
 const openClawJobCards = new Map();
+const realtimePendingText = "正在结合本地记忆思考...";
+const realtimeTimeoutMs = 45000;
 
 function password() {
   return localStorage.getItem(passwordKey) || "";
@@ -43,10 +59,55 @@ function password() {
 function showApp() {
   loginPanel.classList.add("hidden");
   appPanel.classList.remove("hidden");
+  bindViewportMetrics();
   connectRealtime();
   if (location.hash === "#chat") switchView("chatView");
-  consumePendingProactive();
+  loadChatHistory().finally(() => {
+    consumePendingProactive();
+    consumePendingAgentEvent();
+  });
   loadDashboard();
+}
+
+function updateViewportMetrics() {
+  const viewport = window.visualViewport;
+  const focusedComposer = document.activeElement === messageInput;
+  const rawViewportHeight = viewport ? viewport.height : window.innerHeight;
+  let keyboardBottom = viewport
+    ? Math.max(0, Math.round(window.innerHeight - viewport.height - viewport.offsetTop))
+    : 0;
+  if (focusedComposer && keyboardBottom < 80 && rawViewportHeight >= window.innerHeight - 8) {
+    keyboardBottom = Math.round(window.innerHeight * 0.38);
+  }
+  const appHeight = Math.max(
+    320,
+    Math.round(keyboardBottom > 80 ? window.innerHeight - keyboardBottom : rawViewportHeight || window.innerHeight || 0)
+  );
+  const sidebarHeight = sidebar ? Math.ceil(sidebar.getBoundingClientRect().height) : 154;
+  document.documentElement.style.setProperty("--app-height", `${appHeight}px`);
+  document.documentElement.style.setProperty("--keyboard-bottom", `${keyboardBottom}px`);
+  document.documentElement.style.setProperty("--mobile-sidebar-height", `${sidebarHeight}px`);
+  document.body.classList.toggle("keyboard-open", focusedComposer && keyboardBottom > 80);
+  if (focusedComposer) {
+    requestAnimationFrame(() => {
+      messageInput.scrollIntoView({ block: "nearest", inline: "nearest" });
+    });
+  }
+}
+
+function bindViewportMetrics() {
+  updateViewportMetrics();
+  if (viewportMetricsBound) return;
+  viewportMetricsBound = true;
+  window.addEventListener("resize", updateViewportMetrics);
+  window.addEventListener("orientationchange", () => setTimeout(updateViewportMetrics, 250));
+  if (window.visualViewport) {
+    window.visualViewport.addEventListener("resize", updateViewportMetrics);
+    window.visualViewport.addEventListener("scroll", updateViewportMetrics);
+  }
+  messageInput.addEventListener("focus", () => setTimeout(updateViewportMetrics, 120));
+  messageInput.addEventListener("click", () => setTimeout(updateViewportMetrics, 120));
+  window.addEventListener("nomi-pending-agent-event", consumePendingAgentEvent);
 }
 
 async function api(path, options = {}) {
@@ -65,6 +126,7 @@ async function api(path, options = {}) {
 function switchView(viewId) {
   document.querySelectorAll(".view").forEach((view) => view.classList.toggle("active", view.id === viewId));
   document.querySelectorAll(".nav-button").forEach((button) => button.classList.toggle("active", button.dataset.view === viewId));
+  if (viewId === "agendaView") loadAgenda();
   if (viewId === "suggestionsView") loadSuggestions();
   if (viewId === "collectorsView") loadCollectors();
   if (viewId === "toolsView") loadTools();
@@ -92,9 +154,93 @@ function addMessage(role, text, sources = []) {
   return item;
 }
 
+function setChatConversationId(value) {
+  chatConversationId = value || "";
+  if (chatConversationId) {
+    localStorage.setItem(conversationKey, chatConversationId);
+  } else {
+    localStorage.removeItem(conversationKey);
+  }
+}
+
+async function loadChatHistory(force = false) {
+  if (chatHistoryLoaded && !force) return;
+  if (messages.children.length && !force) {
+    chatHistoryLoaded = true;
+    return;
+  }
+  chatHistoryLoaded = true;
+  const params = new URLSearchParams();
+  params.set("limit", "80");
+  if (chatConversationId) params.set("conversation_id", chatConversationId);
+  const query = `?${params.toString()}`;
+  try {
+    const result = await api(`/api/chat/history${query}`);
+    if (result.conversation_id) setChatConversationId(result.conversation_id);
+    messages.innerHTML = "";
+    (result.messages || []).forEach((message) => {
+      if (message.role === "user" || message.role === "assistant") {
+        addMessage(message.role, message.content || "");
+      }
+    });
+  } catch (error) {
+    if (chatConversationId && !force) {
+      setChatConversationId("");
+      chatHistoryLoaded = false;
+      await loadChatHistory(true);
+    }
+  }
+}
+
 function appendMessageText(node, text) {
   node.textContent += text;
   messages.scrollTop = messages.scrollHeight;
+}
+
+function focusMessageInputNow() {
+  if (!messageInput) return;
+  messageInput.focus({ preventScroll: true });
+  const caret = messageInput.value.length;
+  messageInput.setSelectionRange(caret, caret);
+  updateViewportMetrics();
+}
+
+function refocusMessageInput() {
+  if (!messageInput) return;
+  requestAnimationFrame(() => {
+    focusMessageInputNow();
+  });
+  for (const delay of [80, 240, 520]) {
+    setTimeout(focusMessageInputNow, delay);
+  }
+}
+
+function clearRealtimeChatWatchdog() {
+  if (!realtimeChatWatchdog) return;
+  clearTimeout(realtimeChatWatchdog);
+  realtimeChatWatchdog = null;
+}
+
+function failActiveRealtimeChat(message) {
+  clearRealtimeChatWatchdog();
+  if (activeAssistantNode) {
+    if (realtimeChatHadDelta) {
+      appendMessageText(activeAssistantNode, `\n\n${message}`);
+    } else {
+      activeAssistantNode.textContent = message;
+    }
+  } else {
+    addMessage("assistant", message);
+  }
+  activeAssistantNode = null;
+  realtimeChatHadDelta = false;
+}
+
+function startRealtimeChatWatchdog() {
+  clearRealtimeChatWatchdog();
+  realtimeChatWatchdog = setTimeout(() => {
+    failActiveRealtimeChat("实时回复超时，请稍后重试或检查模型服务。");
+  }, realtimeTimeoutMs);
 }
 
 function connectRealtime() {
@@ -106,9 +252,17 @@ function connectRealtime() {
   });
   realtimeSocket.addEventListener("close", () => {
     realtimeReady = false;
+    if (activeAssistantNode) {
+      failActiveRealtimeChat("实时通道已断开，请重新发送或检查模型服务。");
+    }
     setTimeout(() => {
       if (password()) connectRealtime();
     }, 3000);
+  });
+  realtimeSocket.addEventListener("error", () => {
+    if (activeAssistantNode) {
+      failActiveRealtimeChat("实时通道发生错误，请重新发送或检查网络。");
+    }
   });
   realtimeSocket.addEventListener("message", (event) => {
     handleRealtimeMessage(JSON.parse(event.data));
@@ -123,14 +277,46 @@ function handleRealtimeMessage(event) {
     location.hash = "chat";
     return;
   }
+  if (event.type === "agent_task_delivery") {
+    switchView("chatView");
+    messages.appendChild(renderLongTailDelivery(event.delivery || {}, {
+      taskId: event.task_id,
+      effectId: event.effect_id,
+    }));
+    messages.scrollTop = messages.scrollHeight;
+    location.hash = "chat";
+    return;
+  }
+  if (event.type === "agent_task_fallback") {
+    const fallbackDecision = event.fallback_decision || {};
+    const actionCard = event.action_card || fallbackDecision.action_card;
+    if (actionCard) {
+      switchView("chatView");
+      messages.appendChild(renderLongTailActionCard(actionCard, {
+        taskId: event.task_id,
+        effectId: event.effect_id,
+      }));
+      messages.scrollTop = messages.scrollHeight;
+      location.hash = "chat";
+    }
+    return;
+  }
   if (event.type === "chat_delta") {
     if (!activeAssistantNode) activeAssistantNode = addMessage("assistant", "");
+    if (!realtimeChatHadDelta && activeAssistantNode.textContent === realtimePendingText) {
+      activeAssistantNode.textContent = "";
+    }
+    realtimeChatHadDelta = true;
+    startRealtimeChatWatchdog();
     appendMessageText(activeAssistantNode, event.delta || "");
     return;
   }
   if (event.type === "chat_done") {
+    clearRealtimeChatWatchdog();
+    if (event.conversation_id) setChatConversationId(event.conversation_id);
     if (activeAssistantNode && event.sources?.length) activeAssistantNode.appendChild(renderSources(event.sources));
     activeAssistantNode = null;
+    realtimeChatHadDelta = false;
     return;
   }
   if (event.type === "openclaw_job_event") {
@@ -138,7 +324,7 @@ function handleRealtimeMessage(event) {
     return;
   }
   if (event.type === "error") {
-    addMessage("assistant", event.message || "实时通道发生错误。");
+    failActiveRealtimeChat(event.message || "实时通道发生错误。");
   }
 }
 
@@ -153,6 +339,19 @@ function consumePendingProactive() {
     addMessage("assistant", `${title}${event.body || ""}`);
   } catch {
     addMessage("assistant", raw);
+  }
+}
+
+function consumePendingAgentEvent() {
+  const raw = localStorage.getItem("nomi-pending-agent-event");
+  if (!raw) return;
+  localStorage.removeItem("nomi-pending-agent-event");
+  try {
+    const event = JSON.parse(raw);
+    handleRealtimeMessage(event);
+  } catch {
+    switchView("chatView");
+    addMessage("assistant", "收到一个长尾任务提醒，但事件内容无法解析。");
   }
 }
 
@@ -174,8 +373,88 @@ function renderSources(sources) {
   return sourceBox;
 }
 
+function renderLongTailDelivery(delivery, context = {}) {
+  const node = card("message assistant long-tail-delivery");
+  const message = delivery.message || "长尾任务有新的交付结果。";
+  node.textContent = message;
+  if ((delivery.actions || []).length) {
+    const actionCard = {
+      title: "需要你确认的后续操作",
+      message: "这些操作只会打开 Nomi 的回滚/补偿流程，不会直接撤回或执行第三方动作。",
+      actions: delivery.actions,
+    };
+    node.appendChild(renderLongTailActionCard(actionCard, context));
+  }
+  return node;
+}
+
+function renderLongTailActionCard(actionCard, context = {}) {
+  const node = card("card long-tail-action-card");
+  const title = document.createElement("strong");
+  title.textContent = actionCard.title || "任务操作";
+  const message = document.createElement("p");
+  message.textContent = actionCard.message || "请选择下一步。";
+  node.append(title, message);
+  const actions = document.createElement("div");
+  actions.className = "actions";
+  for (const rawAction of actionCard.actions || []) {
+    const action = { ...rawAction };
+    const actionButton = button(action.label || action.id || "执行");
+    actionButton.addEventListener("click", () => handleLongTailActionCardAction(action, context, node));
+    actions.appendChild(actionButton);
+  }
+  if (actions.children.length) node.appendChild(actions);
+  return node;
+}
+
+async function handleLongTailActionCardAction(action, context = {}, node) {
+  const taskId = action.task_id || context.taskId;
+  const effectId = action.effect_id || context.effectId;
+  const status = document.createElement("p");
+  status.className = "muted";
+  node.appendChild(status);
+  if (!taskId || !effectId) {
+    status.textContent = "缺少任务或外部效果编号，无法打开补偿流程。";
+    return;
+  }
+  if (action.id === "review_external_effect_rollback") {
+    status.textContent = "读取回滚与补偿说明...";
+    try {
+      const result = await api(`/api/agent-tasks/${taskId}/external-effects/${effectId}/rollback`, {
+        method: "POST",
+      });
+      status.textContent = "已读取回滚说明。";
+      if (result.action_card) {
+        node.appendChild(renderLongTailActionCard(result.action_card, { taskId, effectId }));
+      }
+    } catch {
+      status.textContent = "无法读取回滚说明。";
+    }
+    return;
+  }
+  if (action.id === "prepare_compensation") {
+    const reason = window.prompt("补偿操作说明", "准备一条更正或取消说明，发送前需要我再次确认。");
+    if (!reason) {
+      status.textContent = "已取消补偿准备。";
+      return;
+    }
+    status.textContent = "准备补偿方案...";
+    try {
+      const result = await api(`/api/agent-tasks/${taskId}/external-effects/${effectId}/compensation`, {
+        method: "POST",
+        body: JSON.stringify({ proposal: { type: "manual_compensation_request", reason } }),
+      });
+      status.textContent = `补偿方案已准备：${result.status || "waiting_for_compensation_confirmation"}`;
+    } catch {
+      status.textContent = "补偿方案准备失败。";
+    }
+    return;
+  }
+  status.textContent = "这个任务操作暂时只能在完整任务详情中处理。";
+}
+
 async function loadDashboard() {
-  await Promise.allSettled([loadSuggestions(), loadCollectors(), loadGovernance(), loadTools()]);
+  await Promise.allSettled([loadAgenda(), loadSuggestions(), loadCollectors(), loadGovernance(), loadTools()]);
 }
 
 async function loadSearch(query) {
@@ -262,7 +541,9 @@ function renderEventGovernanceItem(item) {
 
 function renderSemanticGovernanceItem(item) {
   const node = card();
-  node.innerHTML = `<time>${item.memory_type} · ${Number(item.confidence || 0).toFixed(2)}</time><strong>长期记忆</strong><p>${renderJson(item.content)}</p>`;
+  const sourceIds = item.source_event_ids || [];
+  const sourceText = sourceIds.length ? ` · 来源 ${sourceIds.length} 条证据` : " · 无来源证据";
+  node.innerHTML = `<time>${item.memory_type} · ${Number(item.confidence || 0).toFixed(2)}${sourceText}</time><strong>长期记忆</strong><p>${renderJson(item.content)}${sourceIds.length ? `\nsource_event_ids: ${sourceIds.join(", ")}` : ""}</p>`;
   const actions = document.createElement("div");
   actions.className = "actions";
   const correct = button("纠正");
@@ -288,7 +569,19 @@ function renderSemanticGovernanceItem(item) {
 
 function renderStateGovernanceItem(item) {
   const node = card();
-  node.innerHTML = `<time>${item.key} · ${Number(item.confidence || 0).toFixed(2)}</time><strong>状态</strong><p>${renderJson(item.value)}</p>`;
+  const sourceFactIds = item.source_fact_ids || [];
+  const sourceText = sourceFactIds.length ? ` · 来源 ${sourceFactIds.length} 条事实` : " · 无来源事实";
+  node.innerHTML = `<time>${item.key} · ${Number(item.confidence || 0).toFixed(2)}${sourceText}</time><strong>状态</strong><p>${renderJson(item.value)}${sourceFactIds.length ? `\nsource_fact_ids: ${sourceFactIds.join(", ")}` : ""}</p>`;
+  const actions = document.createElement("div");
+  actions.className = "actions";
+  const remove = button("删除");
+  remove.className = "danger";
+  remove.addEventListener("click", async () => {
+    await api("/memory/delete", { method: "POST", body: JSON.stringify({ state_key: item.key }) });
+    node.remove();
+  });
+  actions.appendChild(remove);
+  node.appendChild(actions);
   return node;
 }
 
@@ -306,6 +599,326 @@ function renderRouteTraceGovernanceItem(item) {
   const pipeline = item.pipeline_id ? `\nPipeline：${item.pipeline_id}` : "";
   node.innerHTML = `<time>${routeTypeLabel(item.route_type)} · ${item.capability_id || "unknown"} · ${item.risk_permission || "read_only"}</time><strong>${item.request}</strong><p>${renderJson(item.task_route_decision)}${pipeline}${packetGoal}${clarification}</p>`;
   return node;
+}
+
+function agendaStatusText(status) {
+  if (status === "scheduled") return "已安排";
+  if (status === "open") return "待处理";
+  if (status === "done") return "已完成";
+  if (status === "dismissed") return "已忽略";
+  if (status === "cancelled" || status === "canceled") return "已取消";
+  return status || "未知状态";
+}
+
+function agendaCertaintyText(certainty) {
+  if (certainty === "exact") return "时间明确";
+  if (certainty === "fuzzy") return "信息模糊";
+  if (certainty === "inferred") return "推断";
+  return certainty || "未标注";
+}
+
+function agendaTypeText(type) {
+  if (type === "appointment") return "约定";
+  if (type === "todo") return "待办";
+  if (type === "deadline") return "截止";
+  if (type === "payment") return "付款";
+  if (type === "travel") return "出行";
+  if (type === "shopping") return "购物";
+  return type || "日程";
+}
+
+function missingFieldText(field) {
+  const labels = {
+    exact_time: "具体时间",
+    exact_place: "具体地点",
+    place: "地点",
+    participants: "参与人",
+    amount: "金额",
+    due_time: "截止时间",
+  };
+  return labels[field] || field;
+}
+
+const agendaWeekdayLabels = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"];
+const agendaChineseWeekdays = { 一: 0, 二: 1, 三: 2, 四: 3, 五: 4, 六: 5, 日: 6, 天: 6 };
+const agendaChineseDigits = { 零: 0, 一: 1, 二: 2, 两: 2, 三: 3, 四: 4, 五: 5, 六: 6, 七: 7, 八: 8, 九: 9 };
+
+function agendaDateKeyFromDate(date) {
+  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
+}
+
+function agendaDateFromKey(dateKey) {
+  const [year, month, day] = String(dateKey || "").split("-").map((value) => Number(value));
+  if (!year || !month || !day) return new Date();
+  return new Date(year, month - 1, day);
+}
+
+function agendaAddDays(date, days) {
+  const next = new Date(date);
+  next.setDate(next.getDate() + days);
+  return next;
+}
+
+function agendaStartOfWeek(date) {
+  const day = date.getDay() || 7;
+  return agendaAddDays(date, 1 - day);
+}
+
+function agendaWeekdayLabel(date) {
+  return agendaWeekdayLabels[(date.getDay() + 6) % 7];
+}
+
+function agendaHourFromChinese(value) {
+  const raw = String(value || "").trim();
+  if (!raw) return null;
+  if (/^\d+$/.test(raw)) return Number(raw);
+  if (raw === "十") return 10;
+  if (raw.includes("十")) {
+    const [before, after] = raw.split("十");
+    const tens = before ? agendaChineseDigits[before] || 0 : 1;
+    const ones = after ? agendaChineseDigits[after] || 0 : 0;
+    return tens * 10 + ones;
+  }
+  return agendaChineseDigits[raw] ?? null;
+}
+
+function agendaTimeOfDayFromText(text) {
+  const match = String(text || "").match(/(上午|下午|晚上|中午|早上)?\s*([0-2]?\d|[一二三四五六七八九十两]{1,3})\s*(?:点|[:：])\s*([0-5]?\d)?/);
+  if (!match) return null;
+  const period = match[1] || "";
+  let hour = agendaHourFromChinese(match[2]);
+  const minute = Number(match[3] || 0);
+  if (hour === null || hour > 23 || minute > 59) return null;
+  if ((period === "下午" || period === "晚上") && hour >= 1 && hour < 12) hour += 12;
+  if (period === "中午" && hour < 11) hour += 12;
+  return { hour, minute };
+}
+
+function agendaEventDate(item) {
+  const timeWindow = item.time_window || {};
+  const timestamp = timeWindow.source_event_timestamp || item.metadata?.event_timestamp || item.created_at;
+  const parsed = timestamp ? new Date(timestamp) : new Date();
+  return Number.isNaN(parsed.getTime()) ? new Date() : parsed;
+}
+
+function agendaRelativeDateFromText(text, eventDate) {
+  const raw = String(text || "");
+  if (raw.includes("后天")) return agendaAddDays(eventDate, 2);
+  if (raw.includes("明天")) return agendaAddDays(eventDate, 1);
+  if (raw.includes("今天") || raw.includes("今晚")) return eventDate;
+  const weekdayMatch = raw.match(/(下周)?(?:周|星期|礼拜)([一二三四五六日天])/);
+  if (!weekdayMatch) return null;
+  const target = agendaChineseWeekdays[weekdayMatch[2]];
+  if (target === undefined) return null;
+  const current = (eventDate.getDay() + 6) % 7;
+  let days = (target - current + 7) % 7;
+  if (weekdayMatch[1]) days += 7;
+  return agendaAddDays(eventDate, days);
+}
+
+function resolvedAgendaWindowFromRaw(item) {
+  const timeWindow = item.time_window || {};
+  const raw = timeWindow.raw_text || item.title || "";
+  const eventDate = agendaEventDate(item);
+  const targetDate = agendaRelativeDateFromText(raw, eventDate);
+  if (!targetDate) return null;
+  const dateKey = agendaDateKeyFromDate(targetDate);
+  const weekday = agendaWeekdayLabel(targetDate);
+  const time = agendaTimeOfDayFromText(raw);
+  if (!time) return { date: dateKey, display: `${dateKey} ${weekday}` };
+  return {
+    date: dateKey,
+    display: `${dateKey} ${weekday} ${String(time.hour).padStart(2, "0")}:${String(time.minute).padStart(2, "0")}`,
+  };
+}
+
+function agendaDateKeyForItem(item) {
+  const timeWindow = item.time_window || {};
+  if (timeWindow.date) return String(timeWindow.date).slice(0, 10);
+  const start = timeWindow.start || timeWindow.start_at;
+  if (start) {
+    const parsed = new Date(start);
+    if (!Number.isNaN(parsed.getTime())) return agendaDateKeyFromDate(parsed);
+    return String(start).slice(0, 10);
+  }
+  return resolvedAgendaWindowFromRaw(item)?.date || "";
+}
+
+function formatAgendaTimeWindow(timeWindow = {}, item = {}) {
+  if (timeWindow.display) return timeWindow.display;
+  const resolved = resolvedAgendaWindowFromRaw(item);
+  if (resolved?.display) return resolved.display;
+  if (timeWindow.date) {
+    const date = agendaDateFromKey(String(timeWindow.date).slice(0, 10));
+    return `${String(timeWindow.date).slice(0, 10)} ${agendaWeekdayLabel(date)}`;
+  }
+  const start = timeWindow.start || timeWindow.start_at;
+  if (start) {
+    const parsed = new Date(start);
+    if (!Number.isNaN(parsed.getTime())) {
+      return `${agendaDateKeyFromDate(parsed)} ${agendaWeekdayLabel(parsed)} ${String(parsed.getHours()).padStart(2, "0")}:${String(parsed.getMinutes()).padStart(2, "0")}`;
+    }
+    return String(start);
+  }
+  if (!timeWindow || typeof timeWindow !== "object") return "未记录";
+  if (timeWindow.text) return timeWindow.text;
+  if (timeWindow.raw_text) return timeWindow.raw_text;
+  return "未记录";
+}
+
+function agendaRelativeTitleTimeText(text) {
+  const raw = String(text || "");
+  const patterns = [
+    /(今天|今晚|明天|后天)\s*(早上|上午|中午|下午|晚上)?\s*([0-2]?\d|[一二三四五六七八九十两]{1,3})\s*(?:点|[:：])\s*([0-5]?\d)?/,
+    /(下周)?\s*(?:周|星期|礼拜)([一二三四五六日天])\s*(早上|上午|中午|下午|晚上)?\s*([0-2]?\d|[一二三四五六七八九十两]{1,3})\s*(?:点|[:：])\s*([0-5]?\d)?/,
+    /(今天|今晚|明天|后天)/,
+    /(下周)?\s*(?:周|星期|礼拜)([一二三四五六日天])/,
+  ];
+  for (const pattern of patterns) {
+    const match = raw.match(pattern);
+    if (match?.[0]) return match[0];
+  }
+  return "";
+}
+
+function formatAgendaTitle(item = {}) {
+  const originalTitle = item.title || "未命名日程";
+  const timeWindow = item.time_window || {};
+  const relativeText = timeWindow.raw_text || timeWindow.text || "";
+  const resolved = resolvedAgendaWindowFromRaw(item);
+  if (!resolved?.display) {
+    return originalTitle;
+  }
+  const replacementTarget = relativeText && originalTitle.includes(relativeText)
+    ? relativeText
+    : agendaRelativeTitleTimeText(originalTitle);
+  if (!replacementTarget) return originalTitle;
+  return originalTitle
+    .replace(replacementTarget, `${resolved.display} `)
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+async function loadAgenda() {
+  agendaContent.textContent = "加载中...";
+  try {
+    const data = await api("/api/agenda?limit=50");
+    agendaItems = data.items || [];
+    if (!selectedAgendaDate) {
+      selectedAgendaDate = agendaItems.map(agendaDateKeyForItem).find(Boolean) || agendaDateKeyFromDate(new Date());
+    }
+    renderAgenda();
+  } catch {
+    agendaContent.textContent = "无法读取日程。";
+  }
+}
+
+function renderAgenda() {
+  agendaContent.textContent = "";
+  renderAgendaDayTabs();
+  const activeItems = agendaItems.filter((item) => !["done", "dismissed", "cancelled", "canceled"].includes(item.status));
+  const closedItems = agendaItems.filter((item) => ["done", "dismissed", "cancelled", "canceled"].includes(item.status));
+  const selectedActive = activeItems.filter((item) => agendaDateKeyForItem(item) === selectedAgendaDate);
+  const selectedClosed = closedItems.filter((item) => agendaDateKeyForItem(item) === selectedAgendaDate).slice(0, 8);
+  const undatedItems = activeItems.filter((item) => !agendaDateKeyForItem(item)).slice(0, 8);
+  renderAgendaSection("当天日程", selectedActive);
+  renderAgendaSection("当天已处理", selectedClosed);
+  if (!selectedActive.length && !selectedClosed.length) agendaContent.appendChild(emptyCard("当天暂无日程"));
+  renderAgendaSection("时间未定", undatedItems);
+}
+
+function renderAgendaDayTabs() {
+  agendaDayTabs.textContent = "";
+  const selectedDate = agendaDateFromKey(selectedAgendaDate || agendaDateKeyFromDate(new Date()));
+  const weekStart = agendaStartOfWeek(selectedDate);
+  const counts = new Map();
+  for (const item of agendaItems) {
+    const dateKey = agendaDateKeyForItem(item);
+    if (dateKey) counts.set(dateKey, (counts.get(dateKey) || 0) + 1);
+  }
+  for (let index = 0; index < 7; index += 1) {
+    const date = agendaAddDays(weekStart, index);
+    const dateKey = agendaDateKeyFromDate(date);
+    const tab = button("");
+    tab.className = `agenda-day-tab${dateKey === selectedAgendaDate ? " active" : ""}`;
+    tab.setAttribute("role", "tab");
+    tab.setAttribute("aria-selected", dateKey === selectedAgendaDate ? "true" : "false");
+    tab.innerHTML = `<span>${agendaWeekdayLabel(date)}</span><strong>${date.getMonth() + 1}/${date.getDate()}</strong>${counts.get(dateKey) ? `<em>${counts.get(dateKey)}</em>` : ""}`;
+    tab.addEventListener("click", () => {
+      selectedAgendaDate = dateKey;
+      renderAgenda();
+    });
+    agendaDayTabs.appendChild(tab);
+  }
+}
+
+function renderAgendaSection(title, items) {
+  if (!items.length) return;
+  const heading = document.createElement("h3");
+  heading.textContent = title;
+  agendaContent.appendChild(heading);
+  for (const item of items) agendaContent.appendChild(renderAgendaItem(item));
+}
+
+function renderAgendaItem(item) {
+  const node = card("card agenda-card");
+  const meta = document.createElement("time");
+  meta.textContent = `${agendaTypeText(item.type)} · ${agendaStatusText(item.status)} · ${agendaCertaintyText(item.certainty)} · ${Number(item.confidence || 0).toFixed(2)}`;
+  const title = document.createElement("strong");
+  title.textContent = formatAgendaTitle(item);
+  const detail = document.createElement("p");
+  const missingFields = (item.missing_fields || []).map(missingFieldText);
+  const detailLines = [
+    `时间：${formatAgendaTimeWindow(item.time_window, item)}`,
+    `地点：${item.place || "未记录"}`,
+    `参与：${(item.participants || []).join("、") || "未记录"}`,
+  ];
+  if (missingFields.length) detailLines.push(`待补充：${missingFields.join("、")}`);
+  if (item.metadata?.source || item.source_event_ids?.length) {
+    detailLines.push(`来源：${item.metadata?.source || "本地事件"}${item.source_event_ids?.length ? ` · ${item.source_event_ids.length} 条证据` : ""}`);
+  }
+  detail.textContent = detailLines.join("\n");
+  node.append(meta, title, detail);
+
+  const actions = document.createElement("div");
+  actions.className = "actions";
+  if (!["done", "dismissed", "cancelled", "canceled"].includes(item.status)) {
+    const snooze = button("稍后提醒");
+    snooze.addEventListener("click", () => snoozeAgendaItem(item.id));
+    const done = button("完成");
+    done.addEventListener("click", () => updateAgendaItemStatus(item.id, "done"));
+    const dismiss = button("忽略");
+    dismiss.addEventListener("click", () => updateAgendaItemStatus(item.id, "dismissed"));
+    actions.append(snooze, done, dismiss);
+  }
+  if (actions.children.length) node.appendChild(actions);
+  return node;
+}
+
+if (typeof window !== "undefined") {
+  window.nomiAgendaDebug = {
+    agendaDateKeyForItem,
+    formatAgendaTitle,
+    formatAgendaTimeWindow,
+    resolvedAgendaWindowFromRaw,
+  };
+}
+
+async function updateAgendaItemStatus(id, status) {
+  await api(`/api/agenda/${id}`, {
+    method: "PATCH",
+    body: JSON.stringify({ status, reason: `user marked agenda ${status} from workbench` }),
+  });
+  await loadAgenda();
+}
+
+async function snoozeAgendaItem(id) {
+  const snoozedUntil = new Date(Date.now() + 60 * 60 * 1000).toISOString();
+  await api(`/api/agenda/${id}/snooze`, {
+    method: "POST",
+    body: JSON.stringify({ snoozed_until: snoozedUntil, reason: "user snoozed from workbench" }),
+  });
+  await loadAgenda();
 }
 
 async function loadSuggestions() {
@@ -671,25 +1284,78 @@ loginForm.addEventListener("submit", async (event) => {
   }
 });
 
-chatForm.addEventListener("submit", async (event) => {
-  event.preventDefault();
+async function submitChatMessage() {
   const text = messageInput.value.trim();
   if (!text) return;
   messageInput.value = "";
   addMessage("user", text);
+  refocusMessageInput();
   if (realtimeReady && realtimeSocket?.readyState === WebSocket.OPEN) {
-    activeAssistantNode = addMessage("assistant", "");
-    realtimeSocket.send(JSON.stringify({ type: "chat_message", message: text }));
+    activeAssistantNode = addMessage("assistant", realtimePendingText);
+    realtimeChatHadDelta = false;
+    startRealtimeChatWatchdog();
+    try {
+      realtimeSocket.send(
+        JSON.stringify({
+          type: "chat_message",
+          message: text,
+          conversation_id: chatConversationId || undefined,
+        })
+      );
+    } catch {
+      failActiveRealtimeChat("实时通道发送失败，请重新发送或检查网络。");
+    }
+    refocusMessageInput();
     return;
   }
-  const pendingNode = addMessage("assistant", "正在结合本地记忆思考...");
+  const pendingNode = addMessage("assistant", realtimePendingText);
   try {
-    const result = await api("/api/chat", { method: "POST", body: JSON.stringify({ message: text }) });
+    const result = await api("/api/chat", {
+      method: "POST",
+      body: JSON.stringify({ message: text, conversation_id: chatConversationId || undefined }),
+    });
+    if (result.conversation_id) setChatConversationId(result.conversation_id);
     pendingNode.textContent = result.answer;
     if (result.sources?.length) pendingNode.appendChild(renderSources(result.sources));
   } catch {
     pendingNode.textContent = "请求失败，请检查模型服务或访问密码。";
+  } finally {
+    refocusMessageInput();
   }
+}
+
+chatForm.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  await submitChatMessage();
+});
+
+function preserveComposerFocus(event) {
+  event.preventDefault();
+  refocusMessageInput();
+}
+
+chatSubmitButton.addEventListener("pointerdown", preserveComposerFocus);
+chatSubmitButton.addEventListener("touchstart", preserveComposerFocus, { passive: false });
+chatSubmitButton.addEventListener("mousedown", preserveComposerFocus);
+chatSubmitButton.addEventListener("touchend", (event) => {
+  event.preventDefault();
+  lastTouchSubmitAt = Date.now();
+  refocusMessageInput();
+  submitChatMessage();
+}, { passive: false });
+chatSubmitButton.addEventListener("click", (event) => {
+  event.preventDefault();
+  if (Date.now() - lastTouchSubmitAt < 700) {
+    refocusMessageInput();
+    return;
+  }
+  refocusMessageInput();
+  submitChatMessage();
+});
+
+messages.addEventListener("pointerdown", () => {
+  messageInput.blur();
+  setTimeout(updateViewportMetrics, 120);
 });
 
 window.addEventListener("hashchange", () => {
@@ -707,6 +1373,7 @@ governanceFilters.addEventListener("submit", (event) => {
   loadGovernance();
 });
 refreshGovernance.addEventListener("click", loadGovernance);
+refreshAgenda.addEventListener("click", loadAgenda);
 refreshSuggestions.addEventListener("click", loadSuggestions);
 refreshCollectors.addEventListener("click", loadCollectors);
 refreshTools.addEventListener("click", loadTools);

@@ -60,7 +60,7 @@ public final class FloatingPanelLayoutTest {
     }
 
     @Test
-    public void estimatesKeyboardTopWhenInputIsFocusedButInsetsAreUnavailable() {
+    public void estimatesKeyboardTopWhenInputIsFocused() {
         int visibleBottom = FloatingPanelLayout.visibleBottomForInputFocus(
                 900,
                 900,
@@ -73,7 +73,7 @@ public final class FloatingPanelLayoutTest {
     }
 
     @Test
-    public void trustsDetectedKeyboardTopWhenInsetsAreAvailable() {
+    public void keepsFocusedKeyboardTopStableWhenVisibleFrameChanges() {
         int visibleBottom = FloatingPanelLayout.visibleBottomForInputFocus(
                 900,
                 620,
@@ -82,6 +82,32 @@ public final class FloatingPanelLayoutTest {
                 120
         );
 
-        assertEquals(620, visibleBottom);
+        assertEquals(580, visibleBottom);
+    }
+
+    @Test
+    public void ignoresShrunkenOverlayVisibleFrameWhenInputIsFocused() {
+        int visibleBottom = FloatingPanelLayout.visibleBottomForInputFocus(
+                900,
+                420,
+                true,
+                320,
+                120
+        );
+
+        assertEquals(580, visibleBottom);
+    }
+
+    @Test
+    public void restoresFullVisibleBottomWhenInputLosesFocus() {
+        int visibleBottom = FloatingPanelLayout.visibleBottomForInputFocus(
+                900,
+                420,
+                false,
+                320,
+                120
+        );
+
+        assertEquals(900, visibleBottom);
     }
 }

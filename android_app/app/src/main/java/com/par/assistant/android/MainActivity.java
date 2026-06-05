@@ -1,9 +1,12 @@
 package com.par.assistant.android;
 
+import android.Manifest;
 import android.content.Intent;
+import android.content.pm.PackageManager;
 import android.graphics.Color;
 import android.graphics.drawable.GradientDrawable;
 import android.net.Uri;
+import android.os.Build;
 import android.os.Bundle;
 import android.provider.Settings;
 import android.view.Gravity;
@@ -20,6 +23,8 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
 public final class MainActivity extends Activity {
+    static final String EXTRA_REQUEST_MICROPHONE = "com.par.assistant.android.REQUEST_MICROPHONE";
+    private static final int REQUEST_RECORD_AUDIO = 2001;
     private final ExecutorService executor = Executors.newSingleThreadExecutor();
     private EditText baseUrlInput;
     private EditText passwordInput;
@@ -29,6 +34,9 @@ public final class MainActivity extends Activity {
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         setContentView(buildView());
+        if (getIntent() != null && getIntent().getBooleanExtra(EXTRA_REQUEST_MICROPHONE, false)) {
+            requestMicrophoneIfNeeded();
+        }
     }
 
     private LinearLayout buildView() {
@@ -135,6 +143,26 @@ public final class MainActivity extends Activity {
         }
         startForegroundService(new Intent(this, FloatingBallService.class));
         closePageOnly();
+    }
+
+    private void requestMicrophoneIfNeeded() {
+        if (Build.VERSION.SDK_INT < 23 || checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
+            statusText.setText("麦克风已授权。按住 Nomi 悬浮球即可语音输入。");
+            return;
+        }
+        statusText.setText("请授权麦克风，授权后按住 Nomi 悬浮球说话。");
+        requestPermissions(new String[] {Manifest.permission.RECORD_AUDIO}, REQUEST_RECORD_AUDIO);
+    }
+
+    @Override
+    public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+        if (requestCode != REQUEST_RECORD_AUDIO) return;
+        boolean granted = grantResults.length > 0 && grantResults[0] == PackageManager.PERMISSION_GRANTED;
+        statusText.setText(granted ? "麦克风已授权。按住 Nomi 悬浮球即可语音输入。" : "没有麦克风权限，暂时无法语音输入。");
+        if (granted && Settings.canDrawOverlays(this)) {
+            startForegroundService(new Intent(this, FloatingBallService.class));
+        }
     }
 
     private void closePageOnly() {

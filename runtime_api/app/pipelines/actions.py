@@ -684,7 +684,7 @@ def _extract_destination(request: str) -> str | None:
     for pattern in (r"(?:去|到|前往)([^，。,.!?？]+?)(?:要多久|怎么走|路线|打车|$)", r"route to ([^,.!?]+)"):
         match = re.search(pattern, request, flags=re.IGNORECASE)
         if match:
-            return _clean_phrase(match.group(1))
+            return _clean_phrase(re.sub(r"(?:的|地)$", "", match.group(1).strip()))
     return None
 
 
@@ -715,6 +715,9 @@ def _extract_counterparty(request: str) -> str | None:
 
 
 def _extract_amount_or_bill(request: str) -> str | None:
+    bill_match = re.search(r"\b(?:INV|INVOICE|BILL)[-_A-Z0-9]+\b", request, flags=re.IGNORECASE)
+    if bill_match:
+        return bill_match.group(0).strip()
     match = re.search(r"(\d+(?:\.\d+)?\s*(?:元|块|rmb|usd|dollars?)(?:[^，。,.!?？]*)?)", request, flags=re.IGNORECASE)
     return _clean_phrase(match.group(1)) if match else None
 
@@ -723,7 +726,13 @@ def _extract_file_or_query(request: str) -> str | None:
     match = re.search(r"([^，。,.!?？\s]+\.(?:docx?|xlsx?|pdf|txt|md|csv))", request, flags=re.IGNORECASE)
     if match:
         return match.group(1).strip()
-    cleaned = re.sub(r"(总结一下|总结|读取|打开|查找|写|分享|共享|帮我|please|summarize|read|find|write|share)", "", request, flags=re.IGNORECASE)
+    cleaned = re.sub(
+        r"(总结一下|总结|读取|打开|查一下|找一下|找一找|查找|帮我|请|麻烦|并?给我|给我|一下|写|分享|共享|please|summarize|read|find|write|share)",
+        "",
+        request,
+        flags=re.IGNORECASE,
+    )
+    cleaned = re.sub(r"[,，]?\s*并\s*[。.!！?？]?\s*$", "", cleaned)
     return _clean_phrase(cleaned)
 
 

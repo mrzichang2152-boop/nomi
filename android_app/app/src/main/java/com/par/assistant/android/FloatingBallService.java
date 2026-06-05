@@ -1,21 +1,27 @@
 package com.par.assistant.android;
 
+import android.Manifest;
 import android.app.Notification;
 import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import android.app.PendingIntent;
 import android.app.Service;
 import android.content.Intent;
+import android.content.pm.PackageManager;
+import android.content.pm.ServiceInfo;
 import android.graphics.Color;
 import android.graphics.Insets;
 import android.graphics.PixelFormat;
 import android.graphics.Rect;
 import android.graphics.drawable.GradientDrawable;
+import android.net.Uri;
 import android.os.Build;
+import android.os.Bundle;
 import android.os.IBinder;
 import android.view.Gravity;
 import android.view.MotionEvent;
 import android.view.View;
+import android.view.ViewConfiguration;
 import android.view.ViewTreeObserver;
 import android.view.WindowInsets;
 import android.view.WindowManager;
@@ -32,10 +38,14 @@ import com.par.assistant.core.SuggestionDeduper;
 
 import java.util.List;
 import java.util.Map;
+import java.util.UUID;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
 public final class FloatingBallService extends Service {
+    static final String ACTION_SHOW_ACCOUNTS = "com.par.assistant.android.SHOW_ACCOUNTS";
+    static final String ACTION_SHOW_EXTERNAL_AUTH_CLOSE = "com.par.assistant.android.SHOW_EXTERNAL_AUTH_CLOSE";
+    static final String EXTRA_AUTH_MESSAGE = "com.par.assistant.android.AUTH_MESSAGE";
     private static final String CHANNEL_ID = "par-floating-ball";
     private static final int NOTIFICATION_ID = 1001;
 
@@ -43,8 +53,10 @@ public final class FloatingBallService extends Service {
     private WindowManager windowManager;
     private NomiAvatarView ballView;
     private TextView bubbleView;
+    private Button externalAuthCloseView;
     private WindowManager.LayoutParams ballParams;
     private WindowManager.LayoutParams bubbleParams;
+    private WindowManager.LayoutParams externalAuthCloseParams;
     private WindowManager.LayoutParams panelParams;
     private LinearLayout panelView;
     private TextView responseView;
@@ -53,14 +65,24 @@ public final class FloatingBallService extends Service {
     private ScrollView accountsScrollView;
     private LinearLayout chatContentView;
     private LinearLayout settingsContentView;
+    private TextView settingsStatusView;
     private LinearLayout chatHistoryView;
     private ScrollView chatScrollView;
     private int unreadCount;
     private SuggestionPoller poller;
     private RealtimeClient realtimeClient;
+    private StreamingAsrClient streamingAsrClient;
+    private StreamingVoiceRecorder voiceRecorder;
     private ProactiveMessage lastProactiveMessage;
     private final FloatingChatContext chatContext = new FloatingChatContext();
+    private final StringBuilder streamingAnswerBuffer = new StringBuilder();
     private String activeConversationId;
+    private TextView streamingPendingView;
+    private String activeVoiceSessionId;
+    private int activeVoiceLastSeq;
+    private boolean activeVoiceReady;
+    private boolean activeVoiceFinishedByUser;
+    private TextView voicePanelMessageView;
     private ViewTreeObserver.OnGlobalLayoutListener panelLayoutListener;
     private int panelDefaultY;
     private int panelDefaultHeight;
@@ -80,13 +102,23 @@ public final class FloatingBallService extends Service {
     public void onCreate() {
         super.onCreate();
         windowManager = (WindowManager) getSystemService(WINDOW_SERVICE);
-        startForeground(NOTIFICATION_ID, notification("Nomi 正在陪伴你", "点击打开完整工作台"));
+        startNomiForeground(false);
         showBall();
         startRealtime();
     }
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
+        if (windowManager != null && ballView == null) {
+            showBall();
+        }
+        if (intent != null && ACTION_SHOW_ACCOUNTS.equals(intent.getAction())) {
+            showAccountsAfterExternalAuth(intent.getStringExtra(EXTRA_AUTH_MESSAGE));
+        }
+        if (intent != null && ACTION_SHOW_EXTERNAL_AUTH_CLOSE.equals(intent.getAction())) {
+            if (ballView == null) showBall();
+            showExternalAuthCloseButton();
+        }
         return START_STICKY;
     }
 
@@ -94,8 +126,10 @@ public final class FloatingBallService extends Service {
     public void onDestroy() {
         if (poller != null) poller.stop();
         if (realtimeClient != null) realtimeClient.stop();
+        stopVoiceSession(true);
         removeView(ballView);
         removeView(bubbleView);
+        removeView(externalAuthCloseView);
         closePanel();
         super.onDestroy();
     }
@@ -113,14 +147,44 @@ public final class FloatingBallService extends Service {
         ballParams.x = dp(12);
         ballParams.y = dp(140);
 
-        DragController drag = new DragController(ballParams, () -> togglePanel());
-        ballView.setOnTouchListener(drag);
-        ballView.setOnLongClickListener(view -> {
-            Intent intent = new Intent(this, MainActivity.class);
-            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
-            startActivity(intent);
-            return true;
-        });
+        float touchSlop = ViewConfiguration.get(this).getScaledTouchSlop();
+        ballView.setOnTouchListener(new VoicePressController(450, touchSlop, dp(96), new VoicePressController.DecisionCallback() {
+            @Override
+            public void onTap() {
+                togglePanel();
+            }
+
+            @Override
+            public void onDragMove(int x, int y) {
+                moveBallToRawPosition(x, y);
+            }
+
+            @Override
+            public void onDragEnd(int x, int y) {
+                moveBallToRawPosition(x, y);
+                snapBallToEdge();
+            }
+
+            @Override
+            public void onVoiceStart() {
+                startVoiceInput();
+            }
+
+            @Override
+            public void onVoiceCancelArmed(boolean armed) {
+                showVoiceBubble(armed ? "松手取消" : "正在听...");
+            }
+
+            @Override
+            public void onVoiceEnd() {
+                finishVoiceInput();
+            }
+
+            @Override
+            public void onVoiceCancelled() {
+                cancelVoiceInput("user_swiped_cancel");
+            }
+        }));
         windowManager.addView(ballView, ballParams);
     }
 
@@ -240,6 +304,7 @@ public final class FloatingBallService extends Service {
         panelParams.softInputMode = WindowManager.LayoutParams.SOFT_INPUT_ADJUST_NOTHING;
         windowManager.addView(panelView, panelParams);
         attachPanelKeyboardListener();
+        loadRemoteChatHistory();
     }
 
     private void sendMessage(String text) {
@@ -251,6 +316,9 @@ public final class FloatingBallService extends Service {
         TextView pending = addChatMessage("Nomi", "正在思考...");
         responseView.setText("");
         String conversationId = activeConversationId;
+        if (trySendStreamingChat(trimmed, conversationId, pending)) {
+            return;
+        }
         executor.execute(() -> {
             try {
                 ChatResult result = api().chat(trimmed, conversationId, clientContext);
@@ -268,6 +336,296 @@ public final class FloatingBallService extends Service {
         });
     }
 
+    private boolean trySendStreamingChat(String message, String conversationId, TextView pending) {
+        if (realtimeClient == null || streamingPendingView != null) {
+            return false;
+        }
+        streamingPendingView = pending;
+        streamingAnswerBuffer.setLength(0);
+        try {
+            boolean sent = realtimeClient.sendChatMessage(message, conversationId, 80, "android");
+            if (!sent) {
+                clearStreamingChatState();
+            }
+            return sent;
+        } catch (Exception error) {
+            clearStreamingChatState();
+            return false;
+        }
+    }
+
+    private void applyStreamingChatDelta(String delta) {
+        if (streamingPendingView == null) return;
+        if (delta != null) {
+            streamingAnswerBuffer.append(delta);
+        }
+        String answer = streamingAnswerBuffer.toString().trim();
+        streamingPendingView.setText(messageText("Nomi", answer.isEmpty() ? "正在思考..." : answer));
+    }
+
+    private void completeStreamingChat(String answer, String conversationId) {
+        if (streamingPendingView == null) return;
+        if (conversationId != null && !conversationId.trim().isEmpty()) {
+            activeConversationId = conversationId.trim();
+        }
+        String finalAnswer = answer == null || answer.trim().isEmpty()
+                ? streamingAnswerBuffer.toString().trim()
+                : answer.trim();
+        if (finalAnswer.isEmpty()) {
+            finalAnswer = "已发送，但没有返回内容。";
+        }
+        streamingPendingView.setText(messageText("Nomi", finalAnswer));
+        chatContext.addAssistant(finalAnswer);
+        clearStreamingChatState();
+    }
+
+    private void failStreamingChat(String message) {
+        if (streamingPendingView == null) return;
+        String reason = message == null || message.trim().isEmpty() ? "实时通道异常" : message.trim();
+        streamingPendingView.setText(messageText("Nomi", "发送失败：" + reason));
+        clearStreamingChatState();
+    }
+
+    private void clearStreamingChatState() {
+        streamingPendingView = null;
+        streamingAnswerBuffer.setLength(0);
+    }
+
+    private void startVoiceInput() {
+        if (!hasMicrophonePermission()) {
+            showVoiceBubble("请允许麦克风权限。");
+            startActivity(MicrophonePermissionActivity.intent(this, "voice_long_press"));
+            return;
+        }
+        stopVoiceSession(false);
+        activeVoiceSessionId = UUID.randomUUID().toString();
+        activeVoiceLastSeq = 0;
+        activeVoiceReady = false;
+        activeVoiceFinishedByUser = false;
+        voicePanelMessageView = null;
+        showVoiceBubble("正在连接语音识别...");
+        if (panelView != null) {
+            voicePanelMessageView = addChatMessage("Nomi", "按住说话，我正在连接语音识别...");
+        }
+        try {
+            streamingAsrClient = new StreamingAsrClient(ConfigPrefs.read(this), new StreamingAsrClient.Callback() {
+                @Override
+                public void onReady(String sessionId, String provider, int maxDurationMs) {
+                    runOnMain(() -> {
+                        activeVoiceReady = true;
+                        showVoiceBubble("正在听...");
+                        updateVoicePanelMessage("正在听...");
+                        startVoiceRecorder();
+                        if (activeVoiceFinishedByUser) {
+                            finishVoiceInput();
+                        }
+                    });
+                }
+
+                @Override
+                public void onPartial(String text, double confidence, boolean stable) {
+                    runOnMain(() -> {
+                        String partial = text == null || text.trim().isEmpty() ? "正在听..." : text.trim();
+                        showVoiceBubble(partial);
+                        updateVoicePanelMessage("识别中\n" + partial);
+                    });
+                }
+
+                @Override
+                public void onFinal(String text, double confidence, String transcriptId) {
+                    runOnMain(() -> handleVoiceFinal(text, confidence));
+                }
+
+                @Override
+                public void onError(String code, String message) {
+                    runOnMain(() -> failVoiceInput(message));
+                }
+
+                @Override
+                public void onClosed() {
+                    runOnMain(() -> {
+                        if (activeVoiceSessionId != null) {
+                            failVoiceInput("语音识别连接已断开。");
+                        }
+                    });
+                }
+            });
+            streamingAsrClient.start(activeVoiceSessionId, activeConversationId, "zh-CN");
+        } catch (Exception error) {
+            failVoiceInput("语音识别启动失败：" + error.getMessage());
+        }
+    }
+
+    private void startVoiceRecorder() {
+        if (voiceRecorder != null && voiceRecorder.isRecording()) return;
+        startNomiForeground(true);
+        voiceRecorder = new StreamingVoiceRecorder();
+        boolean started = voiceRecorder.start(new StreamingVoiceRecorder.Callback() {
+            @Override
+            public void onAudioChunk(byte[] pcm, int seq, long capturedAtMs) {
+                StreamingAsrClient client = streamingAsrClient;
+                String sessionId = activeVoiceSessionId;
+                activeVoiceLastSeq = seq;
+                if (client != null && sessionId != null) {
+                    client.sendAudioChunk(sessionId, pcm, seq, capturedAtMs);
+                }
+            }
+
+            @Override
+            public void onLevel(float rms) {
+            }
+
+            @Override
+            public void onRecorderError(String userVisibleMessage, Throwable error) {
+                runOnMain(() -> failVoiceInput(userVisibleMessage));
+            }
+        });
+        if (!started) {
+            startNomiForeground(false);
+            failVoiceInput("录音启动失败。");
+        }
+    }
+
+    private void finishVoiceInput() {
+        if (activeVoiceSessionId == null) return;
+        activeVoiceFinishedByUser = true;
+        if (voiceRecorder != null) {
+            voiceRecorder.stop();
+        }
+        showVoiceBubble(activeVoiceReady ? "正在识别..." : "正在连接语音识别...");
+        updateVoicePanelMessage(activeVoiceReady ? "正在识别..." : "正在连接语音识别...");
+        StreamingAsrClient client = streamingAsrClient;
+        if (client != null && activeVoiceReady) {
+            client.finish(activeVoiceSessionId, activeVoiceLastSeq);
+        }
+    }
+
+    private void cancelVoiceInput(String reason) {
+        if (activeVoiceSessionId == null) {
+            showVoiceBubble("已取消语音输入。");
+            return;
+        }
+        if (voiceRecorder != null) voiceRecorder.stop();
+        if (streamingAsrClient != null) streamingAsrClient.cancel(activeVoiceSessionId, reason);
+        stopVoiceSession(false);
+        showVoiceBubble("已取消语音输入。");
+        updateVoicePanelMessage("已取消语音输入。");
+    }
+
+    private void handleVoiceFinal(String text, double confidence) {
+        String transcript = text == null ? "" : text.trim();
+        stopVoiceSession(false);
+        if (transcript.isEmpty() || confidence < 0.55) {
+            showVoiceBubble("没听清，再说一次。");
+            updateVoicePanelMessage("没听清，再说一次。");
+            return;
+        }
+        if (confidence < 0.78) {
+            showVoiceConfirmBubble(transcript);
+            updateVoicePanelMessage("我听到的是：\n" + transcript + "\n如正确，请点击气泡发送。");
+            return;
+        }
+        removeBubble();
+        updateVoicePanelMessage("已识别：\n" + transcript);
+        sendMessage(transcript);
+    }
+
+    private void failVoiceInput(String message) {
+        String visible = message == null || message.trim().isEmpty() ? "语音识别失败，请稍后重试。" : message.trim();
+        stopVoiceSession(false);
+        showVoiceBubble(visible);
+        updateVoicePanelMessage(visible);
+    }
+
+    private void stopVoiceSession(boolean cancelProvider) {
+        if (voiceRecorder != null) {
+            voiceRecorder.stop();
+            voiceRecorder = null;
+        }
+        startNomiForeground(false);
+        if (streamingAsrClient != null) {
+            if (cancelProvider && activeVoiceSessionId != null) {
+                streamingAsrClient.cancel(activeVoiceSessionId, "service_stopped");
+            } else {
+                streamingAsrClient.stop();
+            }
+            streamingAsrClient = null;
+        }
+        activeVoiceSessionId = null;
+        activeVoiceLastSeq = 0;
+        activeVoiceReady = false;
+        activeVoiceFinishedByUser = false;
+    }
+
+    private void updateVoicePanelMessage(String text) {
+        if (voicePanelMessageView != null) {
+            voicePanelMessageView.setText(messageText("Nomi", text == null ? "" : text));
+        }
+    }
+
+    private boolean hasMicrophonePermission() {
+        return Build.VERSION.SDK_INT < 23 || checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED;
+    }
+
+    private void startNomiForeground(boolean withMicrophone) {
+        Notification foregroundNotification = notification(
+                withMicrophone ? "Nomi 正在听你说话" : "Nomi 正在陪伴你",
+                withMicrophone ? "松开悬浮球后发送语音输入" : "点击打开完整工作台"
+        );
+        if (Build.VERSION.SDK_INT >= 34) {
+            int type = ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE;
+            if (withMicrophone) {
+                type |= ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE;
+            }
+            startForeground(NOTIFICATION_ID, foregroundNotification, type);
+        } else if (Build.VERSION.SDK_INT >= 29 && withMicrophone) {
+            startForeground(NOTIFICATION_ID, foregroundNotification, ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE);
+        } else {
+            startForeground(NOTIFICATION_ID, foregroundNotification);
+        }
+    }
+
+    private void loadRemoteChatHistory() {
+        int localSizeAtRequest = chatContext.size();
+        String conversationId = activeConversationId;
+        executor.execute(() -> {
+            try {
+                ChatHistoryResult history = api().chatHistory(conversationId, 80);
+                runOnMain(() -> applyRemoteChatHistory(history, localSizeAtRequest));
+            } catch (Exception error) {
+                runOnMain(() -> {
+                    if (responseView != null) {
+                        responseView.setText("历史对话加载失败：" + error.getMessage());
+                    }
+                });
+            }
+        });
+    }
+
+    private void applyRemoteChatHistory(ChatHistoryResult history, int localSizeAtRequest) {
+        if (panelView == null || chatHistoryView == null || history == null || history.messages.isEmpty()) {
+            return;
+        }
+        if (chatContext.size() != localSizeAtRequest) {
+            return;
+        }
+        if (!history.conversationId.trim().isEmpty()) {
+            activeConversationId = history.conversationId.trim();
+        }
+        chatHistoryView.removeAllViews();
+        chatContext.replaceWithHistory(history.messages);
+        for (ChatHistoryMessage message : history.messages) {
+            addChatMessage(speakerForHistoryRole(message.role), message.content);
+        }
+        if (responseView != null) {
+            responseView.setText("");
+        }
+    }
+
+    private String speakerForHistoryRole(String role) {
+        return "user".equals(role) ? "你" : "Nomi";
+    }
+
     private void closePanel() {
         detachPanelKeyboardListener();
         removeView(panelView);
@@ -278,8 +636,10 @@ public final class FloatingBallService extends Service {
         accountsScrollView = null;
         chatContentView = null;
         settingsContentView = null;
+        settingsStatusView = null;
         chatHistoryView = null;
         chatScrollView = null;
+        voicePanelMessageView = null;
     }
 
     private void attachPanelKeyboardListener() {
@@ -357,7 +717,23 @@ public final class FloatingBallService extends Service {
 
                 @Override
                 public void onError(String message) {
-                    if (responseView != null) runOnMain(() -> responseView.setText("实时通道异常：" + message));
+                    runOnMain(() -> {
+                        if (streamingPendingView != null) {
+                            failStreamingChat(message);
+                        } else if (responseView != null) {
+                            responseView.setText("实时通道异常：" + message);
+                        }
+                    });
+                }
+
+                @Override
+                public void onChatDelta(String delta) {
+                    runOnMain(() -> applyStreamingChatDelta(delta));
+                }
+
+                @Override
+                public void onChatDone(String answer, String conversationId) {
+                    runOnMain(() -> completeStreamingChat(answer, conversationId));
                 }
             });
             realtimeClient.start();
@@ -404,6 +780,9 @@ public final class FloatingBallService extends Service {
         intent.putExtra(WebWorkspaceActivity.EXTRA_URL, ConfigPrefs.baseUrlOrDefault(this) + "#chat");
         intent.putExtra(WebWorkspaceActivity.EXTRA_PROACTIVE_TITLE, message.title);
         intent.putExtra(WebWorkspaceActivity.EXTRA_PROACTIVE_BODY, message.body);
+        if (message.rawJson != null && !message.rawJson.trim().isEmpty()) {
+            intent.putExtra(WebWorkspaceActivity.EXTRA_REALTIME_EVENT_JSON, message.rawJson);
+        }
         startActivity(intent);
         closePanel();
     }
@@ -414,6 +793,37 @@ public final class FloatingBallService extends Service {
         bubbleParams = null;
     }
 
+    private void showVoiceBubble(String text) {
+        removeBubble();
+        bubbleView = new TextView(this);
+        bubbleView.setText(text == null || text.trim().isEmpty() ? "正在听..." : text.trim());
+        bubbleView.setTextSize(13);
+        bubbleView.setTextColor(Color.rgb(15, 23, 42));
+        bubbleView.setPadding(dp(12), dp(8), dp(12), dp(8));
+        bubbleView.setMaxLines(4);
+        bubbleView.setBackground(rounded(Color.rgb(204, 251, 241), Color.rgb(20, 184, 166), 16));
+        bubbleView.setElevation(dp(8));
+        bubbleParams = overlayParams(dp(240), dp(86), false);
+        bubbleParams.gravity = Gravity.TOP | Gravity.START;
+        positionBubble();
+        windowManager.addView(bubbleView, bubbleParams);
+    }
+
+    private void showVoiceConfirmBubble(String transcript) {
+        String text = transcript == null ? "" : transcript.trim();
+        if (text.isEmpty()) {
+            showVoiceBubble("没听清，再说一次。");
+            return;
+        }
+        showVoiceBubble("我听到的是：\n" + text + "\n点此发送");
+        if (bubbleView != null) {
+            bubbleView.setOnClickListener(view -> {
+                removeBubble();
+                sendMessage(text);
+            });
+        }
+    }
+
     private void positionBubble() {
         if (bubbleParams == null || ballParams == null) return;
         int screenWidth = getResources().getDisplayMetrics().widthPixels;
@@ -421,6 +831,33 @@ public final class FloatingBallService extends Service {
         if (x + dp(230) > screenWidth) x = Math.max(0, ballParams.x - dp(234));
         bubbleParams.x = x;
         bubbleParams.y = Math.max(0, ballParams.y + dp(4));
+    }
+
+    private void moveBallToRawPosition(int rawX, int rawY) {
+        if (ballParams == null || ballView == null) return;
+        int width = Math.max(ballView.getWidth(), dp(72));
+        int height = Math.max(ballView.getHeight(), dp(72));
+        int screenWidth = getResources().getDisplayMetrics().widthPixels;
+        int screenHeight = getResources().getDisplayMetrics().heightPixels;
+        ballParams.x = clamp(rawX - width / 2, 0, Math.max(0, screenWidth - width));
+        ballParams.y = clamp(rawY - height / 2, 0, Math.max(0, screenHeight - height));
+        windowManager.updateViewLayout(ballView, ballParams);
+        positionBubble();
+        if (bubbleView != null && bubbleParams != null) windowManager.updateViewLayout(bubbleView, bubbleParams);
+    }
+
+    private void snapBallToEdge() {
+        if (ballParams == null || ballView == null) return;
+        int screenWidth = getResources().getDisplayMetrics().widthPixels;
+        int width = Math.max(ballView.getWidth(), dp(72));
+        ballParams.x = ballParams.x + width / 2 > screenWidth / 2 ? screenWidth - width : 0;
+        windowManager.updateViewLayout(ballView, ballParams);
+        positionBubble();
+        if (bubbleView != null && bubbleParams != null) windowManager.updateViewLayout(bubbleView, bubbleParams);
+    }
+
+    private int clamp(int value, int min, int max) {
+        return Math.max(min, Math.min(max, value));
     }
 
     private void buildSettingsView() {
@@ -447,12 +884,18 @@ public final class FloatingBallService extends Service {
         settingsContentView.addView(row);
 
         TextView note = new TextView(this);
-        note.setText("账号登录会打开服务器上的远程浏览器。");
+        note.setText("Gmail、Calendar 等工具授权会打开 Composio；WhatsApp 等网页登录会打开服务器远程浏览器。");
         note.setTextSize(12);
         note.setTextColor(Color.rgb(100, 116, 139));
         LinearLayout.LayoutParams noteParams = new LinearLayout.LayoutParams(-1, -2);
         noteParams.setMargins(0, dp(8), 0, dp(8));
         settingsContentView.addView(note, noteParams);
+
+        settingsStatusView = new TextView(this);
+        settingsStatusView.setText("");
+        settingsStatusView.setTextSize(12);
+        settingsStatusView.setTextColor(Color.rgb(15, 118, 110));
+        settingsContentView.addView(settingsStatusView, new LinearLayout.LayoutParams(-1, -2));
 
         accountsView = new LinearLayout(this);
         accountsView.setOrientation(LinearLayout.VERTICAL);
@@ -513,17 +956,43 @@ public final class FloatingBallService extends Service {
             accountsScrollView.setVisibility(View.GONE);
             return;
         }
+        openAccountsList("正在读取账号状态...");
+    }
+
+    private void showAccountsAfterExternalAuth(String message) {
+        if (windowManager == null) return;
+        removeExternalAuthCloseButton();
+        if (ballView == null) showBall();
+        if (panelView == null) {
+            removeBubble();
+            showPanel();
+        }
+        showSettingsView();
+        openAccountsList(
+                message == null || message.trim().isEmpty()
+                        ? "授权流程已返回，正在刷新账号状态。"
+                        : message.trim()
+        );
+    }
+
+    private void openAccountsList(String message) {
+        if (accountsView == null || accountsScrollView == null) return;
         renderAccountChannels(null);
         accountsScrollView.setVisibility(View.VISIBLE);
+        if (settingsStatusView != null) settingsStatusView.setText(message == null ? "" : message);
         executor.execute(() -> {
             try {
-                Map<String, CollectorStatus> statuses = api().collectorStatuses();
-                runOnMain(() -> renderAccountChannels(statuses));
+                Map<String, CollectorStatus> statuses = api().accountStatuses();
+                List<AssistantIdentity> identities = api().assistantIdentities();
+                runOnMain(() -> {
+                    renderAccountChannels(statuses, identities);
+                    if (settingsStatusView != null) settingsStatusView.setText("账号状态已刷新。");
+                });
             } catch (Exception error) {
                 runOnMain(() -> {
                     renderAccountChannels(null);
-                    if (responseView != null) {
-                        responseView.setText("账号状态读取失败，仍可打开服务器浏览器登录：" + error.getMessage());
+                    if (settingsStatusView != null) {
+                        settingsStatusView.setText("账号状态读取失败，仍可重新打开授权：" + error.getMessage());
                     }
                 });
             }
@@ -531,8 +1000,30 @@ public final class FloatingBallService extends Service {
     }
 
     private void renderAccountChannels(Map<String, CollectorStatus> statuses) {
+        renderAccountChannels(statuses, List.of());
+    }
+
+    private void renderAccountChannels(Map<String, CollectorStatus> statuses, List<AssistantIdentity> identities) {
         if (accountsView == null) return;
         accountsView.removeAllViews();
+
+        if (identities != null && !identities.isEmpty()) {
+            TextView identityHeading = new TextView(this);
+            identityHeading.setText("Nomi 身份");
+            identityHeading.setTextSize(15);
+            identityHeading.setTextColor(Color.rgb(15, 23, 42));
+            accountsView.addView(identityHeading);
+
+            TextView identityNote = new TextView(this);
+            identityNote.setText("这些是 Nomi 自己用来收发消息的身份，和你的个人账号分开管理。");
+            identityNote.setTextSize(12);
+            identityNote.setTextColor(Color.rgb(100, 116, 139));
+            accountsView.addView(identityNote);
+
+            for (AssistantIdentity identity : identities) {
+                accountsView.addView(assistantIdentityRow(identity));
+            }
+        }
 
         TextView heading = new TextView(this);
         heading.setText("支持的登录渠道");
@@ -541,7 +1032,7 @@ public final class FloatingBallService extends Service {
         accountsView.addView(heading);
 
         TextView note = new TextView(this);
-        note.setText("点击需要登录的渠道，会打开服务器上的远程浏览器。账号密码和扫码仍由你自己完成。");
+        note.setText("点击需要登录的渠道。工具授权会打开 Composio 登录页；网页会打开服务器浏览器。账号密码和扫码仍由你自己完成。");
         note.setTextSize(12);
         note.setTextColor(Color.rgb(100, 116, 139));
         accountsView.addView(note);
@@ -549,6 +1040,30 @@ public final class FloatingBallService extends Service {
         for (AccountChannel channel : ACCOUNT_CHANNELS) {
             accountsView.addView(accountRow(channel, statuses == null ? null : statuses.get(channel.source)));
         }
+    }
+
+    private View assistantIdentityRow(AssistantIdentity identity) {
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.VERTICAL);
+        row.setPadding(dp(10), dp(8), dp(10), dp(8));
+        row.setBackground(rounded(Color.rgb(240, 253, 250), Color.rgb(153, 246, 228), 12));
+
+        TextView title = new TextView(this);
+        title.setText(identity.displayName);
+        title.setTextSize(14);
+        title.setTextColor(Color.rgb(15, 23, 42));
+        row.addView(title);
+
+        TextView body = new TextView(this);
+        body.setText(identity.subtitle());
+        body.setTextSize(12);
+        body.setTextColor(Color.rgb(51, 65, 85));
+        row.addView(body);
+
+        LinearLayout.LayoutParams margins = new LinearLayout.LayoutParams(-1, -2);
+        margins.setMargins(0, dp(6), 0, 0);
+        row.setLayoutParams(margins);
+        return row;
     }
 
     private View accountRow(AccountChannel channel, CollectorStatus status) {
@@ -592,8 +1107,18 @@ public final class FloatingBallService extends Service {
         LinearLayout.LayoutParams margins = new LinearLayout.LayoutParams(-1, -2);
         margins.setMargins(0, dp(6), 0, 0);
         row.setLayoutParams(margins);
-        if (channel.opensBrowser) {
-            row.setOnClickListener(view -> openRemoteBrowser());
+        AccountChannelRoute route = AccountChannelRoute.forSource(channel.source);
+        if (route.shouldOpenForStatus(status)) {
+            row.setOnClickListener(view -> openAccountChannel(channel));
+        } else if (route.kind() == AccountChannelRoute.Kind.COMPOSIO_CONNECT
+                && status != null
+                && "healthy".equals(status.healthStatus)) {
+            row.setAlpha(0.82f);
+            row.setOnClickListener(view -> {
+                if (responseView != null) {
+                    responseView.setText(channel.name + " 已授权，不需要重新打开授权页。");
+                }
+            });
         }
         return row;
     }
@@ -630,12 +1155,110 @@ public final class FloatingBallService extends Service {
         return Color.rgb(254, 243, 199);
     }
 
-    private void openRemoteBrowser() {
+    private void openRemoteBrowser(String source) {
+        String normalizedSource = source == null ? "" : source.trim();
+        if (!normalizedSource.isEmpty()) {
+            if (responseView != null) responseView.setText("正在打开 " + normalizedSource + " 登录页...");
+            executor.execute(() -> {
+                try {
+                    api().requestRemoteBrowserOpen(normalizedSource);
+                } catch (Exception error) {
+                    runOnMain(() -> {
+                        if (responseView != null) {
+                            responseView.setText("远程浏览器导航失败，仍会打开浏览器：" + error.getMessage());
+                        }
+                    });
+                }
+            });
+        }
         Intent intent = new Intent(this, WebWorkspaceActivity.class);
         intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
         intent.putExtra(WebWorkspaceActivity.EXTRA_URL, ConfigPrefs.remoteBrowserUrl(this));
         startActivity(intent);
         closePanel();
+    }
+
+    private void openAccountChannel(AccountChannel channel) {
+        AccountChannelRoute route = AccountChannelRoute.forSource(channel.source);
+        if (route.kind() == AccountChannelRoute.Kind.COMPOSIO_CONNECT) {
+            if (responseView != null) responseView.setText("正在生成 " + channel.name + " 授权链接...");
+            executor.execute(() -> {
+                try {
+                    String redirectUrl = api().composioConnectUrl(route.composioToolkitSlug());
+                    runOnMain(() -> openExternalUrl(redirectUrl, route.requiresUnobstructedExternalAuth()));
+                } catch (Exception error) {
+                    runOnMain(() -> {
+                        if (responseView != null) {
+                            responseView.setText(channel.name + " 授权链接生成失败：" + error.getMessage());
+                        }
+                    });
+                }
+            });
+            return;
+        }
+        if (route.kind() == AccountChannelRoute.Kind.REMOTE_BROWSER) {
+            openRemoteBrowser(route.remoteBrowserSource());
+            return;
+        }
+        if (responseView != null) responseView.setText(channel.name + " 不需要网页登录授权。");
+    }
+
+    private void openExternalUrl(String url, boolean hideOverlays) {
+        if (hideOverlays) {
+            hideAssistantOverlaysForExternalAuth();
+        }
+        Intent intent = externalAuthIntent(url);
+        startActivity(intent);
+        if (!hideOverlays) {
+            closePanel();
+        }
+    }
+
+    private Intent externalAuthIntent(String url) {
+        Intent intent = new Intent(Intent.ACTION_VIEW, Uri.parse(url));
+        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+        Bundle customTabsExtras = new Bundle();
+        customTabsExtras.putBinder("android.support.customtabs.extra.SESSION", null);
+        intent.putExtras(customTabsExtras);
+        intent.putExtra("android.support.customtabs.extra.TITLE_VISIBILITY", 1);
+        return intent;
+    }
+
+    private void hideAssistantOverlaysForExternalAuth() {
+        closePanel();
+        removeBubble();
+        if (ballView == null) showBall();
+        showExternalAuthCloseButton();
+    }
+
+    private void showExternalAuthCloseButton() {
+        removeExternalAuthCloseButton();
+        externalAuthCloseView = closeButton();
+        externalAuthCloseView.setText("×");
+        externalAuthCloseView.setContentDescription("关闭授权页面");
+        externalAuthCloseView.setElevation(dp(14));
+        externalAuthCloseView.setOnClickListener(view -> closeExternalAuthPage());
+
+        externalAuthCloseParams = overlayParams(dp(56), dp(56), false);
+        externalAuthCloseParams.gravity = Gravity.TOP | Gravity.END;
+        externalAuthCloseParams.x = dp(12);
+        externalAuthCloseParams.y = dp(40);
+        windowManager.addView(externalAuthCloseView, externalAuthCloseParams);
+    }
+
+    private void removeExternalAuthCloseButton() {
+        removeView(externalAuthCloseView);
+        externalAuthCloseView = null;
+        externalAuthCloseParams = null;
+    }
+
+    private void closeExternalAuthPage() {
+        removeExternalAuthCloseButton();
+        Intent home = new Intent(Intent.ACTION_MAIN);
+        home.addCategory(Intent.CATEGORY_HOME);
+        home.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+        startActivity(home);
+        showAccountsAfterExternalAuth(ExternalAuthOverlayState.cancelMessage());
     }
 
     private void startSuggestionPolling() {

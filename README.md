@@ -1,6 +1,6 @@
-# Personal AI Runtime
+# Nomi
 
-Private-cloud personal context runtime based on Managed Chromium, event collectors, semantic memory, and personal search.
+Private-cloud personal assistant based on managed Chromium sessions, private event collectors, semantic memory, proactive suggestions, and tool pipelines.
 
 ## Local Development
 
@@ -44,7 +44,7 @@ JAVA_HOME=/path/to/jdk-17 gradle -p android_app :shared:test :app:assembleDebug
 The server entrypoint is nginx on port `80`.
 
 ```bash
-cd /opt/par
+cd /opt/nomi
 docker compose up -d --build
 ```
 
@@ -80,7 +80,7 @@ Postgres, Redis, and the FastAPI container stay inside Docker networking.
 Routine maintenance:
 
 ```bash
-cd /opt/par
+cd /opt/nomi
 bash scripts/db-maintenance.sh
 ```
 
@@ -93,6 +93,12 @@ http://your-server.example.com:6080/vnc.html
 ```
 
 Default VNC password is configured through `VNC_PASSWORD`.
+
+Before treating a private-cloud deployment as release-ready, walk through the production checklist:
+
+```text
+docs/superpowers/reports/2026-06-03-production-release-checklist.md
+```
 
 ## Services
 

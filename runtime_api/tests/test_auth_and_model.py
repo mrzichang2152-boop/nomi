@@ -155,6 +155,41 @@ def test_memory_delete_requires_password(monkeypatch):
     assert response.status_code == 401
 
 
+def test_model_status_endpoint_reports_configured_provider(monkeypatch):
+    monkeypatch.setenv("DATABASE_URL", "postgresql://test")
+    monkeypatch.setenv("REDIS_URL", "redis://test")
+    monkeypatch.setenv("APP_PASSWORD", "secret")
+    monkeypatch.setenv("MODEL_PROVIDER_ID", "qwen36_primary")
+    monkeypatch.setenv("MODEL_BASE_URL", "http://model.local:9161")
+    monkeypatch.setenv("MODEL_NAME", "qwen3.6")
+
+    from app import main
+
+    client = TestClient(main.app)
+    response = client.get("/api/model/status", headers={"x-par-password": "secret"})
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["active_provider_id"] == "qwen36_primary"
+    assert payload["unavailable"] is False
+    assert payload["providers"][0]["provider_id"] == "qwen36_primary"
+    assert payload["providers"][0]["model"] == "qwen3.6"
+    assert payload["providers"][0]["base_url"] == "http://model.local:9161"
+
+
+def test_model_status_endpoint_requires_password(monkeypatch):
+    monkeypatch.setenv("DATABASE_URL", "postgresql://test")
+    monkeypatch.setenv("REDIS_URL", "redis://test")
+    monkeypatch.setenv("APP_PASSWORD", "secret")
+
+    from app import main
+
+    client = TestClient(main.app)
+    response = client.get("/api/model/status")
+
+    assert response.status_code == 401
+
+
 def test_memory_delete_accepts_json_body_with_password(monkeypatch):
     monkeypatch.setenv("DATABASE_URL", "postgresql://test")
     monkeypatch.setenv("REDIS_URL", "redis://test")
@@ -190,6 +225,47 @@ def test_memory_delete_accepts_json_body_with_password(monkeypatch):
     assert response.status_code == 200
     assert response.json() == {"deleted": 1}
     assert "DELETE FROM semantic_memory" in executed[0][0]
+
+
+def test_memory_delete_can_remove_state_memory_and_write_audit(monkeypatch):
+    monkeypatch.setenv("DATABASE_URL", "postgresql://test")
+    monkeypatch.setenv("REDIS_URL", "redis://test")
+    monkeypatch.setenv("APP_PASSWORD", "secret")
+
+    from app import main
+
+    executed = []
+
+    class Cursor:
+        rowcount = 1
+
+    class Conn:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return None
+
+        def execute(self, sql, params=()):
+            executed.append((sql, params))
+            return Cursor()
+
+    monkeypatch.setattr(main, "db", lambda: Conn())
+
+    client = TestClient(main.app)
+    response = client.post(
+        "/memory/delete",
+        json={"state_key": "current_focus"},
+        headers={"x-par-password": "secret"},
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"deleted": 1}
+    assert "DELETE FROM memory_states WHERE key = %s" in executed[0][0]
+    assert executed[0][1] == ("current_focus",)
+    assert "INSERT INTO memory_audit_log" in executed[1][0]
+    assert executed[1][1][2] == "memory_state"
+    assert executed[1][1][3] == "current_focus"
 
 
 def test_collector_settings_can_pause_source_and_event_is_rejected(monkeypatch):
@@ -472,6 +548,148 @@ def test_collector_status_merges_settings_and_health(monkeypatch):
     assert gmail["details"] == {"preview_count": 10}
     assert whatsapp["enabled"] is False
     assert whatsapp["health_status"] == "degraded"
+
+
+def test_collector_status_exposes_channel_capability_boundaries(monkeypatch):
+    monkeypatch.setenv("DATABASE_URL", "postgresql://test")
+    monkeypatch.setenv("REDIS_URL", "redis://test")
+    monkeypatch.setenv("APP_PASSWORD", "secret")
+
+    from app import main
+
+    class Cursor:
+        def __init__(self, rows=None):
+            self.rows = rows or []
+
+        def fetchall(self):
+            return self.rows
+
+    class Conn:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return None
+
+        def execute(self, sql, params=()):
+            normalized = " ".join(sql.split())
+            if "FROM collector_settings" in normalized:
+                return Cursor([])
+            if "FROM collector_health" in normalized:
+                return Cursor([])
+            raise AssertionError(f"Unexpected SQL: {sql}")
+
+    monkeypatch.setattr(main, "db", lambda: Conn())
+
+    payload = TestClient(main.app).get(
+        "/api/collectors/status",
+        headers={"x-par-password": "secret"},
+    ).json()
+
+    by_source = {item["source"]: item for item in payload["collectors"]}
+    gmail_capability = by_source["gmail"]["capability"]
+    whatsapp_capability = by_source["whatsapp"]["capability"]
+    telegram_capability = by_source["telegram"]["capability"]
+    assert gmail_capability["mode"] == "api_or_browser"
+    assert "composio:gmail" in gmail_capability["adapters"]
+    assert "full_mailbox_sync_when_connected" in gmail_capability["supported_operations"]
+    assert whatsapp_capability["mode"] == "managed_browser_visible_dom"
+    assert whatsapp_capability["full_history_guarantee"] is False
+    assert "visible_chat_list" in whatsapp_capability["supported_operations"]
+    assert telegram_capability["mode"] == "managed_browser_visible_dom"
+    assert telegram_capability["full_history_guarantee"] is False
+
+
+def test_gmail_composio_fetch_persists_messages_as_collector_events(monkeypatch):
+    monkeypatch.setenv("DATABASE_URL", "postgresql://test")
+    monkeypatch.setenv("REDIS_URL", "redis://test")
+    monkeypatch.setenv("APP_PASSWORD", "secret")
+
+    from app import main
+
+    executed = []
+    queued = []
+    captured_body = {}
+
+    def fake_execute_composio_tool_call(body):
+        captured_body["toolkit_slug"] = body.toolkit_slug
+        captured_body["tool_slug"] = body.tool_slug
+        captured_body["arguments"] = dict(body.arguments)
+        return {
+            "status": "completed",
+            "live_result": {
+                "result": {
+                    "messages": [
+                        {
+                            "id": "gmail-1",
+                            "threadId": "thread-1",
+                            "subject": "报价截止提醒",
+                            "from": "alice@example.com",
+                            "to": ["me@example.com"],
+                            "snippet": "周五 18:00 前确认报价。",
+                            "body": "请在周五 18:00 前确认 PHONE_1 报价。",
+                        }
+                    ]
+                }
+            },
+        }
+
+    class Cursor:
+        def __init__(self, rows=None):
+            self.rows = rows or []
+
+        def fetchone(self):
+            return self.rows[0] if self.rows else None
+
+    class Conn:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return None
+
+        def execute(self, sql, params=()):
+            normalized = " ".join(sql.split())
+            if "SELECT enabled, paused_until" in normalized:
+                return Cursor()
+            if "INSERT INTO events" in normalized:
+                executed.append((normalized, params))
+                return Cursor()
+            raise AssertionError(f"Unexpected SQL: {sql}")
+
+    class Redis:
+        def xadd(self, stream, fields):
+            queued.append((stream, fields))
+
+    monkeypatch.setattr(main, "execute_composio_tool_call", fake_execute_composio_tool_call)
+    monkeypatch.setattr(main, "db", lambda: Conn())
+    monkeypatch.setattr(main, "redis_client", lambda: Redis())
+
+    response = TestClient(main.app).post(
+        "/api/collectors/gmail/composio/fetch",
+        headers={"x-par-password": "secret"},
+        json={"query": "newer_than:1d", "limit": 10},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "completed"
+    assert payload["fetched_count"] == 1
+    assert payload["persisted_count"] == 1
+    assert captured_body == {
+        "toolkit_slug": "gmail",
+        "tool_slug": "GMAIL_FETCH_EMAILS",
+        "arguments": {"query": "newer_than:1d", "max_results": 10},
+    }
+    event_params = executed[0][1]
+    assert event_params[2] == "gmail"
+    assert event_params[3] == "gmail_message_snapshot"
+    stored = json.loads(event_params[4])
+    assert stored["message_id"] == "gmail-1"
+    assert stored["thread_id"] == "thread-1"
+    assert stored["subject"] == "报价截止提醒"
+    assert stored["source_adapter"] == "composio:gmail"
+    assert queued[0][0] == "events:raw"
 
 
 def test_memory_governance_filters_events_and_exposes_sensitive_flag(monkeypatch):
@@ -919,8 +1137,8 @@ def test_persist_task_route_trace_records_decision_and_packet(monkeypatch):
     assert params[2] == "openclaw_tool"
     assert params[3] == "automation.browser.operate"
     assert params[5] == "external_execution"
-    assert params[7]["route_type"] == "openclaw_tool"
-    assert params[8]["goal"] == "帮我去一个不支持 MCP 的网站填写报名表，但不要提交"
+    assert params[7].obj["route_type"] == "openclaw_tool"
+    assert params[8].obj["goal"] == "帮我去一个不支持 MCP 的网站填写报名表，但不要提交"
 
 
 def test_task_route_traces_api_filters_and_returns_audit_rows(monkeypatch):
@@ -1048,6 +1266,46 @@ def test_openclaw_execute_live_uses_openresponses_endpoint(monkeypatch):
     assert "禁止动作" in captured["json"]["input"]
     assert "submit" in captured["json"]["input"]
     assert captured["json"]["metadata"]["nomi_permission"] == "external_execution"
+
+
+def test_openclaw_live_execution_records_long_tail_action_request_policy_and_trace(monkeypatch):
+    monkeypatch.setenv("APP_PASSWORD", "secret")
+    monkeypatch.setenv("OPENCLAW_ENABLED", "true")
+    from app import main
+    from app.long_tail_agent import LongTailEventStore
+
+    store = LongTailEventStore()
+    main._LONG_TAIL_EVENT_STORE = store
+    route = main.route_tool_request(
+        "帮我去一个不支持 MCP 的网站填写报名表，但不要提交",
+        {"current_url": "https://forms.example/apply?token=abc123"},
+    )
+
+    class FakeResponse:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"id": "resp_openclaw_live_1", "output_text": "表单草稿已准备，未提交。"}
+
+    monkeypatch.setattr(main.httpx, "post", lambda *args, **kwargs: FakeResponse())
+
+    result = main.execute_openclaw_task_packet(route["openclaw_task_packet"], route["execution_guard"])
+    events = store.task_events(route["openclaw_task_packet"]["task_id"])
+
+    assert result["mode"] == "live"
+    assert [event["event_type"] for event in events] == [
+        "executor.action_requested",
+        "policy.checked",
+        "executor.live_completed",
+    ]
+    assert events[0]["payload"]["action_request"]["action_type"] == "openclaw.run_task_packet"
+    assert events[1]["payload"]["policy_report"]["status"] == "allowed"
+    assert events[1]["payload"]["policy_report"]["may_execute"] is True
+    assert events[2]["payload"]["executor_trace"]["provider"] == "openclaw"
+    assert events[2]["payload"]["executor_trace"]["provider_trace_id"] == "resp_openclaw_live_1"
+    assert events[2]["payload"]["executor_trace"]["executor_trace_id"].startswith("openclaw_exec_")
+    assert events[2]["payload"]["live_result"]["external_side_effect"] is False
 
 
 def test_openclaw_execute_live_normalizes_gateway_tool_events(monkeypatch):
@@ -1617,6 +1875,142 @@ def test_composio_status_uses_v3_mcp_servers_endpoint(monkeypatch):
     assert captured["headers"]["x-api-key"] == "test-key"
 
 
+def test_composio_tool_execute_readonly_uses_policy_gate_and_persists_invocation(monkeypatch):
+    monkeypatch.setenv("APP_PASSWORD", "secret")
+    monkeypatch.setenv("COMPOSIO_API_KEY", "test-key")
+    from fastapi.testclient import TestClient
+    from app import main
+
+    captured = {}
+    executed = []
+
+    class FakeSession:
+        def execute_tool(self, tool_slug, arguments):
+            captured["tool_slug"] = tool_slug
+            captured["arguments"] = dict(arguments)
+            return {
+                "emails": [
+                    {"subject": "报价截止提醒", "from": "alice@example.com"}
+                ]
+            }
+
+    class Conn:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return None
+
+        def execute(self, sql, params=()):
+            executed.append((" ".join(sql.split()), params))
+            return self
+
+        def fetchone(self):
+            return None
+
+        def fetchall(self):
+            return []
+
+    monkeypatch.setattr(
+        main,
+        "get_or_create_composio_session",
+        lambda user_id, session_kind: (
+            FakeSession(),
+            {
+                "session_kind": session_kind,
+                "toolkits": {"enable": ["gmail"]},
+                "tags": {"enable": ["readOnlyHint"], "disable": ["destructiveHint"]},
+                "manage_connections": False,
+            },
+        ),
+    )
+    monkeypatch.setattr(main, "current_composio_user_id", lambda: "nomi_owner")
+    monkeypatch.setattr(main, "db", lambda: Conn())
+
+    response = TestClient(main.app).post(
+        "/api/integrations/composio/tools/execute",
+        headers={"x-par-password": "secret"},
+        json={
+            "session_kind": "readonly",
+            "toolkit_slug": "gmail",
+            "tool_slug": "GMAIL_FETCH_EMAILS",
+            "arguments": {"query": "from:alice newer_than:1d"},
+            "task_id": "task_email_read",
+            "step_id": "fetch_recent_email",
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "completed"
+    assert payload["toolkit_slug"] == "gmail"
+    assert payload["tool_slug"] == "GMAIL_FETCH_EMAILS"
+    assert payload["live_result"]["external_side_effect"] is False
+    assert captured == {
+        "tool_slug": "GMAIL_FETCH_EMAILS",
+        "arguments": {"query": "from:alice newer_than:1d"},
+    }
+    assert any("INSERT INTO composio_tool_invocations" in sql for sql, _ in executed)
+    invocation_params = next(params for sql, params in executed if "INSERT INTO composio_tool_invocations" in sql)
+    assert invocation_params[2] == "gmail"
+    assert invocation_params[3] == "GMAIL_FETCH_EMAILS"
+    assert invocation_params[5] == "completed"
+
+
+def test_composio_tool_execute_blocks_external_message_without_confirmation(monkeypatch):
+    monkeypatch.setenv("APP_PASSWORD", "secret")
+    monkeypatch.setenv("COMPOSIO_API_KEY", "test-key")
+    from fastapi.testclient import TestClient
+    from app import main
+    executed = []
+
+    class FakeSession:
+        def execute_tool(self, tool_slug, arguments):
+            raise AssertionError("send tool must not execute without confirmation")
+
+    class Conn:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return None
+
+        def execute(self, sql, params=()):
+            executed.append((" ".join(sql.split()), params))
+            return self
+
+    monkeypatch.setattr(
+        main,
+        "get_or_create_composio_session",
+        lambda user_id, session_kind: (
+            FakeSession(),
+            {
+                "session_kind": session_kind,
+                "toolkits": {"enable": ["gmail"]},
+                "tags": {"disable": ["destructiveHint"]},
+                "manage_connections": False,
+            },
+        ),
+    )
+    monkeypatch.setattr(main, "db", lambda: Conn())
+    response = TestClient(main.app).post(
+        "/api/integrations/composio/tools/execute",
+        headers={"x-par-password": "secret"},
+        json={
+            "session_kind": "write",
+            "toolkit_slug": "gmail",
+            "tool_slug": "GMAIL_SEND_EMAIL",
+            "arguments": {"to": "alice@example.com", "body": "hello"},
+        },
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "composio_tool_execution_requires_confirmation"
+    assert any("INSERT INTO composio_tool_invocations" in sql for sql, _ in executed)
+    invocation_params = next(params for sql, params in executed if "INSERT INTO composio_tool_invocations" in sql)
+    assert invocation_params[5] == "requires_confirmation"
+
+
 def test_composio_connect_requires_api_key_without_calling_sdk(monkeypatch):
     monkeypatch.setenv("APP_PASSWORD", "secret")
     monkeypatch.delenv("COMPOSIO_API_KEY", raising=False)
@@ -1642,9 +2036,11 @@ def test_composio_connect_creates_manual_authorization_link_and_persists_without
     monkeypatch.setenv("COMPOSIO_USER_ID", "nomi_owner")
     from fastapi.testclient import TestClient
     from app import main
+    from app.long_tail_agent import LongTailEventStore
 
     executed = []
     captured = {}
+    event_store = LongTailEventStore()
 
     class Cursor:
         rowcount = 1
@@ -1697,6 +2093,7 @@ def test_composio_connect_creates_manual_authorization_link_and_persists_without
 
     monkeypatch.setattr(main, "db", lambda: Conn())
     monkeypatch.setattr(main, "create_composio_sdk_client", lambda api_key: FakeComposio())
+    monkeypatch.setattr(main, "long_tail_event_store", lambda: event_store)
 
     response = TestClient(main.app).post(
         "/api/integrations/composio/connect/gmail",
@@ -1723,6 +2120,103 @@ def test_composio_connect_creates_manual_authorization_link_and_persists_without
     assert any("INSERT INTO composio_sessions" in sql for sql, _ in executed)
     assert any("INSERT INTO composio_connect_requests" in sql for sql, _ in executed)
     assert any("INSERT INTO account_connections" in sql for sql, _ in executed)
+    events = event_store.task_events("composio:readonly:gmail:connect")
+    assert [event["event_type"] for event in events] == [
+        "executor.action_requested",
+        "policy.checked",
+        "executor.live_completed",
+    ]
+    assert events[0]["payload"]["action_request"]["action_type"] == "composio.authorize_toolkit"
+    assert events[1]["payload"]["policy_report"]["status"] == "allowed"
+    assert events[2]["payload"]["live_result"]["status"] == "link_created"
+    assert events[2]["payload"]["live_result"]["external_side_effect"] is False
+
+
+def test_composio_connect_includes_callback_when_configured(monkeypatch):
+    monkeypatch.setenv("APP_PASSWORD", "secret")
+    monkeypatch.setenv("COMPOSIO_API_KEY", "test-key")
+    monkeypatch.setenv("COMPOSIO_CALLBACK_URL", "https://nomi.example/api/integrations/composio/callback")
+    from fastapi.testclient import TestClient
+    from app import main
+
+    captured = {}
+
+    class Cursor:
+        rowcount = 1
+
+        def __init__(self, rows=None):
+            self.rows = rows or []
+
+        def fetchone(self):
+            return self.rows[0] if self.rows else None
+
+    class Conn:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return None
+
+        def execute(self, sql, params=()):
+            normalized = " ".join(sql.split())
+            if "FROM composio_sessions" in normalized:
+                return Cursor()
+            return Cursor()
+
+    class FakeMcp:
+        url = "https://mcp.composio.test/session"
+        headers = {"authorization": "Bearer sdk-secret"}
+
+    class FakeConnectRequest:
+        id = "link_req_1"
+        redirect_url = "https://connect.composio.dev/link/ln_test"
+        connected_account_id = ""
+        expires_at = None
+
+    class FakeSession:
+        session_id = "sess_readonly"
+        mcp = FakeMcp()
+
+        def authorize(self, toolkit_slug, callback_url=None):
+            captured["toolkit_slug"] = toolkit_slug
+            captured["callback_url"] = callback_url
+            return FakeConnectRequest()
+
+    class FakeComposio:
+        def create(self, **kwargs):
+            return FakeSession()
+
+    monkeypatch.setattr(main, "db", lambda: Conn())
+    monkeypatch.setattr(main, "create_composio_sdk_client", lambda api_key: FakeComposio())
+
+    response = TestClient(main.app).post(
+        "/api/integrations/composio/connect/gmail",
+        headers={"x-par-password": "secret"},
+    )
+
+    assert response.status_code == 200
+    assert captured["toolkit_slug"] == "gmail"
+    assert captured["callback_url"] == (
+        "https://nomi.example/api/integrations/composio/callback?toolkit=gmail&session_kind=readonly"
+    )
+
+
+def test_composio_callback_returns_android_deep_link_without_auth_or_sensitive_echo(monkeypatch):
+    monkeypatch.setenv("APP_PASSWORD", "secret")
+    from fastapi.testclient import TestClient
+    from app import main
+
+    response = TestClient(main.app).get(
+        "/api/integrations/composio/callback"
+        "?toolkit=gmail&session_kind=readonly&status=success&connectedAccountId=ca_secret"
+    )
+
+    assert response.status_code == 200
+    text = response.text
+    assert "nomi://composio/connected?toolkit=gmail&amp;session_kind=readonly&amp;status=success" in text
+    assert "intent://composio/connected" in text
+    assert "返回 Nomi 授权列表" in text
+    assert "ca_secret" not in text
 
 
 def test_composio_toolkits_sync_returns_connected_status_and_redacts_session_headers(monkeypatch):
@@ -1730,8 +2224,10 @@ def test_composio_toolkits_sync_returns_connected_status_and_redacts_session_hea
     monkeypatch.setenv("COMPOSIO_API_KEY", "test-key")
     from fastapi.testclient import TestClient
     from app import main
+    from app.long_tail_agent import LongTailEventStore
 
     executed = []
+    event_store = LongTailEventStore()
 
     class Cursor:
         rowcount = 1
@@ -1793,6 +2289,7 @@ def test_composio_toolkits_sync_returns_connected_status_and_redacts_session_hea
 
     monkeypatch.setattr(main, "db", lambda: Conn())
     monkeypatch.setattr(main, "create_composio_sdk_client", lambda api_key: FakeComposio())
+    monkeypatch.setattr(main, "long_tail_event_store", lambda: event_store)
 
     response = TestClient(main.app).get(
         "/api/integrations/composio/toolkits?session_kind=readonly",
@@ -1814,3 +2311,16 @@ def test_composio_toolkits_sync_returns_connected_status_and_redacts_session_hea
         }
     ]
     assert any("INSERT INTO composio_toolkits" in sql for sql, _ in executed)
+    events = event_store.task_events("composio:readonly:toolkits:sync")
+    assert [event["event_type"] for event in events] == [
+        "executor.action_requested",
+        "policy.checked",
+        "executor.live_completed",
+    ]
+    assert events[0]["payload"]["action_request"]["action_type"] == "composio.list_toolkits"
+    assert events[1]["payload"]["policy_report"]["status"] == "allowed"
+    live_result = events[2]["payload"]["live_result"]
+    assert live_result["status"] == "toolkits_synced"
+    assert live_result["toolkit_count"] == 1
+    assert live_result["connected_count"] == 1
+    assert live_result["external_side_effect"] is False

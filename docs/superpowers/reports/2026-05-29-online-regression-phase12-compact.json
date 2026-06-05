@@ -1,0 +1,1342 @@
+{
+  "cases": {
+    "RG-WA-001": {
+      "event_id": "bfb3dc1d-11f5-4b1b-8aaa-3640c3b44f74",
+      "raw_text": "rg-PHONE_1 周六下午AMOUNT_1点在武康路见，记得带 PHONE_1 报价单。",
+      "intent": "约定",
+      "summary": "rg-PHONE_1 周六下午AMOUNT_1点在武康路见，记得带 PHONE_1 报价单。",
+      "labels": [
+        "appointment",
+        "todo"
+      ],
+      "primary_label": "appointment",
+      "vector_count": 1
+    },
+    "RG-WA-002": {
+      "event_id": "b14427f6-38ff-4063-9ec0-fc0d50604af8",
+      "raw_text": "rg-PHONE_1 周末我们见一下吧，具体时间地点我晚点发你。",
+      "intent": "约定",
+      "summary": "rg-PHONE_1 周末我们见一下吧，具体时间地点我晚点发你。",
+      "labels": [
+        "appointment",
+        "commitment"
+      ],
+      "primary_label": "appointment",
+      "vector_count": 1
+    },
+    "RG-WA-003": {
+      "event_id": "6ea3984e-888f-41dd-90fa-d1b981c54d70",
+      "raw_text": "rg-PHONE_1 上次说的见面改到周日上午AMOUNT_1点，地点还是武康路。",
+      "intent": "改期",
+      "summary": "rg-PHONE_1 上次说的见面改到周日上午AMOUNT_1点，地点还是武康路。",
+      "labels": [
+        "reschedule",
+        "appointment"
+      ],
+      "primary_label": "reschedule",
+      "vector_count": 1
+    },
+    "RG-WA-004": {
+      "event_id": "c0c9ee65-9cb6-4b8e-a2c0-cbbd5154ce96",
+      "raw_text": "rg-PHONE_1 周末那个见面先取消，之后再约。",
+      "intent": "取消",
+      "summary": "rg-PHONE_1 周末那个见面先取消，之后再约。",
+      "labels": [
+        "cancel",
+        "appointment"
+      ],
+      "primary_label": "cancel",
+      "vector_count": 1
+    },
+    "RG-WA-005A": {
+      "event_id": "ac19363b-44d2-4762-8b83-48d28a877a92",
+      "raw_text": "rg-PHONE_1 PHONE_1 报价别太晚，我周日要给老板看。",
+      "intent": "截止日期",
+      "summary": "rg-PHONE_1 PHONE_1 报价别太晚，我周日要给老板看。",
+      "labels": [
+        "deadline",
+        "todo"
+      ],
+      "primary_label": "deadline",
+      "vector_count": 1
+    },
+    "RG-WA-005B": {
+      "event_id": "68d1964c-7f35-48cc-b3bc-0613aabc6a09",
+      "raw_text": "rg-PHONE_1 RG_Alice 对价格很敏感，先别告诉她我这么说。",
+      "intent": "关系信号",
+      "summary": "rg-PHONE_1 RG_Alice 对价格很敏感，先别告诉她我这么说。",
+      "labels": [
+        "todo",
+        "relationship_signal"
+      ],
+      "primary_label": "todo",
+      "vector_count": 1
+    },
+    "RG-GM-001": {
+      "event_id": "9c16ead6-df13-4584-84eb-f3c3b89dc195",
+      "raw_text": "Please send the PHONE_1 quote before Friday 18:00. Confirm margin before replying.",
+      "intent": "待办",
+      "summary": "[REGRESSION rg-PHONE_1] PHONE_1 quote deadline：Please send the PHONE_1 quote before Friday 18:00. Confirm margin before replying.",
+      "labels": [
+        "deadline",
+        "todo"
+      ],
+      "primary_label": "deadline",
+      "vector_count": 1
+    },
+    "RG-GM-002": {
+      "event_id": "e6adbb95-1147-4c16-83b2-fa369dcd2661",
+      "raw_text": "Invoice INV-RG-AMOUNT_1 for AMOUNT_1 is due next Tuesday. Please arrange payment.",
+      "intent": "付款",
+      "summary": "[REGRESSION rg-PHONE_1] Invoice INV-RG-AMOUNT_1 due：Invoice INV-RG-AMOUNT_1 for AMOUNT_1 is due next Tuesday. Please arrange payment.",
+      "labels": [
+        "payment",
+        "deadline",
+        "todo"
+      ],
+      "primary_label": "payment",
+      "vector_count": 1
+    },
+    "RG-GM-003": {
+      "event_id": "6c770a12-d99b-4aef-8093-a7db8c86911c",
+      "raw_text": "Can you confirm whether PHONE_1 margin is approved?",
+      "intent": "待办",
+      "summary": "[REGRESSION rg-PHONE_1] Can you confirm PHONE_1 margin?：Can you confirm whether PHONE_1 margin is approved?",
+      "labels": [
+        "todo"
+      ],
+      "primary_label": "todo",
+      "vector_count": 1
+    }
+  },
+  "agendas": [
+    {
+      "id": "1381bd98-e593-4b51-b8ac-4d7325b3002c",
+      "type": "payment",
+      "title": "INV-RG-AMOUNT_1发票付款截止",
+      "status": "pending",
+      "certainty": "fuzzy",
+      "time_window": {
+        "raw_text": "next Tuesday",
+        "has_exact_time": false,
+        "has_fuzzy_time": false,
+        "rule_has_exact_time": false
+      },
+      "place": null,
+      "participants": [
+        "RG_CFO",
+        "EMAIL_1"
+      ],
+      "missing_fields": [
+        "exact_time"
+      ],
+      "needs_clarification": true,
+      "source_event_ids": [
+        "e6adbb95-1147-4c16-83b2-fa369dcd2661"
+      ],
+      "metadata": {
+        "source": "",
+        "dedupe_key": "agenda:deadline:unknown:gm_rg_thread_invoice",
+        "parser_mode": "hybrid_model_rules",
+        "created_from": "semantic_event",
+        "model_reason": "原文仅提及'due next Tuesday'，未提供具体日期和时间，故certainty为fuzzy，exact_time归入missing_fields。事件明确为付款截止，is_agenda为true。",
+        "rule_candidate": {
+          "type": "deadline",
+          "place": "",
+          "title": "[REGRESSION rg-PHONE_1] Invoice INV-RG-AMOUNT_1 due：Invoice INV-RG-AMOUNT_1 for AMOUNT_1 is due next Tuesday. Please arrange payment.",
+          "status": "scheduled",
+          "metadata": {
+            "source": "",
+            "dedupe_key": "agenda:deadline:unknown:gm_rg_thread_invoice",
+            "created_from": "semantic_event",
+            "event_timestamp": "2026-05-29T13:09:38.857103+00:00"
+          },
+          "certainty": "fuzzy",
+          "operation": "create",
+          "confidence": 0.85,
+          "time_window": {
+            "raw_text": "[REGRESSION rg-PHONE_1] Invoice INV-RG-AMOUNT_1 due：Invoice INV-RG-AMOUNT_1 for AMOUNT_1 is due next Tuesday. Please arrange payment.\nInvoice INV-RG-AMOUNT_1 for AMOUNT_1 is due next Tuesday. Please arrange payment.\n[REGRESSION rg-PHONE_1] ",
+            "has_exact_time": false,
+            "has_fuzzy_time": false
+          },
+          "participants": [
+            "RG_CFO",
+            "EMAIL_1"
+          ],
+          "missing_fields": [
+            "exact_time"
+          ],
+          "source_event_ids": [
+            "e6adbb95-1147-4c16-83b2-fa369dcd2661"
+          ],
+          "needs_clarification": true
+        },
+        "event_timestamp": "2026-05-29T13:09:38.857103+00:00",
+        "model_candidate": {
+          "type": "payment",
+          "place": "",
+          "title": "INV-RG-AMOUNT_1发票付款截止",
+          "reason": "原文仅提及'due next Tuesday'，未提供具体日期和时间，故certainty为fuzzy，exact_time归入missing_fields。事件明确为付款截止，is_agenda为true。",
+          "status": "pending",
+          "certainty": "fuzzy",
+          "is_agenda": true,
+          "operation": "create",
+          "confidence": 0.85,
+          "time_window": {
+            "raw_text": "next Tuesday"
+          },
+          "participants": [
+            "RG_CFO"
+          ],
+          "missing_fields": [
+            "exact_time"
+          ],
+          "needs_clarification": true
+        },
+        "validation_warnings": []
+      }
+    },
+    {
+      "id": "a0380761-519a-4217-a620-5c68fc9ebd5d",
+      "type": "deadline",
+      "title": "PHONE_1 报价截止",
+      "status": "pending",
+      "certainty": "fuzzy",
+      "time_window": {
+        "raw_text": "Friday 18:00",
+        "has_exact_time": true,
+        "has_fuzzy_time": false,
+        "rule_has_exact_time": true
+      },
+      "place": null,
+      "participants": [
+        "RG_Alice",
+        "EMAIL_1"
+      ],
+      "missing_fields": [
+        "exact_time"
+      ],
+      "needs_clarification": true,
+      "source_event_ids": [
+        "9c16ead6-df13-4584-84eb-f3c3b89dc195"
+      ],
+      "metadata": {
+        "source": "",
+        "dedupe_key": "agenda:deadline:unknown:gm_rg_thread_quote",
+        "parser_mode": "hybrid_model_rules",
+        "created_from": "semantic_event",
+        "model_reason": "原文仅提及 'Friday 18:00' 作为截止时间，未提供具体日期，依据规则 certainty 设为 fuzzy，exact_time 归入 missing_fields。",
+        "rule_candidate": {
+          "type": "deadline",
+          "place": "",
+          "title": "[REGRESSION rg-PHONE_1] PHONE_1 quote deadline：Please send the PHONE_1 quote before Friday 18:00. Confirm margin before replying.",
+          "status": "scheduled",
+          "metadata": {
+            "source": "",
+            "dedupe_key": "agenda:deadline:unknown:gm_rg_thread_quote",
+            "created_from": "semantic_event",
+            "event_timestamp": "2026-05-29T13:09:38.802582+00:00"
+          },
+          "certainty": "exact",
+          "operation": "create",
+          "confidence": 0.8,
+          "time_window": {
+            "raw_text": "[REGRESSION rg-PHONE_1] PHONE_1 quote deadline：Please send the PHONE_1 quote before Friday 18:00. Confirm margin before replying.\nPlease send the PHONE_1 quote before Friday 18:00. Confirm margin before replying.\n[REGRESSION rg-PHONE_1] PHO",
+            "has_exact_time": true,
+            "has_fuzzy_time": false
+          },
+          "participants": [
+            "RG_Alice",
+            "EMAIL_1"
+          ],
+          "missing_fields": [],
+          "source_event_ids": [
+            "9c16ead6-df13-4584-84eb-f3c3b89dc195"
+          ],
+          "needs_clarification": false
+        },
+        "event_timestamp": "2026-05-29T13:09:38.802582+00:00",
+        "model_candidate": {
+          "type": "deadline",
+          "place": "",
+          "title": "PHONE_1 报价截止",
+          "reason": "原文仅提及 'Friday 18:00' 作为截止时间，未提供具体日期，依据规则 certainty 设为 fuzzy，exact_time 归入 missing_fields。",
+          "status": "pending",
+          "certainty": "fuzzy",
+          "is_agenda": true,
+          "operation": "create",
+          "confidence": 0.8,
+          "time_window": {
+            "raw_text": "Friday 18:00"
+          },
+          "participants": [
+            "RG_Alice"
+          ],
+          "missing_fields": [
+            "exact_time"
+          ],
+          "needs_clarification": true
+        },
+        "validation_warnings": []
+      }
+    },
+    {
+      "id": "60c1c774-a18a-4e78-8ca9-61b395f26484",
+      "type": "appointment",
+      "title": "取消周末见面",
+      "status": "canceled",
+      "certainty": "fuzzy",
+      "time_window": {
+        "raw_text": "周末",
+        "has_exact_time": false,
+        "has_fuzzy_time": true,
+        "rule_has_exact_time": false
+      },
+      "place": null,
+      "participants": [
+        "RG_Bob"
+      ],
+      "missing_fields": [],
+      "needs_clarification": false,
+      "source_event_ids": [
+        "c0c9ee65-9cb6-4b8e-a2c0-cbbd5154ce96"
+      ],
+      "metadata": {
+        "source": "",
+        "dedupe_key": "agenda:appointment:unknown:wx_rg_bob_thread",
+        "parser_mode": "hybrid_model_rules",
+        "created_from": "semantic_event",
+        "model_reason": "原文仅提及'周末'这一模糊时间，未提供具体日期、地点及参与人，故certainty设为fuzzy，并将exact_time和exact_place列入missing_fields。",
+        "rule_candidate": {
+          "type": "appointment",
+          "place": "",
+          "title": "rg-PHONE_1 周末那个见面先取消，之后再约。",
+          "status": "canceled",
+          "metadata": {
+            "source": "",
+            "dedupe_key": "agenda:appointment:unknown:wx_rg_bob_thread",
+            "created_from": "semantic_event",
+            "event_timestamp": "2026-05-29T13:03:34.369140+00:00"
+          },
+          "certainty": "fuzzy",
+          "operation": "cancel",
+          "confidence": 0.6,
+          "time_window": {
+            "raw_text": "rg-PHONE_1 周末那个见面先取消，之后再约。\nrg-PHONE_1 周末那个见面先取消，之后再约。\nrg-PHONE_1 周末那个见面先取消，之后再约。",
+            "has_exact_time": false,
+            "has_fuzzy_time": true
+          },
+          "participants": [
+            "RG_Bob"
+          ],
+          "missing_fields": [],
+          "source_event_ids": [
+            "c0c9ee65-9cb6-4b8e-a2c0-cbbd5154ce96"
+          ],
+          "needs_clarification": false
+        },
+        "event_timestamp": "2026-05-29T13:03:34.369140+00:00",
+        "model_candidate": {
+          "type": "appointment",
+          "place": "",
+          "title": "取消周末见面",
+          "reason": "原文仅提及'周末'这一模糊时间，未提供具体日期、地点及参与人，故certainty设为fuzzy，并将exact_time和exact_place列入missing_fields。",
+          "status": "canceled",
+          "certainty": "fuzzy",
+          "is_agenda": true,
+          "operation": "cancel",
+          "confidence": 0.6,
+          "time_window": {
+            "raw_text": "周末"
+          },
+          "participants": [
+            "RG_Bob"
+          ],
+          "missing_fields": [
+            "exact_time",
+            "exact_place"
+          ],
+          "needs_clarification": false
+        },
+        "validation_warnings": []
+      }
+    },
+    {
+      "id": "1d36007c-5ab6-4f60-9258-6a90a644012f",
+      "type": "appointment",
+      "title": "与RG_Alice改期见面",
+      "status": "scheduled",
+      "certainty": "fuzzy",
+      "time_window": {
+        "raw_text": "周日上午AMOUNT_1点",
+        "has_exact_time": true,
+        "has_fuzzy_time": true,
+        "rule_has_exact_time": true
+      },
+      "place": "武康路",
+      "participants": [
+        "RG_Alice"
+      ],
+      "missing_fields": [
+        "exact_time"
+      ],
+      "needs_clarification": true,
+      "source_event_ids": [
+        "6ea3984e-888f-41dd-90fa-d1b981c54d70"
+      ],
+      "metadata": {
+        "source": "",
+        "dedupe_key": "agenda:appointment:unknown:wx_rg_alice_thread",
+        "parser_mode": "hybrid_model_rules",
+        "created_from": "semantic_event",
+        "model_reason": "原文仅提及'周日上午'及占位符'AMOUNT_1点'，无确切日期与具体时间，故certainty为fuzzy且exact_time缺失需澄清。地点'武康路'有明确依据。",
+        "rule_candidate": {
+          "type": "appointment",
+          "place": "武康路",
+          "title": "rg-PHONE_1 上次说的见面改到周日上午AMOUNT_1点，地点还是武康路。",
+          "status": "scheduled",
+          "metadata": {
+            "source": "",
+            "dedupe_key": "agenda:appointment:unknown:wx_rg_alice_thread",
+            "created_from": "semantic_event",
+            "event_timestamp": "2026-05-29T13:00:32.125640+00:00"
+          },
+          "certainty": "fuzzy",
+          "operation": "reschedule",
+          "confidence": 0.8,
+          "time_window": {
+            "raw_text": "rg-PHONE_1 上次说的见面改到周日上午AMOUNT_1点，地点还是武康路。\nrg-PHONE_1 上次说的见面改到周日上午AMOUNT_1点，地点还是武康路。\nrg-PHONE_1 上次说的见面改到周日上午AMOUNT_1点，地点还是武康路。",
+            "has_exact_time": true,
+            "has_fuzzy_time": true
+          },
+          "participants": [
+            "RG_Alice"
+          ],
+          "missing_fields": [],
+          "source_event_ids": [
+            "6ea3984e-888f-41dd-90fa-d1b981c54d70"
+          ],
+          "needs_clarification": false
+        },
+        "event_timestamp": "2026-05-29T13:00:32.125640+00:00",
+        "model_candidate": {
+          "type": "appointment",
+          "place": "武康路",
+          "title": "与RG_Alice改期见面",
+          "reason": "原文仅提及'周日上午'及占位符'AMOUNT_1点'，无确切日期与具体时间，故certainty为fuzzy且exact_time缺失需澄清。地点'武康路'有明确依据。",
+          "status": "scheduled",
+          "certainty": "fuzzy",
+          "is_agenda": true,
+          "operation": "reschedule",
+          "confidence": 0.8,
+          "time_window": {
+            "raw_text": "周日上午AMOUNT_1点"
+          },
+          "participants": [
+            "RG_Alice"
+          ],
+          "missing_fields": [
+            "exact_time"
+          ],
+          "needs_clarification": true
+        },
+        "validation_warnings": []
+      }
+    },
+    {
+      "id": "7c159482-b7f3-4547-b3ee-c9961a0c602a",
+      "type": "appointment",
+      "title": "周六下午武康路见面",
+      "status": "pending",
+      "certainty": "fuzzy",
+      "time_window": {
+        "raw_text": "周六下午AMOUNT_1点",
+        "has_exact_time": true,
+        "has_fuzzy_time": true,
+        "rule_has_exact_time": true
+      },
+      "place": "武康路",
+      "participants": [
+        "RG_Alice"
+      ],
+      "missing_fields": [
+        "exact_time"
+      ],
+      "needs_clarification": true,
+      "source_event_ids": [
+        "bfb3dc1d-11f5-4b1b-8aaa-3640c3b44f74"
+      ],
+      "metadata": {
+        "source": "whatsapp",
+        "dedupe_key": "agenda:appointment:whatsapp:wx_rg_alice_thread",
+        "parser_mode": "hybrid_model_rules",
+        "created_from": "semantic_event",
+        "model_reason": "原文明确提及周六下午在武康路见面，但具体时间以占位符AMOUNT_1表示，未提供确切时间信息，需进一步澄清。",
+        "rule_candidate": null,
+        "event_timestamp": "2026-05-29T12:54:27.627549+00:00",
+        "model_candidate": {
+          "type": "appointment",
+          "place": "武康路",
+          "title": "周六下午武康路见面",
+          "reason": "原文明确提及周六下午在武康路见面，但具体时间以占位符AMOUNT_1表示，未提供确切时间信息，需进一步澄清。",
+          "status": "pending",
+          "certainty": "fuzzy",
+          "is_agenda": true,
+          "operation": "create",
+          "confidence": 0.75,
+          "time_window": {
+            "raw_text": "周六下午AMOUNT_1点"
+          },
+          "participants": [
+            "RG_Alice"
+          ],
+          "missing_fields": [
+            "exact_time"
+          ],
+          "needs_clarification": true
+        },
+        "validation_warnings": []
+      }
+    }
+  ],
+  "agenda_versions": [
+    {
+      "agenda_item_id": "1381bd98-e593-4b51-b8ac-4d7325b3002c",
+      "operation": "create",
+      "previous_value": {},
+      "new_value": {
+        "type": "payment",
+        "place": "",
+        "title": "INV-RG-AMOUNT_1发票付款截止",
+        "status": "pending",
+        "metadata": {
+          "source": "",
+          "dedupe_key": "agenda:deadline:unknown:gm_rg_thread_invoice",
+          "parser_mode": "hybrid_model_rules",
+          "created_from": "semantic_event",
+          "model_reason": "原文仅提及'due next Tuesday'，未提供具体日期和时间，故certainty为fuzzy，exact_time归入missing_fields。事件明确为付款截止，is_agenda为true。",
+          "rule_candidate": {
+            "type": "deadline",
+            "place": "",
+            "title": "[REGRESSION rg-PHONE_1] Invoice INV-RG-AMOUNT_1 due：Invoice INV-RG-AMOUNT_1 for AMOUNT_1 is due next Tuesday. Please arrange payment.",
+            "status": "scheduled",
+            "metadata": {
+              "source": "",
+              "dedupe_key": "agenda:deadline:unknown:gm_rg_thread_invoice",
+              "created_from": "semantic_event",
+              "event_timestamp": "2026-05-29T13:09:38.857103+00:00"
+            },
+            "certainty": "fuzzy",
+            "operation": "create",
+            "confidence": 0.85,
+            "time_window": {
+              "raw_text": "[REGRESSION rg-PHONE_1] Invoice INV-RG-AMOUNT_1 due：Invoice INV-RG-AMOUNT_1 for AMOUNT_1 is due next Tuesday. Please arrange payment.\nInvoice INV-RG-AMOUNT_1 for AMOUNT_1 is due next Tuesday. Please arrange payment.\n[REGRESSION rg-PHONE_1] ",
+              "has_exact_time": false,
+              "has_fuzzy_time": false
+            },
+            "participants": [
+              "RG_CFO",
+              "EMAIL_1"
+            ],
+            "missing_fields": [
+              "exact_time"
+            ],
+            "source_event_ids": [
+              "e6adbb95-1147-4c16-83b2-fa369dcd2661"
+            ],
+            "needs_clarification": true
+          },
+          "event_timestamp": "2026-05-29T13:09:38.857103+00:00",
+          "model_candidate": {
+            "type": "payment",
+            "place": "",
+            "title": "INV-RG-AMOUNT_1发票付款截止",
+            "reason": "原文仅提及'due next Tuesday'，未提供具体日期和时间，故certainty为fuzzy，exact_time归入missing_fields。事件明确为付款截止，is_agenda为true。",
+            "status": "pending",
+            "certainty": "fuzzy",
+            "is_agenda": true,
+            "operation": "create",
+            "confidence": 0.85,
+            "time_window": {
+              "raw_text": "next Tuesday"
+            },
+            "participants": [
+              "RG_CFO"
+            ],
+            "missing_fields": [
+              "exact_time"
+            ],
+            "needs_clarification": true
+          },
+          "validation_warnings": []
+        },
+        "certainty": "fuzzy",
+        "confidence": 0.85,
+        "time_window": {
+          "raw_text": "next Tuesday",
+          "has_exact_time": false,
+          "has_fuzzy_time": false,
+          "rule_has_exact_time": false
+        },
+        "participants": [
+          "RG_CFO",
+          "EMAIL_1"
+        ],
+        "missing_fields": [
+          "exact_time"
+        ],
+        "source_event_ids": [
+          "e6adbb95-1147-4c16-83b2-fa369dcd2661"
+        ],
+        "needs_clarification": true
+      },
+      "reason": "create agenda from semantic event: INV-RG-AMOUNT_1发票付款截止",
+      "source_event_ids": [
+        "e6adbb95-1147-4c16-83b2-fa369dcd2661"
+      ]
+    },
+    {
+      "agenda_item_id": "a0380761-519a-4217-a620-5c68fc9ebd5d",
+      "operation": "create",
+      "previous_value": {},
+      "new_value": {
+        "type": "deadline",
+        "place": "",
+        "title": "PHONE_1 报价截止",
+        "status": "pending",
+        "metadata": {
+          "source": "",
+          "dedupe_key": "agenda:deadline:unknown:gm_rg_thread_quote",
+          "parser_mode": "hybrid_model_rules",
+          "created_from": "semantic_event",
+          "model_reason": "原文仅提及 'Friday 18:00' 作为截止时间，未提供具体日期，依据规则 certainty 设为 fuzzy，exact_time 归入 missing_fields。",
+          "rule_candidate": {
+            "type": "deadline",
+            "place": "",
+            "title": "[REGRESSION rg-PHONE_1] PHONE_1 quote deadline：Please send the PHONE_1 quote before Friday 18:00. Confirm margin before replying.",
+            "status": "scheduled",
+            "metadata": {
+              "source": "",
+              "dedupe_key": "agenda:deadline:unknown:gm_rg_thread_quote",
+              "created_from": "semantic_event",
+              "event_timestamp": "2026-05-29T13:09:38.802582+00:00"
+            },
+            "certainty": "exact",
+            "operation": "create",
+            "confidence": 0.8,
+            "time_window": {
+              "raw_text": "[REGRESSION rg-PHONE_1] PHONE_1 quote deadline：Please send the PHONE_1 quote before Friday 18:00. Confirm margin before replying.\nPlease send the PHONE_1 quote before Friday 18:00. Confirm margin before replying.\n[REGRESSION rg-PHONE_1] PHO",
+              "has_exact_time": true,
+              "has_fuzzy_time": false
+            },
+            "participants": [
+              "RG_Alice",
+              "EMAIL_1"
+            ],
+            "missing_fields": [],
+            "source_event_ids": [
+              "9c16ead6-df13-4584-84eb-f3c3b89dc195"
+            ],
+            "needs_clarification": false
+          },
+          "event_timestamp": "2026-05-29T13:09:38.802582+00:00",
+          "model_candidate": {
+            "type": "deadline",
+            "place": "",
+            "title": "PHONE_1 报价截止",
+            "reason": "原文仅提及 'Friday 18:00' 作为截止时间，未提供具体日期，依据规则 certainty 设为 fuzzy，exact_time 归入 missing_fields。",
+            "status": "pending",
+            "certainty": "fuzzy",
+            "is_agenda": true,
+            "operation": "create",
+            "confidence": 0.8,
+            "time_window": {
+              "raw_text": "Friday 18:00"
+            },
+            "participants": [
+              "RG_Alice"
+            ],
+            "missing_fields": [
+              "exact_time"
+            ],
+            "needs_clarification": true
+          },
+          "validation_warnings": []
+        },
+        "certainty": "fuzzy",
+        "confidence": 0.8,
+        "time_window": {
+          "raw_text": "Friday 18:00",
+          "has_exact_time": true,
+          "has_fuzzy_time": false,
+          "rule_has_exact_time": true
+        },
+        "participants": [
+          "RG_Alice",
+          "EMAIL_1"
+        ],
+        "missing_fields": [
+          "exact_time"
+        ],
+        "source_event_ids": [
+          "9c16ead6-df13-4584-84eb-f3c3b89dc195"
+        ],
+        "needs_clarification": true
+      },
+      "reason": "create agenda from semantic event: PHONE_1 报价截止",
+      "source_event_ids": [
+        "9c16ead6-df13-4584-84eb-f3c3b89dc195"
+      ]
+    },
+    {
+      "agenda_item_id": "60c1c774-a18a-4e78-8ca9-61b395f26484",
+      "operation": "create",
+      "previous_value": {},
+      "new_value": {
+        "type": "appointment",
+        "place": "",
+        "title": "取消周末见面",
+        "status": "canceled",
+        "metadata": {
+          "source": "",
+          "dedupe_key": "agenda:appointment:unknown:wx_rg_bob_thread",
+          "parser_mode": "hybrid_model_rules",
+          "created_from": "semantic_event",
+          "model_reason": "原文仅提及'周末'这一模糊时间，未提供具体日期、地点及参与人，故certainty设为fuzzy，并将exact_time和exact_place列入missing_fields。",
+          "rule_candidate": {
+            "type": "appointment",
+            "place": "",
+            "title": "rg-PHONE_1 周末那个见面先取消，之后再约。",
+            "status": "canceled",
+            "metadata": {
+              "source": "",
+              "dedupe_key": "agenda:appointment:unknown:wx_rg_bob_thread",
+              "created_from": "semantic_event",
+              "event_timestamp": "2026-05-29T13:03:34.369140+00:00"
+            },
+            "certainty": "fuzzy",
+            "operation": "cancel",
+            "confidence": 0.6,
+            "time_window": {
+              "raw_text": "rg-PHONE_1 周末那个见面先取消，之后再约。\nrg-PHONE_1 周末那个见面先取消，之后再约。\nrg-PHONE_1 周末那个见面先取消，之后再约。",
+              "has_exact_time": false,
+              "has_fuzzy_time": true
+            },
+            "participants": [
+              "RG_Bob"
+            ],
+            "missing_fields": [],
+            "source_event_ids": [
+              "c0c9ee65-9cb6-4b8e-a2c0-cbbd5154ce96"
+            ],
+            "needs_clarification": false
+          },
+          "event_timestamp": "2026-05-29T13:03:34.369140+00:00",
+          "model_candidate": {
+            "type": "appointment",
+            "place": "",
+            "title": "取消周末见面",
+            "reason": "原文仅提及'周末'这一模糊时间，未提供具体日期、地点及参与人，故certainty设为fuzzy，并将exact_time和exact_place列入missing_fields。",
+            "status": "canceled",
+            "certainty": "fuzzy",
+            "is_agenda": true,
+            "operation": "cancel",
+            "confidence": 0.6,
+            "time_window": {
+              "raw_text": "周末"
+            },
+            "participants": [
+              "RG_Bob"
+            ],
+            "missing_fields": [
+              "exact_time",
+              "exact_place"
+            ],
+            "needs_clarification": false
+          },
+          "validation_warnings": []
+        },
+        "certainty": "fuzzy",
+        "confidence": 0.6,
+        "time_window": {
+          "raw_text": "周末",
+          "has_exact_time": false,
+          "has_fuzzy_time": true,
+          "rule_has_exact_time": false
+        },
+        "participants": [
+          "RG_Bob"
+        ],
+        "missing_fields": [],
+        "source_event_ids": [
+          "c0c9ee65-9cb6-4b8e-a2c0-cbbd5154ce96"
+        ],
+        "needs_clarification": false
+      },
+      "reason": "cancel agenda from semantic event: 取消周末见面",
+      "source_event_ids": [
+        "c0c9ee65-9cb6-4b8e-a2c0-cbbd5154ce96"
+      ]
+    },
+    {
+      "agenda_item_id": "1d36007c-5ab6-4f60-9258-6a90a644012f",
+      "operation": "create",
+      "previous_value": {},
+      "new_value": {
+        "type": "appointment",
+        "place": "武康路",
+        "title": "与RG_Alice改期见面",
+        "status": "scheduled",
+        "metadata": {
+          "source": "",
+          "dedupe_key": "agenda:appointment:unknown:wx_rg_alice_thread",
+          "parser_mode": "hybrid_model_rules",
+          "created_from": "semantic_event",
+          "model_reason": "原文仅提及'周日上午'及占位符'AMOUNT_1点'，无确切日期与具体时间，故certainty为fuzzy且exact_time缺失需澄清。地点'武康路'有明确依据。",
+          "rule_candidate": {
+            "type": "appointment",
+            "place": "武康路",
+            "title": "rg-PHONE_1 上次说的见面改到周日上午AMOUNT_1点，地点还是武康路。",
+            "status": "scheduled",
+            "metadata": {
+              "source": "",
+              "dedupe_key": "agenda:appointment:unknown:wx_rg_alice_thread",
+              "created_from": "semantic_event",
+              "event_timestamp": "2026-05-29T13:00:32.125640+00:00"
+            },
+            "certainty": "fuzzy",
+            "operation": "reschedule",
+            "confidence": 0.8,
+            "time_window": {
+              "raw_text": "rg-PHONE_1 上次说的见面改到周日上午AMOUNT_1点，地点还是武康路。\nrg-PHONE_1 上次说的见面改到周日上午AMOUNT_1点，地点还是武康路。\nrg-PHONE_1 上次说的见面改到周日上午AMOUNT_1点，地点还是武康路。",
+              "has_exact_time": true,
+              "has_fuzzy_time": true
+            },
+            "participants": [
+              "RG_Alice"
+            ],
+            "missing_fields": [],
+            "source_event_ids": [
+              "6ea3984e-888f-41dd-90fa-d1b981c54d70"
+            ],
+            "needs_clarification": false
+          },
+          "event_timestamp": "2026-05-29T13:00:32.125640+00:00",
+          "model_candidate": {
+            "type": "appointment",
+            "place": "武康路",
+            "title": "与RG_Alice改期见面",
+            "reason": "原文仅提及'周日上午'及占位符'AMOUNT_1点'，无确切日期与具体时间，故certainty为fuzzy且exact_time缺失需澄清。地点'武康路'有明确依据。",
+            "status": "scheduled",
+            "certainty": "fuzzy",
+            "is_agenda": true,
+            "operation": "reschedule",
+            "confidence": 0.8,
+            "time_window": {
+              "raw_text": "周日上午AMOUNT_1点"
+            },
+            "participants": [
+              "RG_Alice"
+            ],
+            "missing_fields": [
+              "exact_time"
+            ],
+            "needs_clarification": true
+          },
+          "validation_warnings": []
+        },
+        "certainty": "fuzzy",
+        "confidence": 0.8,
+        "time_window": {
+          "raw_text": "周日上午AMOUNT_1点",
+          "has_exact_time": true,
+          "has_fuzzy_time": true,
+          "rule_has_exact_time": true
+        },
+        "participants": [
+          "RG_Alice"
+        ],
+        "missing_fields": [
+          "exact_time"
+        ],
+        "source_event_ids": [
+          "6ea3984e-888f-41dd-90fa-d1b981c54d70"
+        ],
+        "needs_clarification": true
+      },
+      "reason": "reschedule agenda from semantic event: 与RG_Alice改期见面",
+      "source_event_ids": [
+        "6ea3984e-888f-41dd-90fa-d1b981c54d70"
+      ]
+    },
+    {
+      "agenda_item_id": "7c159482-b7f3-4547-b3ee-c9961a0c602a",
+      "operation": "create",
+      "previous_value": {},
+      "new_value": {
+        "type": "appointment",
+        "place": "武康路",
+        "title": "周六下午武康路见面",
+        "status": "pending",
+        "metadata": {
+          "source": "whatsapp",
+          "dedupe_key": "agenda:appointment:whatsapp:wx_rg_alice_thread",
+          "parser_mode": "hybrid_model_rules",
+          "created_from": "semantic_event",
+          "model_reason": "原文明确提及周六下午在武康路见面，但具体时间以占位符AMOUNT_1表示，未提供确切时间信息，需进一步澄清。",
+          "rule_candidate": null,
+          "event_timestamp": "2026-05-29T12:54:27.627549+00:00",
+          "model_candidate": {
+            "type": "appointment",
+            "place": "武康路",
+            "title": "周六下午武康路见面",
+            "reason": "原文明确提及周六下午在武康路见面，但具体时间以占位符AMOUNT_1表示，未提供确切时间信息，需进一步澄清。",
+            "status": "pending",
+            "certainty": "fuzzy",
+            "is_agenda": true,
+            "operation": "create",
+            "confidence": 0.75,
+            "time_window": {
+              "raw_text": "周六下午AMOUNT_1点"
+            },
+            "participants": [
+              "RG_Alice"
+            ],
+            "missing_fields": [
+              "exact_time"
+            ],
+            "needs_clarification": true
+          },
+          "validation_warnings": []
+        },
+        "certainty": "fuzzy",
+        "confidence": 0.75,
+        "time_window": {
+          "raw_text": "周六下午AMOUNT_1点",
+          "has_exact_time": true,
+          "has_fuzzy_time": true,
+          "rule_has_exact_time": true
+        },
+        "participants": [
+          "RG_Alice"
+        ],
+        "missing_fields": [
+          "exact_time"
+        ],
+        "source_event_ids": [
+          "bfb3dc1d-11f5-4b1b-8aaa-3640c3b44f74"
+        ],
+        "needs_clarification": true
+      },
+      "reason": "create agenda from semantic event: 周六下午武康路见面",
+      "source_event_ids": [
+        "bfb3dc1d-11f5-4b1b-8aaa-3640c3b44f74"
+      ]
+    }
+  ],
+  "suggestions": [
+    {
+      "source_event_id": "6c770a12-d99b-4aef-8093-a7db8c86911c",
+      "title": "可能值得关注",
+      "body": "[REGRESSION rg-PHONE_1] Can you confirm PHONE_1 margin?：Can you confirm whether PHONE_1 margin is approved?",
+      "priority": 0.7,
+      "status": "open",
+      "actions": [
+        "稍后提醒",
+        "忽略"
+      ],
+      "type": "attention"
+    },
+    {
+      "source_event_id": "e6adbb95-1147-4c16-83b2-fa369dcd2661",
+      "title": "可能值得关注",
+      "body": "[REGRESSION rg-PHONE_1] Invoice INV-RG-AMOUNT_1 due：Invoice INV-RG-AMOUNT_1 for AMOUNT_1 is due next Tuesday. Please arrange payment.",
+      "priority": 0.85,
+      "status": "open",
+      "actions": [
+        "稍后提醒",
+        "忽略"
+      ],
+      "type": "attention"
+    },
+    {
+      "source_event_id": "9c16ead6-df13-4584-84eb-f3c3b89dc195",
+      "title": "可能值得关注",
+      "body": "[REGRESSION rg-PHONE_1] PHONE_1 quote deadline：Please send the PHONE_1 quote before Friday 18:00. Confirm margin before replying.",
+      "priority": 0.8,
+      "status": "open",
+      "actions": [
+        "稍后提醒",
+        "忽略"
+      ],
+      "type": "attention"
+    },
+    {
+      "source_event_id": "68d1964c-7f35-48cc-b3bc-0613aabc6a09",
+      "title": "可能值得关注",
+      "body": "rg-PHONE_1 RG_Alice 对价格很敏感，先别告诉她我这么说。",
+      "priority": 0.7,
+      "status": "open",
+      "actions": [
+        "稍后提醒",
+        "忽略"
+      ],
+      "type": "attention"
+    },
+    {
+      "source_event_id": "ac19363b-44d2-4762-8b83-48d28a877a92",
+      "title": "可能值得关注",
+      "body": "rg-PHONE_1 PHONE_1 报价别太晚，我周日要给老板看。",
+      "priority": 0.7,
+      "status": "open",
+      "actions": [
+        "稍后提醒",
+        "忽略"
+      ],
+      "type": "attention"
+    },
+    {
+      "source_event_id": "c0c9ee65-9cb6-4b8e-a2c0-cbbd5154ce96",
+      "title": "可能值得关注",
+      "body": "rg-PHONE_1 周末那个见面先取消，之后再约。",
+      "priority": 0.6,
+      "status": "open",
+      "actions": [
+        "查路线",
+        "帮我打车",
+        "稍后提醒"
+      ],
+      "type": "attention"
+    },
+    {
+      "source_event_id": "6ea3984e-888f-41dd-90fa-d1b981c54d70",
+      "title": "可能值得关注",
+      "body": "rg-PHONE_1 上次说的见面改到周日上午AMOUNT_1点，地点还是武康路。",
+      "priority": 0.8,
+      "status": "open",
+      "actions": [
+        "查路线",
+        "帮我打车",
+        "稍后提醒"
+      ],
+      "type": "attention"
+    },
+    {
+      "source_event_id": "b14427f6-38ff-4063-9ec0-fc0d50604af8",
+      "title": "可能值得关注",
+      "body": "rg-PHONE_1 周末我们见一下吧，具体时间地点我晚点发你。",
+      "priority": 0.6,
+      "status": "open",
+      "actions": [
+        "稍后提醒",
+        "忽略"
+      ],
+      "type": "attention"
+    },
+    {
+      "source_event_id": "bfb3dc1d-11f5-4b1b-8aaa-3640c3b44f74",
+      "title": "可能值得关注",
+      "body": "rg-PHONE_1 周六下午AMOUNT_1点在武康路见，记得带 PHONE_1 报价单。",
+      "priority": 0.8,
+      "status": "open",
+      "actions": [
+        "稍后提醒",
+        "忽略"
+      ],
+      "type": "attention"
+    }
+  ],
+  "pipeline_executions": [
+    {
+      "id": "200cdd30-f7b3-49f6-9b31-c65e947d151f",
+      "task_trace_id": "02dbbe42-6f5f-460c-a698-808a83203ce2",
+      "request": "帮我回复这封 PHONE_1 邮件，说我会先核对利润率。",
+      "route_type": "core_pipeline",
+      "pipeline_id": "reply_pipeline",
+      "status": "draft_ready",
+      "resolved_slots": {
+        "channel": "gmail",
+        "recipient": "RG_Alice",
+        "message_intent": "我会先核对利润率"
+      },
+      "missing_slots": [],
+      "risk": {
+        "permission": "external_message",
+        "confirmation_required": true,
+        "final_user_confirmation": true
+      },
+      "source_event_ids": [
+        "6c770a12-d99b-4aef-8093-a7db8c86911c"
+      ],
+      "output": {
+        "note": "Draft only. No message was sent.",
+        "draft": "我会先核对利润率",
+        "target": {
+          "channel": "gmail",
+          "recipient": "RG_Alice"
+        },
+        "question": "",
+        "send_message": {
+          "status": "proposed_only",
+          "requires_user_confirmation": true
+        },
+        "leakage_review": {
+          "status": "passed",
+          "matched_terms": [],
+          "reviewed_terms_count": 0
+        },
+        "confirmation_card": {
+          "draft": "我会先核对利润率",
+          "actions": [
+            "confirm_send",
+            "edit_draft",
+            "cancel"
+          ],
+          "channel": "gmail",
+          "recipient": "RG_Alice",
+          "risk_summary": "Final sending requires explicit confirmation."
+        }
+      },
+      "route_source_event_ids": [],
+      "route_request": null
+    },
+    {
+      "id": "ee88025b-a507-43e9-997e-ae318042c658",
+      "task_trace_id": "1f7a0b1b-0bf1-4928-8772-3c6809da9b64",
+      "request": "帮我处理 INV-RG-1001",
+      "route_type": "openclaw_tool",
+      "pipeline_id": null,
+      "status": "blocked",
+      "resolved_slots": {},
+      "missing_slots": [],
+      "risk": {
+        "permission": "external_execution",
+        "confirmation_required": true,
+        "final_user_confirmation": false
+      },
+      "source_event_ids": [
+        "e6adbb95-1147-4c16-83b2-fa369dcd2661"
+      ],
+      "output": {},
+      "route_source_event_ids": [],
+      "route_request": null
+    },
+    {
+      "id": "3d6f503a-b68a-41f3-9614-8118eb89c60b",
+      "task_trace_id": "9e23f3a5-a522-4163-93d2-cb407af278ec",
+      "request": "请处理 PHONE_1 报价邮件",
+      "route_type": "core_pipeline",
+      "pipeline_id": "email_pipeline",
+      "status": "needs_user_input",
+      "resolved_slots": {},
+      "missing_slots": [
+        "mailbox",
+        "email_intent"
+      ],
+      "risk": {
+        "permission": "external_message",
+        "confirmation_required": true,
+        "final_user_confirmation": true
+      },
+      "source_event_ids": [
+        "9c16ead6-df13-4584-84eb-f3c3b89dc195"
+      ],
+      "output": {
+        "question": "Please provide mailbox, email_intent for the email task."
+      },
+      "route_source_event_ids": [],
+      "route_request": null
+    },
+    {
+      "id": "dfdacc97-eded-4e40-8306-f63e2ade6e3a",
+      "task_trace_id": "c9048d51-4224-4db0-8d06-3dcdc7d99189",
+      "request": "帮我回复 RG_Alice，说 PHONE_1 报价我会尽快确认。",
+      "route_type": "core_pipeline",
+      "pipeline_id": "reply_pipeline",
+      "status": "draft_ready",
+      "resolved_slots": {
+        "channel": "whatsapp",
+        "recipient": "RG_Alice",
+        "message_intent": "PHONE_1 报价我会尽快确认"
+      },
+      "missing_slots": [],
+      "risk": {
+        "permission": "external_message",
+        "confirmation_required": true,
+        "final_user_confirmation": true
+      },
+      "source_event_ids": [
+        "ac19363b-44d2-4762-8b83-48d28a877a92"
+      ],
+      "output": {
+        "note": "Draft only. No message was sent.",
+        "draft": "PHONE_1 报价我会尽快确认",
+        "target": {
+          "channel": "whatsapp",
+          "recipient": "RG_Alice"
+        },
+        "question": "",
+        "send_message": {
+          "status": "proposed_only",
+          "requires_user_confirmation": true
+        },
+        "leakage_review": {
+          "status": "passed",
+          "matched_terms": [],
+          "reviewed_terms_count": 0
+        },
+        "confirmation_card": {
+          "draft": "PHONE_1 报价我会尽快确认",
+          "actions": [
+            "confirm_send",
+            "edit_draft",
+            "cancel"
+          ],
+          "channel": "whatsapp",
+          "recipient": "RG_Alice",
+          "risk_summary": "Final sending requires explicit confirmation."
+        }
+      },
+      "route_source_event_ids": [],
+      "route_request": null
+    }
+  ],
+  "searches": {
+    "alice_meeting": {
+      "answer": "找到 3 条相关个人记忆。",
+      "confidence": 0.88,
+      "layers": [
+        "bm25_recall",
+        "vector_recall",
+        "working_memory"
+      ],
+      "top_sources": [
+        {
+          "rank": 1,
+          "layer": "bm25_recall",
+          "summary": "rg-PHONE_1 周六下午AMOUNT_1点在武康路见，记得带 PHONE_1 报价单。",
+          "raw_text": "rg-PHONE_1 周六下午AMOUNT_1点在武康路见，记得带 PHONE_1 报价单。",
+          "source_event_ids": null
+        },
+        {
+          "rank": 2,
+          "layer": "vector_recall",
+          "summary": "rg-PHONE_1 周六下午AMOUNT_1点在武康路见，记得带 PHONE_1 报价单。",
+          "raw_text": "rg-PHONE_1 周六下午AMOUNT_1点在武康路见，记得带 PHONE_1 报价单。",
+          "source_event_ids": null
+        },
+        {
+          "rank": 3,
+          "layer": "working_memory",
+          "summary": {
+            "facts": [
+              {
+                "object": "regression rg phone_1 can you confirm phone_1 margin can you confirm whether phone_1 margin is approved",
+                "summary": "[REGRESSION rg-PHONE_1] Can you confirm PHONE_1 margin?：Can you confirm whether PHONE_1 margin is approved?",
+                "predicate": "待办",
+                "confidence": 0.7
+              },
+              {
+                "object": "regression rg phone_1 phone_1 quote deadline please send the phone_1 quote before friday 18 00 confirm margin before replying",
+                "summary": "[REGRESSION rg-PHONE_1] PHONE_1 quote deadline：Please send the PHONE_1 quote before Friday 18:00. Confirm margin before replying.",
+                "predicate": "待办",
+                "confidence": 0.8
+              }
+            ],
+            "subject": "user",
+            "current_value": "regression rg phone_1 can you confirm phone_1 margin can you confirm whether phone_1 margin is approved",
+            "state_category": "state"
+          },
+          "raw_text": null,
+          "source_event_ids": null
+        }
+      ]
+    },
+    "quote_deadline": {
+      "answer": "找到 3 条相关个人记忆。",
+      "confidence": 0.88,
+      "layers": [
+        "bm25_recall",
+        "vector_recall",
+        "working_memory"
+      ],
+      "top_sources": [
+        {
+          "rank": 1,
+          "layer": "bm25_recall",
+          "summary": "[REGRESSION rg-PHONE_1] PHONE_1 quote deadline：Please send the PHONE_1 quote before Friday 18:00. Confirm margin before replying.",
+          "raw_text": "Please send the PHONE_1 quote before Friday 18:00. Confirm margin before replying.",
+          "source_event_ids": null
+        },
+        {
+          "rank": 2,
+          "layer": "vector_recall",
+          "summary": "[REGRESSION rg-PHONE_1] PHONE_1 quote deadline：Please send the PHONE_1 quote before Friday 18:00. Confirm margin before replying.",
+          "raw_text": "Please send the PHONE_1 quote before Friday 18:00. Confirm margin before replying.",
+          "source_event_ids": null
+        },
+        {
+          "rank": 3,
+          "layer": "working_memory",
+          "summary": {
+            "facts": [
+              {
+                "object": "regression rg phone_1 can you confirm phone_1 margin can you confirm whether phone_1 margin is approved",
+                "summary": "[REGRESSION rg-PHONE_1] Can you confirm PHONE_1 margin?：Can you confirm whether PHONE_1 margin is approved?",
+                "predicate": "待办",
+                "confidence": 0.7
+              },
+              {
+                "object": "regression rg phone_1 phone_1 quote deadline please send the phone_1 quote before friday 18 00 confirm margin before replying",
+                "summary": "[REGRESSION rg-PHONE_1] PHONE_1 quote deadline：Please send the PHONE_1 quote before Friday 18:00. Confirm margin before replying.",
+                "predicate": "待办",
+                "confidence": 0.8
+              }
+            ],
+            "subject": "user",
+            "current_value": "regression rg phone_1 can you confirm phone_1 margin can you confirm whether phone_1 margin is approved",
+            "state_category": "state"
+          },
+          "raw_text": null,
+          "source_event_ids": null
+        }
+      ]
+    },
+    "invoice": {
+      "answer": "找到 2 条相关个人记忆。",
+      "confidence": 0.77,
+      "layers": [
+        "vector_recall",
+        "working_memory"
+      ],
+      "top_sources": [
+        {
+          "rank": 1,
+          "layer": "vector_recall",
+          "summary": "[REGRESSION rg-PHONE_1] Invoice INV-RG-AMOUNT_1 due：Invoice INV-RG-AMOUNT_1 for AMOUNT_1 is due next Tuesday. Please arrange payment.",
+          "raw_text": "Invoice INV-RG-AMOUNT_1 for AMOUNT_1 is due next Tuesday. Please arrange payment.",
+          "source_event_ids": null
+        },
+        {
+          "rank": 2,
+          "layer": "working_memory",
+          "summary": {
+            "facts": [
+              {
+                "object": "regression rg phone_1 invoice inv rg amount_1 due invoice inv rg amount_1 for amount_1 is due next tuesday please arrange payment",
+                "summary": "[REGRESSION rg-PHONE_1] Invoice INV-RG-AMOUNT_1 due：Invoice INV-RG-AMOUNT_1 for AMOUNT_1 is due next Tuesday. Please arrange payment.",
+                "predicate": "付款",
+                "confidence": 0.85
+              }
+            ],
+            "subject": "user",
+            "current_value": "regression rg phone_1 invoice inv rg amount_1 due invoice inv rg amount_1 for amount_1 is due next tuesday please arrange payment",
+            "state_category": "state"
+          },
+          "raw_text": null,
+          "source_event_ids": null
+        }
+      ]
+    }
+  }
+}

@@ -1,0 +1,127 @@
+{
+  "base_url": "http://206.119.171.141",
+  "checks": {
+    "collector_capability": {
+      "passed": true,
+      "http_status": 200,
+      "gmail": {
+        "mode": "api_or_browser",
+        "adapters": [
+          "composio:gmail",
+          "managed_browser_visible_dom"
+        ],
+        "supported_operations": [
+          "full_mailbox_sync_when_connected",
+          "visible_inbox_snapshot",
+          "message_subject_sender_snippet_body_when_available"
+        ],
+        "full_history_guarantee": true,
+        "limitations": [
+          "Full mailbox sync requires a connected Composio Gmail account.",
+          "Browser fallback only captures visible Gmail pages."
+        ]
+      },
+      "whatsapp": {
+        "mode": "managed_browser_visible_dom",
+        "adapters": [
+          "server_chromium_dom"
+        ],
+        "supported_operations": [
+          "visible_chat_list",
+          "opened_conversation_visible_messages",
+          "manual_reply_draft"
+        ],
+        "full_history_guarantee": false,
+        "limitations": [
+          "No official full-history WhatsApp API is used in this version.",
+          "Only logged-in, visible, or explicitly opened WhatsApp Web content can be collected."
+        ]
+      },
+      "telegram": {
+        "mode": "managed_browser_visible_dom",
+        "adapters": [
+          "server_chromium_dom"
+        ],
+        "supported_operations": [
+          "visible_chat_list",
+          "opened_conversation_visible_messages"
+        ],
+        "full_history_guarantee": false,
+        "limitations": [
+          "No Telegram account API sync is used in this version.",
+          "Only logged-in, visible, or explicitly opened Telegram Web content can be collected."
+        ]
+      }
+    },
+    "websocket_streaming_chat": {
+      "passed": true,
+      "event_types": [
+        "chat_delta",
+        "chat_delta",
+        "chat_delta",
+        "chat_delta",
+        "chat_delta",
+        "chat_delta",
+        "chat_delta",
+        "chat_delta",
+        "chat_delta",
+        "chat_delta",
+        "chat_delta",
+        "chat_delta",
+        "chat_delta",
+        "chat_delta",
+        "chat_delta",
+        "chat_delta",
+        "chat_delta",
+        "chat_delta",
+        "chat_delta",
+        "chat_delta",
+        "chat_delta",
+        "chat_delta",
+        "chat_delta",
+        "chat_delta",
+        "chat_delta",
+        "chat_delta",
+        "chat_delta",
+        "chat_delta",
+        "chat_delta",
+        "chat_delta",
+        "chat_delta",
+        "chat_delta",
+        "chat_delta",
+        "chat_delta",
+        "chat_delta",
+        "chat_delta",
+        "chat_delta",
+        "chat_done"
+      ],
+      "answer_preview": "Ping 已收到。我在线，随时待命。请问需要执行哪项具体的回归流检查或处理什么任务？请提供具体参数或指示，我将立即协助。",
+      "conversation_id": "904683f4-1505-4e30-9a88-b1186af250d4",
+      "error": null
+    },
+    "pipeline_smoke": {
+      "passed": true,
+      "route": {
+        "http_status": 200,
+        "route_type": "core_pipeline",
+        "pipeline_id": "route_pipeline"
+      },
+      "pipeline": {
+        "http_status": 200,
+        "pipeline_id": "route_pipeline",
+        "status": "completed_read_only",
+        "resolved_slots": {
+          "destination": "武康路"
+        },
+        "missing_slots": []
+      }
+    },
+    "gmail_composio_fetch": {
+      "passed": null,
+      "skipped": true,
+      "reason": "Set REGRESSION_RUN_GMAIL_COMPOSIO_FETCH=1 after confirming Gmail is connected in Composio."
+    }
+  },
+  "hard_failures": [],
+  "passed": true
+}

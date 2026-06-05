@@ -39,6 +39,21 @@ final class FloatingChatContext {
         return Collections.unmodifiableList(selected);
     }
 
+    void replaceWithHistory(List<ChatHistoryMessage> messages) {
+        turns.clear();
+        if (messages == null) return;
+        for (ChatHistoryMessage message : messages) {
+            if (message == null) continue;
+            String role = message.role == null ? "" : message.role.trim();
+            if (!"user".equals(role) && !"assistant".equals(role)) continue;
+            add(role, message.content);
+        }
+    }
+
+    int size() {
+        return turns.size();
+    }
+
     private void add(String role, String content) {
         String clean = content == null ? "" : content.trim();
         if (clean.isEmpty()) return;

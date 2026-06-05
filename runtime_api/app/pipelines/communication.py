@@ -3,6 +3,8 @@ from __future__ import annotations
 import re
 from typing import Any
 
+from app.assistant_identity.routing import AssistantCommunicationTriggerRouter
+
 
 OWNED_PIPELINES = {
     "personal_search_pipeline",
@@ -17,6 +19,49 @@ PIPELINE_STEPS = {
     "reply_pipeline": ["resolve_target", "resolve_intent", "draft_reply", "await_confirmation"],
     "email_pipeline": ["resolve_mailbox", "resolve_intent", "prepare_email_output", "await_confirmation"],
 }
+
+
+def route_assistant_owned_communication(
+    request_text: str,
+    *,
+    trigger_source: str,
+    channel_hint: str = "",
+    recipient_hint: str = "",
+    source_evidence_ids: list[str] | None = None,
+) -> dict[str, Any]:
+    decision = AssistantCommunicationTriggerRouter().route(
+        {
+            "trigger_source": trigger_source,
+            "text": request_text,
+            "channel_hint": channel_hint,
+            "recipient_hint": recipient_hint,
+            "source_evidence_ids": source_evidence_ids or [],
+        }
+    )
+
+    if decision["route_type"] == "agent":
+        return {
+            "status": "agent_required",
+            "agent_policy": {
+                "allowed_tools": decision["agent_allowed_tools"],
+                "forbidden_provider_tools": decision["forbidden_provider_tools"],
+                "must_return_to_pipeline": "outbound_message_pipeline",
+            },
+            "route_decision": decision,
+        }
+
+    if decision["route_type"] == "none":
+        return {
+            "status": "no_outbound_route",
+            "route_decision": decision,
+        }
+
+    return {
+        "status": "draft_route_ready",
+        "external_effect": "assistant_outbound_draft",
+        "route_decision": decision,
+        "confirmation_required": decision["confirmation_required"],
+    }
 
 
 def run_communication_pipeline(pipeline_id: str, request: str, context: dict[str, Any]) -> dict[str, Any] | None:
@@ -276,7 +321,7 @@ def _chat_response(request: str, context: dict[str, Any]) -> dict[str, Any]:
 def _reply(request: str, context: dict[str, Any]) -> dict[str, Any]:
     required_slots = ["recipient", "channel", "message_intent"]
     active_scope = context.get("active_source_scope") if isinstance(context.get("active_source_scope"), dict) else {}
-    recipient = _text(context.get("recipient")) or _infer_recipient(request)
+    recipient = _text(context.get("recipient")) or _infer_recipient(request) or _recipient_from_active_scope(active_scope)
     channel = _text(context.get("channel")) or _text(active_scope.get("source")) or _infer_channel(request)
     message_intent = _text(context.get("message_intent")) or _infer_reply_intent(request)
     resolved_slots = {}
@@ -370,6 +415,23 @@ def _infer_recipient(request: str) -> str:
         match = re.search(pattern, request)
         if match:
             return match.group(1).strip(" ,.:;")
+    return ""
+
+
+def _recipient_from_active_scope(active_scope: dict[str, Any]) -> str:
+    candidates = [
+        active_scope.get("conversation_label"),
+        active_scope.get("contact_name"),
+        active_scope.get("counterparty_name"),
+        active_scope.get("chat_name"),
+    ]
+    counterparty_ids = active_scope.get("counterparty_ids")
+    if isinstance(counterparty_ids, list):
+        candidates.extend(counterparty_ids)
+    for candidate in candidates:
+        value = _text(candidate)
+        if value and value.lower() not in {"unknown", "user", "me"}:
+            return value
     return ""
 
 

@@ -8,24 +8,29 @@ import android.provider.Settings;
 import android.os.Bundle;
 import android.view.Gravity;
 import android.view.MotionEvent;
+import android.view.WindowManager;
 import android.widget.Button;
 import android.widget.FrameLayout;
 import android.webkit.WebView;
 import android.webkit.WebViewClient;
+import android.webkit.WebSettings;
 
 public final class WebWorkspaceActivity extends Activity {
     static final String EXTRA_URL = "com.par.assistant.android.URL";
     static final String EXTRA_PROACTIVE_TITLE = "com.par.assistant.android.PROACTIVE_TITLE";
     static final String EXTRA_PROACTIVE_BODY = "com.par.assistant.android.PROACTIVE_BODY";
+    static final String EXTRA_REALTIME_EVENT_JSON = "com.par.assistant.android.REALTIME_EVENT_JSON";
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+        getWindow().setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE);
 
         FrameLayout root = new FrameLayout(this);
         WebView webView = new WebView(this);
         webView.getSettings().setJavaScriptEnabled(true);
         webView.getSettings().setDomStorageEnabled(true);
+        webView.getSettings().setCacheMode(WebSettings.LOAD_NO_CACHE);
         webView.setWebViewClient(new WebViewClient() {
             @Override
             public void onPageFinished(WebView view, String url) {
@@ -45,6 +50,11 @@ public final class WebWorkspaceActivity extends Activity {
                     } catch (org.json.JSONException ignored) {
                         // Static keys and string values should not fail, but avoid blocking the WebView if Android changes behavior.
                     }
+                }
+                String realtimeEventJson = getIntent().getStringExtra(EXTRA_REALTIME_EVENT_JSON);
+                if (realtimeEventJson != null && !realtimeEventJson.trim().isEmpty()) {
+                    String payload = org.json.JSONObject.quote(realtimeEventJson);
+                    view.evaluateJavascript("localStorage.setItem('nomi-pending-agent-event', " + payload + "); window.dispatchEvent(new Event('nomi-pending-agent-event'));", null);
                 }
             }
         });
