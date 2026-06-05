@@ -25,11 +25,11 @@ For V1, Nomi should help the user:
 ## Non-Goals
 
 - Do not build a generic "AI job coach" that only answers career questions.
-- Do not mass-apply, spam recruiters, or send outreach without user confirmation.
+- Do not mass-apply, add connections, or send outreach without an explicit delegated automation grant, target manifest, quota, stop conditions, and audit trace.
 - Do not fabricate experience, projects, education, compensation history, certificates, immigration status, or references.
-- Do not rely on unauthorized LinkedIn scraping, automatic LinkedIn messaging, fake accounts, or browser extensions that automate LinkedIn activity.
+- Do not rely on hidden LinkedIn scraping, fake accounts, challenge bypass, platform security evasion, or implicit-target automation.
 - Do not promise universal direct API access to every job platform. Many job boards and ATS products expose different levels of API support.
-- Do not submit applications, send messages, upload resumes, or change external systems without a final confirmation gate in V1.
+- Do not submit applications, send messages, upload resumes, or change external systems unless the action is covered by either a final user confirmation gate or a saved delegated automation grant.
 
 ## Research Summary
 
@@ -43,8 +43,8 @@ Design implication:
 
 - Use LinkedIn as a user-controlled browser surface and context source only when the user is actively operating it.
 - Nomi may help draft messages, summarize visible pages, compare JDs, and guide the user.
-- Nomi must not make V1 depend on hidden LinkedIn scraping or automatic LinkedIn sending.
-- LinkedIn outreach in V1 should be a draft plus user-confirmed manual/browser-assisted step, not a silent backend send.
+- Nomi must not make V1 depend on hidden LinkedIn scraping, implicit-target sending, or platform challenge bypass.
+- LinkedIn outreach in V1 can be draft/manual/browser-assisted by default, or quota-limited cloud Playwright execution when the user grants delegated automation for a concrete target manifest.
 
 References:
 
@@ -115,7 +115,8 @@ This design extends, not replaces, the existing Nomi architecture:
 - Core high-frequency work runs through deterministic pipelines.
 - Long-tail platform workflows use OpenClaw as a bounded executor, not as Nomi's brain.
 - External effects require confirmation.
-- Nomi-owned Gmail/WhatsApp/phone identities can be used for assistant-style outreach, but only after confirmation.
+- Nomi-owned Gmail/WhatsApp/phone identities can be used for assistant-style outreach after confirmation, and later through delegated automation once assistant-owned channel policies are explicitly enabled.
+- High-automation job-search actions use `2026-06-05-delegated-automation-permission-foundation-design.md` for action grants, target manifests, quotas, stop conditions, and audit.
 - Long-tail agent runtime remains planner + state memory + verifier + checkpoint + final evaluator.
 
 The Job Agent introduces a new career domain on top of the same primitives.
@@ -559,8 +560,8 @@ Rules:
 - post-interview thank-you;
 - rescheduling or availability reply.
 
-**Confirmation:** always required before send.  
-**LinkedIn rule:** V1 produces draft/manual browser-assist only. It must not auto-send through unauthorized automation.
+**Confirmation or delegated grant:** sending requires either one-off user confirmation or an active delegated automation grant with a target manifest, quota, and audit trace.  
+**LinkedIn rule:** V1 can support cloud Playwright LinkedIn sending only through the delegated automation foundation. It must not run unbounded background messaging or send to implicit targets.
 
 ### 9. `application_submission_pipeline`
 
@@ -579,11 +580,11 @@ Rules:
 3. prepare answers and attachments;
 4. fill or prepare the form;
 5. show final review;
-6. require explicit user confirmation;
-7. submit only after confirmation;
+6. require explicit user confirmation or a matching delegated automation grant;
+7. submit only after confirmation/grant validation;
 8. write application record and trace.
 
-**Hard stop:** if the platform has a visible `Submit`, `Send`, `Apply`, `Upload`, or irreversible control, the browser executor must stop before triggering it unless confirmation was already captured for that exact action.
+**Hard stop:** if the platform has a visible `Submit`, `Send`, `Apply`, `Upload`, or irreversible control, the browser executor must stop before triggering it unless confirmation was already captured for that exact action or the action is covered by a valid delegated automation grant.
 
 ### 10. `interview_prep_pipeline`
 
@@ -739,7 +740,7 @@ Long-tail agent is allowed when:
 - the user asks for a multi-step platform-specific workflow not covered by a Job pipeline;
 - the system needs controlled browser observation.
 
-Long-tail agent is not allowed to bypass Job pipeline rules. For example, if the agent finds that a message needs to be sent, it must return an outbound intent to `outreach_message_pipeline`; it cannot directly send.
+Long-tail agent is not allowed to bypass Job pipeline rules. For example, if the agent finds that a message needs to be sent, it must return an outbound intent to `outreach_message_pipeline`; it cannot directly send unless the automation foundation validates an explicit grant, target manifest, budget, and stop policy for the exact action.
 
 ## External Tool Strategy
 
@@ -749,7 +750,7 @@ Long-tail agent is not allowed to bypass Job pipeline rules. For example, if the
 2. Official or documented read APIs: Greenhouse, Lever, Ashby, Workable, SmartRecruiters.
 3. Browser-assisted read-only observation for user-visible pages.
 4. Composio tools for Gmail, Google Calendar, Google Drive, Notion/Docs, and approved communication channels when connected.
-5. OpenClaw for unfamiliar application portals, with stop-before-submit.
+5. Cloud Playwright/OpenClaw for unfamiliar application portals and LinkedIn workspace execution, with stop-before-submit unless delegated automation grants allow the exact action.
 
 ### LinkedIn Handling
 
@@ -758,7 +759,8 @@ LinkedIn is handled through a strict `linkedin_browser_observation_adapter`:
 - observe only user-opened pages or user-provided URLs;
 - extract visible JD/contact/profile facts with source evidence;
 - draft messages for manual/user-confirmed sending;
-- never run hidden crawling, background contact scraping, fake engagement, or unauthorized automated messaging.
+- execute add-connection, send-message, Apply/Submit, and batch application actions only when a delegated grant, target manifest, quota, and audit trace exist;
+- never run unbounded hidden crawling, implicit-target batch messaging, fake engagement, challenge bypass, or platform security evasion.
 
 ### Nomi-Owned Identity Handling
 
@@ -833,6 +835,15 @@ Confirmation required:
 - using Nomi-owned identity to speak to third parties;
 - writing to external CRMs/docs/calendar/job platforms.
 
+Delegated automation exception:
+
+- For selected actions, the user may replace repeated one-off confirmations with an active delegated automation grant defined by `2026-06-05-delegated-automation-permission-foundation-design.md`.
+- The grant must be scoped to scenario, platform, surface, and action.
+- The grant must have daily and batch quotas.
+- Batch actions must use a concrete target manifest.
+- Every executed action must write an audit trace.
+- User-owned Gmail and WhatsApp are not part of this delegated automation scope in V1; Nomi-owned identities can be added as assistant-owned channel policies later.
+
 Extra confirmation required:
 
 - offer acceptance/rejection;
@@ -865,12 +876,13 @@ V1 should implement:
 - interview prep packet with JD + resume grounded self-introduction;
 - application tracker;
 - proactive "today's next action" cards;
-- final confirmation gates.
+- final confirmation gates;
+- delegated automation hooks for LinkedIn/ATS add-connection, message, Apply/Submit, and batch application actions.
 
 V1 should not implement:
 
-- automatic LinkedIn scraping or sending;
-- automatic mass application;
+- unbounded automatic LinkedIn scraping or implicit-target sending;
+- mass application without target manifests and quotas;
 - universal ATS form submission;
 - autonomous offer acceptance or negotiation send;
 - unverified resume claims.
@@ -912,8 +924,8 @@ Given a recruiter and JD, Nomi must:
 - draft a concise intro;
 - mention why the user fits using resume evidence;
 - mention why the role/company is relevant using JD evidence;
-- require confirmation before sending;
-- use LinkedIn as manual/browser-assisted draft only in V1.
+- require confirmation or delegated automation grant before sending;
+- use LinkedIn automation only through a target-manifest, quota-limited delegated grant.
 
 ### Application Submission
 
@@ -921,8 +933,8 @@ Given an application form, Nomi must:
 
 - fill or prepare fields when evidence exists;
 - list missing fields;
-- stop before final submission;
-- ask for explicit confirmation;
+- stop before final submission unless a valid delegated grant covers the exact action;
+- ask for explicit confirmation or validate delegated grant;
 - write an application record after submission or cancellation.
 
 ### Proactive Suggestion
@@ -953,6 +965,7 @@ Test each pipeline with semantic assertions, not only success flags:
 - outreach draft cites both JD and resume;
 - interview intro is role-specific, not generic;
 - final submission stops before external effect;
+- delegated batch execution stops at quota, duplicate target, missing evidence, or platform challenge;
 - proactive suggestion is actionable and not noisy.
 
 ## Implementation Phasing
@@ -986,6 +999,8 @@ Test each pipeline with semantic assertions, not only success flags:
 - browser-assisted application preparation;
 - stop-before-submit;
 - final confirmation;
+- delegated automation permission checks;
+- quota-limited batch execution;
 - upload/submit trace.
 
 ### Phase 5: Offer And Negotiation
@@ -998,6 +1013,7 @@ Test each pipeline with semantic assertions, not only success flags:
 ## Open Questions And Known Gaps
 
 - LinkedIn official API access for this use case is not assumed. V1 must use draft/manual/browser-assisted flows.
+- LinkedIn cloud Playwright high-automation actions are allowed only through the delegated automation foundation.
 - Indeed and some aggregators may require partner access. V1 should use employer/ATS canonical URLs where possible.
 - Some ATS application APIs require employer-specific credentials, API keys, or partner status. V1 should support read-only discovery broadly and submission only where valid configuration exists.
 - Resume file generation format is not specified here; implementation can start with Markdown/PDF/DOCX depending on existing document tooling.
