@@ -19,6 +19,9 @@ def test_persist_semantics_skips_memory_and_timeline_when_event_already_processe
         def __init__(self, rowcount):
             self.rowcount = rowcount
 
+        def fetchone(self):
+            return None
+
     class Conn:
         def execute(self, sql, params=()):
             executed.append(sql)
@@ -51,6 +54,9 @@ def test_persist_semantics_writes_vector_and_suggestion_for_new_event():
     class Cursor:
         def __init__(self, rowcount):
             self.rowcount = rowcount
+
+        def fetchone(self):
+            return None
 
     class Conn:
         def execute(self, sql, params=()):
@@ -108,6 +114,51 @@ def test_rule_extract_semantics_marks_nomi_user_instruction_and_feedback():
     assert feedback["importance"] >= 0.8
 
 
+def test_dialogue_batch_semantics_summarizes_complete_rounds_without_model_call(monkeypatch):
+    from app.worker import extract_semantics, semantic_text, vector_content_for_event
+
+    def fail_model_call(messages):
+        raise AssertionError("dialogue batches should be summarized locally before memory persistence")
+
+    monkeypatch.setattr("app.worker.call_model", fail_model_call)
+
+    turns = []
+    for idx in range(15):
+        turns.append(
+            {
+                "role": "user",
+                "content": f"第{idx + 1}轮：帮我关注 PHONE_1 报价和利润率",
+                "created_at": f"2026-06-16T10:{idx:02d}:00+08:00",
+            }
+        )
+        turns.append(
+            {
+                "role": "assistant",
+                "content": "收到。我会结合报价截止和利润率继续提醒。",
+                "created_at": f"2026-06-16T10:{idx:02d}:20+08:00",
+            }
+        )
+
+    semantic = extract_semantics(
+        "nomi_chat",
+        "dialogue_batch",
+        {
+            "conversation_id": "conv-job-1",
+            "round_count": 15,
+            "turns": turns,
+        },
+    )
+
+    assert semantic["intent"] == "dialogue_batch_summary"
+    assert semantic["entities"]["turn_count"] == 30
+    assert semantic["entities"]["round_count"] == 15
+    assert semantic["entities"]["conversation_id"] == "conv-job-1"
+    assert semantic["entities"]["primary_label"] in {"deadline", "todo", "important_fact"}
+    assert "PHONE_1 报价和利润率" in semantic["summary"]
+    assert "user: 第1轮" in semantic_text(semantic)
+    assert "assistant: 收到" in vector_content_for_event("nomi_chat", "dialogue_batch", semantic)
+
+
 def test_extract_semantics_merges_model_and_rule_event_labels(monkeypatch):
     from app import worker
 
@@ -144,9 +195,324 @@ def test_extract_semantics_merges_model_and_rule_event_labels(monkeypatch):
     assert "appointment" in semantic["entities"]["classification_trace"]["rule_labels"]
 
 
+def test_whatsapp_memory_instruction_is_classified_as_important_fact(monkeypatch):
+    from app import worker
+
+    monkeypatch.setattr(worker, "call_model", lambda messages: (_ for _ in ()).throw(AssertionError("rules should handle explicit memory instructions")))
+
+    semantic = worker.extract_semantics(
+        "whatsapp",
+        "whatsapp_message",
+        {"chat_name": "大刚", "sender": "大刚", "message": "请记住：我的测试暗号是海盐拿铁。 测试码P1"},
+    )
+
+    labels = semantic["entities"]["labels"]
+    assert semantic["intent"] in {"conversation_memory", "preference_update", "generic_event"}
+    assert "important_fact" in labels
+    assert semantic["entities"]["primary_label"] == "important_fact"
+    assert "海盐拿铁" in semantic["summary"]
+
+
+def test_whatsapp_family_relation_fact_is_structured_without_model(monkeypatch):
+    from app import worker
+
+    monkeypatch.setattr(worker, "call_model", lambda messages: (_ for _ in ()).throw(AssertionError("family facts should be rules-first")))
+
+    semantic = worker.extract_semantics(
+        "whatsapp",
+        "whatsapp_message",
+        {"chat_name": "大刚", "sender": "大刚", "message": "我儿子叫王刚"},
+    )
+
+    labels = semantic["entities"]["labels"]
+    assert semantic["intent"] == "conversation_memory"
+    assert "important_fact" in labels
+    assert "relationship_signal" in labels
+    assert semantic["entities"]["primary_label"] == "important_fact"
+    assert semantic["entities"]["subject"] == "大刚"
+    assert semantic["entities"]["predicate"] == "son_name"
+    assert semantic["entities"]["object"] == "王刚"
+    assert semantic["entities"]["family_relation"] == "son"
+    assert semantic["entities"]["person"] == "大刚"
+    assert "儿子" in semantic["summary"]
+    assert "王刚" in semantic["summary"]
+    assert "大刚" in semantic["summary"]
+
+    fact = worker.fact_from_semantic("11111111-1111-1111-1111-111111111111", semantic)
+    assert fact["subject"] == "大刚"
+    assert fact["predicate"] == "son_name"
+    assert fact["object"] == "王刚"
+    assert fact["confidence"] >= 0.7
+
+
+def test_whatsapp_third_person_family_relation_fact_is_structured_without_model(monkeypatch):
+    from app import worker
+
+    monkeypatch.setattr(worker, "call_model", lambda messages: (_ for _ in ()).throw(AssertionError("family facts should be rules-first")))
+
+    semantic = worker.extract_semantics(
+        "whatsapp",
+        "whatsapp_message",
+        {"chat_name": "大刚", "sender": "大刚", "message": "王超他儿子叫张红"},
+    )
+
+    labels = semantic["entities"]["labels"]
+    assert semantic["intent"] == "conversation_memory"
+    assert "important_fact" in labels
+    assert "relationship_signal" in labels
+    assert semantic["entities"]["primary_label"] == "important_fact"
+    assert semantic["entities"]["subject"] == "王超"
+    assert semantic["entities"]["predicate"] == "son_name"
+    assert semantic["entities"]["object"] == "张红"
+    assert semantic["entities"]["family_relation"] == "son"
+    assert semantic["entities"]["person"] == "王超"
+    assert semantic["entities"]["speaker"] == "大刚"
+    assert semantic["entities"]["source_speaker"] == "大刚"
+    assert semantic["entities"]["related_person"] == "张红"
+    assert "王超" in semantic["summary"]
+    assert "儿子" in semantic["summary"]
+    assert "张红" in semantic["summary"]
+
+    fact = worker.fact_from_semantic("11111111-1111-1111-1111-111111111111", semantic)
+    assert fact["subject"] == "王超"
+    assert fact["predicate"] == "son_name"
+    assert fact["object"] == "张红"
+    assert fact["confidence"] >= 0.7
+
+
+def test_outgoing_whatsapp_family_relation_fact_still_belongs_to_user(monkeypatch):
+    from app import worker
+
+    monkeypatch.setattr(worker, "call_model", lambda messages: (_ for _ in ()).throw(AssertionError("family facts should be rules-first")))
+
+    semantic = worker.extract_semantics(
+        "whatsapp",
+        "whatsapp_message",
+        {"chat_name": "大刚", "sender": "我", "message_direction": "outgoing", "message": "我儿子叫王刚"},
+    )
+
+    assert semantic["entities"]["subject"] == "user"
+    assert semantic["entities"]["person"] == "user"
+    assert semantic["entities"]["predicate"] == "son_name"
+    assert semantic["entities"]["object"] == "王刚"
+
+
+def test_chinese_fact_intent_alias_normalizes_to_conversation_memory():
+    from app.worker import intent_for_primary_label
+
+    assert intent_for_primary_label("important_fact", "陈述事实") == "conversation_memory"
+    assert intent_for_primary_label("important_fact", "事实陈述") == "conversation_memory"
+
+
+def test_whatsapp_deadline_before_phrase_creates_deadline_agenda_without_model(monkeypatch):
+    from app import worker
+
+    monkeypatch.setattr(worker, "call_model", lambda messages: (_ for _ in ()).throw(AssertionError("deadline phrase should be rules-first")))
+
+    semantic = worker.extract_semantics(
+        "whatsapp",
+        "whatsapp_message",
+        {
+            "chat_name": "大刚",
+            "sender": "大刚",
+            "message": "周五18点前把报价单发我，记得核对成本和利润率。 测试码T1",
+        },
+    )
+    labels = semantic["entities"]["labels"]
+
+    assert "deadline" in labels
+    assert "todo" in labels
+    assert semantic["entities"]["primary_label"] == "deadline"
+
+    candidate = worker.agenda_candidate_from_semantic(
+        "11111111-1111-1111-1111-111111111111",
+        "2026-07-01T11:29:00+00:00",
+        semantic,
+    )
+
+    assert candidate is not None
+    assert candidate["type"] == "deadline"
+    assert candidate["time_window"]["start"] == "2026-07-03T18:00:00+08:00"
+    assert candidate["time_window"]["display"] == "2026-07-03 周五 18:00"
+
+
+def test_agenda_time_parser_handles_dianban_as_half_past():
+    from app.worker import extract_time_of_day, resolved_agenda_time_window
+
+    assert extract_time_of_day("明天下午3点半在人民广场见") == (15, 30)
+
+    time_window = resolved_agenda_time_window(
+        "明天下午3点半在人民广场见，带合同。",
+        "2026-07-01T11:29:00+00:00",
+    )
+
+    assert time_window["start"] == "2026-07-02T15:30:00+08:00"
+    assert time_window["display"] == "2026-07-02 周四 15:30"
+
+
+def test_whatsapp_snapshot_is_low_value_and_not_an_agenda_candidate():
+    from app import worker
+
+    semantic = worker.extract_semantics(
+        "whatsapp",
+        "whatsapp_snapshot",
+        {
+            "title": "(2) WhatsApp",
+            "visible_text": "明天下午3点半在人民广场见，带合同。 测试码M1",
+            "line_count": 23,
+        },
+    )
+
+    assert worker.should_skip_agenda_candidate(semantic, semantic["raw_data"]) is True
+    assert worker.agenda_candidate_from_semantic(
+        "11111111-1111-1111-1111-111111111111",
+        "2026-07-01T11:29:00+00:00",
+        semantic,
+    ) is None
+
+
+def test_linkedin_job_detail_snapshot_never_becomes_agenda_candidate(monkeypatch):
+    from app import worker
+
+    monkeypatch.setattr(
+        worker,
+        "call_model",
+        lambda messages: """
+        {
+          "is_agenda": true,
+          "type": "appointment",
+          "operation": "create",
+          "title": "BJAK Backend Engineer 页面跟进",
+          "status": "scheduled",
+          "certainty": "fuzzy",
+          "time_window": {"raw_text": "3 months ago"},
+          "place": "",
+          "participants": ["BJAK"],
+          "missing_fields": ["exact_time", "exact_place"],
+          "needs_clarification": true,
+          "confidence": 0.74,
+          "reason": "页面里有 3 months ago 和 Apply"
+        }
+        """,
+    )
+
+    semantic = worker.extract_semantics(
+        "linkedin",
+        "linkedin_job_description_snapshot",
+        {
+            "url": "https://www.linkedin.com/jobs/view/4388714215/",
+            "title": "Backend Engineer, AI (Agent Systems) | BJAK | LinkedIn",
+            "visible_text": (
+                "0 notifications\nSkip to footer\nBJAK\n"
+                "Backend Engineer, AI (Agent Systems)\n"
+                "Beijing, Beijing, China\n3 months ago\nApply\nSubmit application"
+            ),
+            "job_pages": [
+                {
+                    "job_id": "linkedin_job_4388714215",
+                    "source": "linkedin_browser_observation",
+                    "title": "Backend Engineer, AI (Agent Systems)",
+                    "company": "BJAK",
+                    "location": "Beijing, Beijing, China",
+                    "url": "https://www.linkedin.com/jobs/view/4388714215/",
+                    "description": "Build agent systems. Apply now.",
+                }
+            ],
+        },
+    )
+
+    assert worker.should_skip_agenda_candidate(semantic, semantic["raw_data"]) is True
+    assert worker.hybrid_agenda_candidate_from_semantic(
+        "11111111-1111-1111-1111-111111111111",
+        "2026-07-04T17:27:55+00:00",
+        semantic,
+    ) is None
+
+
+def test_linkedin_job_detail_snapshot_semantics_are_rules_only(monkeypatch):
+    from app import worker
+
+    model_called = False
+
+    def model_call(messages):
+        nonlocal model_called
+        model_called = True
+        return "{}"
+
+    monkeypatch.setattr(worker, "call_model", model_call)
+
+    semantic = worker.extract_semantics(
+        "linkedin",
+        "linkedin_job_description_snapshot",
+        {
+            "url": "https://www.linkedin.com/jobs/view/4388714215/",
+            "title": "Backend Engineer, AI (Agent Systems) | BJAK | LinkedIn",
+            "visible_text": "BJAK\nBackend Engineer, AI (Agent Systems)\n3 months ago\nApply",
+            "job_pages": [
+                {
+                    "job_id": "linkedin_job_4388714215",
+                    "source": "linkedin_browser_observation",
+                    "title": "Backend Engineer, AI (Agent Systems)",
+                    "company": "BJAK",
+                    "url": "https://www.linkedin.com/jobs/view/4388714215/",
+                }
+            ],
+        },
+    )
+
+    assert model_called is False
+    assert semantic["intent"] == "generic_event"
+    assert semantic["entities"]["primary_label"] == "low_value"
+    assert semantic["entities"]["classification_trace"]["parser_mode"] == "rules_only_browser_observation"
+
+
+def test_linkedin_job_search_results_stay_low_value_even_with_page_action_words(monkeypatch):
+    from app import worker
+
+    def model_call(messages):
+        raise AssertionError("LinkedIn browser observations should not call the semantic model")
+
+    monkeypatch.setattr(worker, "call_model", model_call)
+
+    semantic = worker.extract_semantics(
+        "linkedin",
+        "linkedin_job_search_results",
+        {
+            "url": "https://www.linkedin.com/jobs/search/?keywords=AI%20Agent%20Backend%20Engineer&location=China",
+            "title": "(18) AI Agent Backend Engineer Jobs in China | LinkedIn",
+            "text": (
+                "0 notifications total\nJobs\nTasks\nBefore you apply\n"
+                "AI Agent Engineer (MJ000014)\nLianLian\nHangzhou\n"
+                "Staff Software Engineer - AI agent, Productivity\nAirwallex\nShanghai"
+            ),
+            "job_results": [
+                {
+                    "title": "AI Agent Engineer (MJ000014)",
+                    "company": "LianLian",
+                    "location": "Hangzhou",
+                    "url": "https://www.linkedin.com/jobs/view/4386306575/",
+                },
+                {
+                    "title": "Staff Software Engineer - AI agent, Productivity",
+                    "company": "Airwallex",
+                    "location": "Shanghai",
+                    "url": "https://www.linkedin.com/jobs/view/4428797241/",
+                },
+            ],
+        },
+    )
+
+    assert semantic["intent"] == "generic_event"
+    assert semantic["entities"]["primary_label"] == "low_value"
+    assert semantic["entities"]["labels"] == ["low_value"]
+    assert semantic["entities"]["classification_trace"]["parser_mode"] == "rules_only_browser_observation"
+    assert worker.suggestion_for_event("11111111-1111-1111-1111-111111111111", semantic) is None
+
+
 def test_extract_semantics_keeps_rule_payment_label_when_model_misses_it(monkeypatch):
     from app import worker
 
+    monkeypatch.setenv("WORKER_RULES_FIRST_ENABLED", "0")
     monkeypatch.setattr(
         worker,
         "call_model",
@@ -174,9 +540,108 @@ def test_extract_semantics_keeps_rule_payment_label_when_model_misses_it(monkeyp
     assert "rule_overrode_low_value_model_label" in semantic["entities"]["classification_trace"]["validation_warnings"]
 
 
+def test_extract_semantics_keeps_rule_deadline_for_gmail_before_datetime_when_model_misses_it(monkeypatch):
+    from app import worker
+
+    monkeypatch.setenv("WORKER_RULES_FIRST_ENABLED", "0")
+    monkeypatch.setattr(
+        worker,
+        "call_model",
+        lambda messages: """
+        {
+          "intent": "generic_event",
+          "entities": {"source": "gmail", "labels": ["low_value"], "primary_label": "low_value"},
+          "importance": 0.4,
+          "summary": "Example AI recruiter follow-up."
+        }
+        """,
+    )
+
+    semantic = worker.extract_semantics(
+        "gmail",
+        "gmail_message",
+        {
+            "subject": "Example AI AI PM follow-up",
+            "body": "Please send your tailored resume and available interview slots before 2026-06-15 18:00.",
+            "text": "Example AI recruiter asks for tailored resume and availability before 2026-06-15 18:00.",
+        },
+    )
+
+    assert semantic["intent"] == "task_request"
+    assert semantic["entities"]["primary_label"] == "deadline"
+    assert "deadline" in semantic["entities"]["labels"]
+    assert "low_value" not in semantic["entities"]["labels"]
+    assert "rule_overrode_low_value_model_label" in semantic["entities"]["classification_trace"]["validation_warnings"]
+
+
+def test_extract_semantics_suppresses_linkedin_gmail_notification_before_agenda_rules(monkeypatch):
+    from app import worker
+
+    monkeypatch.setattr(worker, "call_model", lambda messages: (_ for _ in ()).throw(AssertionError("low-value platform notifications should not call model")))
+
+    semantic = worker.extract_semantics(
+        "gmail",
+        "gmail_message_snapshot",
+        {
+            "sender": "LinkedIn",
+            "subject": "You have 2 new messages",
+            "body": (
+                "You have 2 new messages\n"
+                "View messages:https://www.linkedin.com/comm/messaging/?midToken=REDACTED#1357 to:\n"
+                "See the latest updates to our AI Security & Governance platform in action with live demos.\n"
+                "Chat with our experts about tackling your biggest AI security challenges."
+            ),
+        },
+    )
+
+    assert semantic["intent"] == "generic_event"
+    assert semantic["entities"]["primary_label"] == "low_value"
+    assert semantic["entities"]["labels"] == ["low_value"]
+    assert semantic["entities"]["classification_trace"]["parser_mode"] == "rules_only_low_value_private_signal"
+    assert worker.suggestion_for_event("11111111-1111-1111-1111-111111111113", semantic) is None
+    assert worker.agenda_candidate_from_semantic(
+        "11111111-1111-1111-1111-111111111113",
+        "2026-06-26T19:17:37+08:00",
+        semantic,
+    ) is None
+
+
+def test_extract_semantics_detects_brief_chinese_meeting_text(monkeypatch):
+    from app import worker
+
+    monkeypatch.setattr(
+        worker,
+        "call_model",
+        lambda messages: """
+        {
+          "intent": "generic_event",
+          "entities": {"source": "whatsapp", "labels": ["ordinary_chat"], "primary_label": "ordinary_chat"},
+          "importance": 0.2,
+          "summary": "普通聊天。"
+        }
+        """,
+    )
+
+    semantic = worker.extract_semantics(
+        "whatsapp",
+        "whatsapp_message",
+        {
+            "sender": "RG_Alice",
+            "counterparty_id": "rg_alice",
+            "text": "2026年6月13日周六下午3点在武康路见，记得带 PHONE_1 报价单。",
+        },
+    )
+
+    assert semantic["intent"] == "social_plan"
+    assert semantic["entities"]["primary_label"] == "appointment"
+    assert "appointment" in semantic["entities"]["labels"]
+    assert "ordinary_chat" not in semantic["entities"]["labels"]
+
+
 def test_extract_semantics_preserves_source_and_normalizes_chinese_appointment_intent(monkeypatch):
     from app import worker
 
+    monkeypatch.setenv("WORKER_RULES_FIRST_ENABLED", "0")
     monkeypatch.setattr(
         worker,
         "call_model",
@@ -237,6 +702,204 @@ def test_agenda_candidate_for_fuzzy_social_plan_has_missing_exact_time_and_place
     assert candidate["source_event_ids"] == ["11111111-1111-1111-1111-111111111111"]
 
 
+def test_whatsapp_fuzzy_place_chat_is_classified_and_persisted_as_fuzzy_appointment(monkeypatch):
+    from app import worker
+
+    monkeypatch.setattr(
+        worker,
+        "call_model",
+        lambda messages: (_ for _ in ()).throw(RuntimeError("simulate semantic model timeout")),
+    )
+
+    semantic = worker.extract_semantics(
+        "whatsapp",
+        "whatsapp_message",
+        {
+            "chat_name": "大刚",
+            "sender": "大刚",
+            "message": "明天下午在保利广场详细聊一下呗",
+            "received_at": "2026-07-02T14:48:23+08:00",
+        },
+    )
+
+    assert semantic["intent"] == "social_plan"
+    assert semantic["entities"]["primary_label"] == "appointment"
+    assert "appointment" in semantic["entities"]["labels"]
+    assert semantic["entities"]["classification_trace"]["parser_mode"] == "rules_first"
+    assert semantic["importance"] >= 0.72
+
+    candidate = worker.agenda_candidate_from_semantic(
+        "78038b27-a7bf-568a-bf0f-f1fa2218f46c",
+        "2026-07-02T06:48:23+00:00",
+        semantic,
+    )
+
+    assert candidate is not None
+    assert candidate["type"] == "appointment"
+    assert candidate["certainty"] == "fuzzy"
+    assert candidate["place"] == "保利广场"
+    assert candidate["time_window"]["date"] == "2026-07-03"
+    assert candidate["time_window"]["display"] == "2026-07-03 周五"
+    assert candidate["time_window"]["has_exact_time"] is False
+    assert candidate["time_window"]["has_fuzzy_time"] is True
+    assert "exact_time" in candidate["missing_fields"]
+    assert "exact_place" not in candidate["missing_fields"]
+
+
+def test_agenda_candidate_ignores_casual_chat_with_relative_time():
+    from app.worker import agenda_candidate_from_semantic
+
+    candidate = agenda_candidate_from_semantic(
+        "11111111-1111-1111-1111-111111111111",
+        "2026-06-16T09:00:00+08:00",
+        {
+            "intent": "普通聊天",
+            "summary": "Alice 问明天是不是会下雨，提醒用户带伞。",
+            "importance": 0.32,
+            "entities": {"source": "whatsapp", "event_type": "whatsapp_message", "labels": ["普通聊天"]},
+            "raw_data": {
+                "chat_name": "Alice",
+                "sender": "Alice",
+                "message": "明天是不是会下雨啊，你出门记得带伞",
+            },
+        },
+    )
+
+    assert candidate is None
+
+
+def test_agenda_candidate_ignores_nomi_chat_planning_request_without_schedule_command():
+    from app.worker import agenda_candidate_from_semantic
+
+    candidate = agenda_candidate_from_semantic(
+        "11111111-1111-1111-1111-111111111111",
+        "2026-06-16T09:00:00+08:00",
+        {
+            "intent": "user_instruction",
+            "summary": "用户想制定明天准备产品经理面试的三步计划。",
+            "importance": 0.52,
+            "entities": {"source": "nomi_chat", "event_type": "chat_message", "labels": ["用户指令"]},
+            "raw_data": {
+                "source": "nomi_chat",
+                "role": "user",
+                "message": "帮我制定一个明天准备产品经理面试的三步计划。",
+            },
+        },
+    )
+
+    assert candidate is None
+
+
+def test_agenda_candidate_keeps_nomi_chat_explicit_reminder_request():
+    from app.worker import agenda_candidate_from_semantic
+
+    candidate = agenda_candidate_from_semantic(
+        "22222222-2222-2222-2222-222222222222",
+        "2026-06-16T09:00:00+08:00",
+        {
+            "intent": "user_instruction",
+            "summary": "用户要求提醒自己明天准备产品经理面试。",
+            "importance": 0.72,
+            "entities": {"source": "nomi_chat", "event_type": "chat_message", "labels": ["用户指令", "待办"]},
+            "raw_data": {
+                "source": "nomi_chat",
+                "role": "user",
+                "message": "提醒我明天准备产品经理面试。",
+            },
+        },
+    )
+
+    assert candidate is not None
+    assert candidate["type"] == "todo"
+    assert "exact_time" in candidate["missing_fields"]
+
+
+def test_agenda_candidate_for_cancel_keeps_cancel_operation_without_route_need():
+    from app.worker import agenda_candidate_from_semantic, suggestion_for_event
+
+    semantic = {
+        "intent": "cancel",
+        "summary": "Alex 说周日武康路见面的安排取消了，不用过去。",
+        "importance": 0.86,
+        "entities": {"source": "whatsapp", "event_type": "whatsapp_message", "labels": ["cancel", "appointment"]},
+        "raw_data": {
+            "chat_name": "Alex",
+            "sender": "Alex",
+            "message": "周日武康路见面的安排取消了，不用过去",
+        },
+    }
+
+    candidate = agenda_candidate_from_semantic(
+        "22222222-2222-2222-2222-222222222222",
+        "2026-06-16T09:00:00+08:00",
+        semantic,
+    )
+    suggestion = suggestion_for_event("22222222-2222-2222-2222-222222222222", semantic)
+
+    assert candidate is not None
+    assert candidate["operation"] == "cancel"
+    assert candidate["status"] == "canceled"
+    assert candidate["missing_fields"] == []
+    action_ids = [item["id"] for item in suggestion["metadata"]["actions"]]
+    assert "route_lookup" not in action_ids
+    assert "ride_prepare" not in action_ids
+
+
+def test_whatsapp_not_meeting_anymore_creates_cancel_agenda_without_model(monkeypatch):
+    from app import worker
+
+    monkeypatch.setattr(worker, "call_model", lambda messages: (_ for _ in ()).throw(AssertionError("cancel phrase should be rules-first")))
+
+    semantic = worker.extract_semantics(
+        "whatsapp",
+        "whatsapp_message",
+        {
+            "chat_name": "大刚",
+            "sender": "大刚",
+            "message": "我们明天不见面了，改电话聊",
+        },
+    )
+
+    assert "cancel" in semantic["entities"]["labels"]
+    candidate = worker.agenda_candidate_from_semantic(
+        "33333333-3333-3333-3333-333333333333",
+        "2026-07-02T08:32:51+00:00",
+        semantic,
+    )
+
+    assert candidate is not None
+    assert candidate["operation"] == "cancel"
+    assert candidate["status"] == "canceled"
+    assert candidate["type"] == "appointment"
+
+
+def test_not_a_meeting_policy_reminder_is_todo_not_appointment(monkeypatch):
+    from app import worker
+
+    monkeypatch.setattr(worker, "call_model", lambda messages: (_ for _ in ()).throw(AssertionError("reminder phrase should be rules-first")))
+
+    semantic = worker.extract_semantics(
+        "whatsapp",
+        "whatsapp_message",
+        {
+            "chat_name": "大刚",
+            "sender": "大刚",
+            "message": "明天3点半别忘了，不是开会，是提醒你看一下保单",
+        },
+    )
+    candidate = worker.agenda_candidate_from_semantic(
+        "44444444-4444-4444-4444-444444444444",
+        "2026-07-02T08:32:24+00:00",
+        semantic,
+    )
+
+    assert candidate is not None
+    assert candidate["type"] == "todo"
+    assert candidate["status"] == "scheduled"
+    assert "exact_place" not in candidate["missing_fields"]
+    assert "保单" in candidate["title"]
+
+
 def test_agenda_candidate_accepts_chinese_appointment_label_from_model():
     from app.worker import agenda_candidate_from_semantic
 
@@ -292,6 +955,30 @@ def test_agenda_candidate_for_exact_meeting_has_no_missing_fields():
     assert candidate["missing_fields"] == []
     assert candidate["needs_clarification"] is False
     assert candidate["time_window"]["has_exact_time"] is True
+    assert candidate["time_window"]["start"] == "2026-05-28T19:00:00+08:00"
+
+
+def test_agenda_candidate_resolves_explicit_date_time_and_square_place():
+    from app.worker import agenda_candidate_from_semantic
+
+    candidate = agenda_candidate_from_semantic(
+        "11111111-1111-1111-1111-111111111111",
+        "2026-06-09T05:00:00+00:00",
+        {
+            "intent": "social_plan",
+            "summary": "赵测试约我 2026-06-10 15:00 在人民广场见。",
+            "importance": 0.86,
+            "entities": {"source": "whatsapp", "event_type": "whatsapp_message"},
+            "raw_data": {"chat_name": "赵测试", "sender": "赵测试", "message": "2026-06-10 15:00 在人民广场见，带合同。"},
+        },
+    )
+
+    assert candidate is not None
+    assert candidate["certainty"] == "exact"
+    assert candidate["place"] == "人民广场"
+    assert candidate["missing_fields"] == []
+    assert candidate["time_window"]["start"] == "2026-06-10T15:00:00+08:00"
+    assert candidate["time_window"]["display"] == "2026-06-10 周三 15:00"
 
 
 def test_agenda_candidate_resolves_tomorrow_afternoon_to_concrete_local_date():
@@ -337,6 +1024,182 @@ def test_agenda_candidate_resolves_weekday_morning_to_concrete_local_date():
     assert candidate["time_window"]["weekday"] == "周五"
     assert candidate["time_window"]["start"] == "2026-06-05T10:00:00+08:00"
     assert candidate["time_window"]["display"] == "2026-06-05 周五 10:00"
+    assert candidate["place"] == "静安寺地铁站"
+
+
+def test_agenda_candidate_resolves_english_next_weekday_time_to_concrete_local_date():
+    from app.worker import agenda_candidate_from_semantic
+
+    candidate = agenda_candidate_from_semantic(
+        "11111111-1111-1111-1111-111111111111",
+        "2026-06-15T10:47:44+00:00",
+        {
+            "intent": "social_plan",
+            "summary": "Product Manager interview next Tuesday: can you join next Tuesday at 10:00 AM?",
+            "importance": 0.8,
+            "entities": {"source": "gmail", "event_type": "gmail_message_snapshot"},
+            "raw_data": {
+                "subject": "Product Manager interview next Tuesday",
+                "sender": "Alpha HR",
+                "body": "Can you join a product manager interview next Tuesday at 10:00 AM?",
+            },
+        },
+    )
+
+    assert candidate is not None
+    assert candidate["time_window"]["date"] == "2026-06-23"
+    assert candidate["time_window"]["weekday"] == "周二"
+    assert candidate["time_window"]["start"] == "2026-06-23T10:00:00+08:00"
+    assert candidate["time_window"]["display"] == "2026-06-23 周二 10:00"
+    assert "exact_time" not in candidate["missing_fields"]
+
+
+def test_agenda_candidate_extracts_place_before_meet_without_at_marker():
+    from app.worker import agenda_candidate_from_semantic
+
+    candidate = agenda_candidate_from_semantic(
+        "11111111-1111-1111-1111-111111111111",
+        "2026-06-09T05:00:00+00:00",
+        {
+            "intent": "social_plan",
+            "summary": "Alex 约我周六下午3点武康路见。",
+            "importance": 0.82,
+            "entities": {"source": "whatsapp", "event_type": "whatsapp_message"},
+            "raw_data": {"chat_name": "Alex", "sender": "Alex", "message": "周六下午3点武康路见。"},
+        },
+    )
+
+    assert candidate is not None
+    assert candidate["place"] == "武康路"
+    assert "exact_place" not in candidate["missing_fields"]
+
+
+def test_agenda_candidate_handles_interview_reschedule_and_pending_zoom_link():
+    from app.worker import agenda_candidate_from_semantic
+
+    candidate = agenda_candidate_from_semantic(
+        "11111111-1111-1111-1111-111111111111",
+        "2026-06-09T05:00:00+00:00",
+        {
+            "intent": "generic_event",
+            "summary": "Maya 说面试 panel 改到明天10:30，Zoom 链接稍后发。",
+            "importance": 0.86,
+            "entities": {"source": "telegram", "event_type": "telegram_message"},
+            "raw_data": {"chat_name": "Maya", "sender": "Maya", "message": "面试 panel 改到明天10:30，Zoom 链接我稍后发。"},
+        },
+    )
+
+    assert candidate is not None
+    assert candidate["type"] == "appointment"
+    assert candidate["operation"] == "reschedule"
+    assert candidate["time_window"]["start"] == "2026-06-10T10:30:00+08:00"
+    assert candidate["metadata"]["pending_artifacts"] == ["zoom_link"]
+    assert "exact_link" in candidate["missing_fields"]
+    assert "exact_place" not in candidate["missing_fields"]
+    assert candidate["needs_clarification"] is True
+
+
+def test_rule_summary_agenda_title_and_suggestion_body_use_readable_message_text():
+    from app.worker import agenda_candidate_from_semantic, rule_extract_semantics, suggestion_for_event
+
+    raw_data = {
+        "run_id": "rg-readable",
+        "channel": "whatsapp",
+        "chat_id": "wa-readable",
+        "contact": "Bob",
+        "direction": "inbound",
+        "text": "2026-06-13 15:00在武康路咖啡店见，我带合同。",
+        "received_at": "2026-06-12T10:31:00+08:00",
+    }
+
+    semantic = rule_extract_semantics("whatsapp", "whatsapp_message", raw_data)
+    semantic["intent"] = "social_plan"
+    semantic["importance"] = 0.72
+    semantic["entities"]["labels"] = ["appointment"]
+    semantic["entities"]["primary_label"] = "appointment"
+    semantic["raw_data"] = raw_data
+
+    candidate = agenda_candidate_from_semantic(
+        "11111111-1111-1111-1111-111111111111",
+        "2026-06-12T02:31:00+00:00",
+        semantic,
+    )
+    suggestion = suggestion_for_event("11111111-1111-1111-1111-111111111111", semantic)
+
+    assert semantic["summary"] == "2026-06-13 15:00在武康路咖啡店见，我带合同。"
+    assert candidate is not None
+    assert candidate["title"] == "2026-06-13 15:00在武康路咖啡店见，我带合同。"
+    assert candidate["time_window"]["raw_text"] == "2026-06-13 15:00在武康路咖啡店见，我带合同。"
+    assert suggestion is not None
+    assert suggestion["body"] == "这条信息可能需要跟进：2026-06-13 15:00在武康路咖啡店见，我带合同。"
+    assert "run_id" not in suggestion["body"]
+
+
+def test_agenda_time_ignores_identifier_digits_before_colon_and_uses_explicit_time():
+    from app.worker import agenda_candidate_from_semantic
+
+    candidate = agenda_candidate_from_semantic(
+        "11111111-1111-1111-1111-111111111111",
+        "2026-06-12T02:40:00+00:00",
+        {
+            "intent": "task_request",
+            "summary": "Nomi regression job deadline fix5：Please submit before 2026-06-15 18:00.",
+            "importance": 0.55,
+            "entities": {"source": "gmail", "event_type": "gmail_message", "labels": ["deadline"], "primary_label": "deadline"},
+            "raw_data": {
+                "thread_id": "gmail-job-003",
+                "subject": "Nomi regression job deadline fix5",
+                "body": "Please submit before 2026-06-15 18:00.",
+            },
+        },
+    )
+
+    assert candidate is not None
+    assert candidate["time_window"]["start"] == "2026-06-15T18:00:00+08:00"
+
+
+def test_agenda_place_extracts_location_still_phrase():
+    from app.worker import agenda_candidate_from_semantic
+
+    candidate = agenda_candidate_from_semantic(
+        "11111111-1111-1111-1111-111111111111",
+        "2026-06-12T02:42:00+00:00",
+        {
+            "intent": "schedule",
+            "summary": "刚才那个见面改到2026-06-14 10:00，地点还是武康路咖啡店。",
+            "importance": 0.62,
+            "entities": {"source": "whatsapp", "event_type": "whatsapp_message", "labels": ["reschedule", "appointment"], "primary_label": "reschedule"},
+            "raw_data": {"chat_id": "wa-friend-cara", "contact": "Cara", "text": "刚才那个见面改到2026-06-14 10:00，地点还是武康路咖啡店。"},
+        },
+    )
+
+    assert candidate is not None
+    assert candidate["place"] == "武康路咖啡店"
+    assert candidate["certainty"] == "exact"
+    assert candidate["missing_fields"] == []
+
+
+def test_low_confidence_fuzzy_social_plan_only_asks_for_clarification_actions():
+    from app.worker import suggestion_for_event
+
+    suggestion = suggestion_for_event(
+        "11111111-1111-1111-1111-111111111111",
+        {
+            "intent": "social_plan",
+            "summary": "Alex 说可能周末聊下。",
+            "importance": 0.5,
+            "entities": {"source": "whatsapp", "event_type": "whatsapp_message", "labels": ["appointment"], "primary_label": "appointment"},
+            "raw_data": {"chat_name": "Alex", "sender": "Alex", "message": "可能周末聊下。"},
+        },
+    )
+
+    assert suggestion is not None
+    actions = suggestion["metadata"]["actions"]
+    labels = [item["label"] for item in actions]
+    assert "补充时间地点" in labels
+    assert "稍后提醒" in labels
+    assert "查路线" not in labels
+    assert "帮我打车" not in labels
 
 
 def test_agenda_dedupe_key_links_reschedule_to_original_conversation():
@@ -369,6 +1232,94 @@ def test_agenda_dedupe_key_links_reschedule_to_original_conversation():
     assert reschedule is not None
     assert reschedule["operation"] == "reschedule"
     assert reschedule["metadata"]["dedupe_key"] == original["metadata"]["dedupe_key"]
+
+
+def test_agenda_dedupe_key_separates_distinct_appointments_in_same_chat():
+    from app.worker import agenda_candidate_from_semantic
+
+    telegram_meeting = agenda_candidate_from_semantic(
+        "11111111-1111-1111-1111-111111111111",
+        "2026-06-30T09:39:33+00:00",
+        {
+            "intent": "social_plan",
+            "summary": "NOMI_REG_TG_0629 周五10点静安寺地铁站见 Maya",
+            "importance": 0.82,
+            "entities": {"source": "telegram", "event_type": "telegram_message_preview"},
+            "raw_data": {
+                "chat_name": "Ask",
+                "message": "NOMI_REG_TG_0629 周五10点静安寺地铁站见 Maya",
+                "capture_scope": "telegram_open_chat_message",
+            },
+        },
+    )
+    whatsapp_meeting_seen_in_same_chat = agenda_candidate_from_semantic(
+        "22222222-2222-2222-2222-222222222222",
+        "2026-06-30T09:39:34+00:00",
+        {
+            "intent": "social_plan",
+            "summary": "NOMI_REG_WA_0629 明天15:30人民广场见，带合同",
+            "importance": 0.82,
+            "entities": {"source": "telegram", "event_type": "telegram_message_preview"},
+            "raw_data": {
+                "chat_name": "Ask",
+                "message": "NOMI_REG_WA_0629 明天15:30人民广场见，带合同",
+                "capture_scope": "telegram_open_chat_message",
+            },
+        },
+    )
+
+    assert telegram_meeting is not None
+    assert whatsapp_meeting_seen_in_same_chat is not None
+    assert telegram_meeting["metadata"]["dedupe_key"] != whatsapp_meeting_seen_in_same_chat["metadata"]["dedupe_key"]
+    assert telegram_meeting["place"] == "静安寺地铁站"
+    assert whatsapp_meeting_seen_in_same_chat["place"] == "人民广场"
+
+
+def test_agenda_dedupe_key_ignores_unstable_whatsapp_participant_for_same_message():
+    from app.worker import agenda_candidate_from_semantic
+
+    timestamp = "2026-07-01T11:29:00+00:00"
+    message = "明天下午3点半在人民广场见，带合同。 测试码M1"
+    history_candidate = agenda_candidate_from_semantic(
+        "11111111-1111-1111-1111-111111111111",
+        timestamp,
+        {
+            "intent": "social_plan",
+            "summary": message,
+            "importance": 0.92,
+            "entities": {"source": "whatsapp", "event_type": "history_scroll_sync"},
+            "raw_data": {
+                "chat_name": "大刚",
+                "sender": "大刚",
+                "message": message,
+                "capture_scope": "whatsapp_open_chat_message",
+            },
+        },
+    )
+    observer_candidate = agenda_candidate_from_semantic(
+        "22222222-2222-2222-2222-222222222222",
+        timestamp,
+        {
+            "intent": "social_plan",
+            "summary": message,
+            "importance": 0.9,
+            "entities": {"source": "whatsapp", "event_type": "mutation_observer"},
+            "raw_data": {
+                "chat_name": "你好呀",
+                "sender": "你好呀",
+                "message": message,
+                "capture_scope": "whatsapp_open_chat_message",
+            },
+        },
+    )
+
+    assert history_candidate is not None
+    assert observer_candidate is not None
+    assert history_candidate["time_window"]["display"] == "2026-07-02 周四 15:30"
+    assert observer_candidate["time_window"]["display"] == "2026-07-02 周四 15:30"
+    assert history_candidate["place"] == "人民广场"
+    assert observer_candidate["place"] == "人民广场"
+    assert history_candidate["metadata"]["dedupe_key"] == observer_candidate["metadata"]["dedupe_key"]
 
 
 def test_hybrid_agenda_uses_valid_model_candidate_with_rule_safety(monkeypatch):
@@ -416,6 +1367,43 @@ def test_hybrid_agenda_uses_valid_model_candidate_with_rule_safety(monkeypatch):
     assert candidate["needs_clarification"] is True
     assert candidate["metadata"]["parser_mode"] == "hybrid_model_rules"
     assert candidate["metadata"]["model_candidate"]["confidence"] == 0.91
+    assert candidate["metadata"]["rule_candidate"]["type"] == "appointment"
+
+
+def test_hybrid_agenda_uses_rules_fast_path_for_complete_exact_candidate(monkeypatch):
+    from app import worker
+
+    monkeypatch.setenv("AGENDA_MODEL_ENABLED", "1")
+
+    def fail_model(messages):
+        raise AssertionError("model should not be called for complete exact rule candidate")
+
+    monkeypatch.setattr(worker, "call_model", fail_model)
+    candidate = worker.hybrid_agenda_candidate_from_semantic(
+        "11111111-1111-1111-1111-111111111111",
+        "2026-06-20T13:06:15+00:00",
+        {
+            "intent": "social_plan",
+            "summary": "明天下午4点人民广场见",
+            "importance": 0.8,
+            "entities": {"source": "gmail", "event_type": "gmail_message_snapshot"},
+            "raw_data": {
+                "subject": "明天下午4点人民广场见",
+                "body": "请明天下午4点在人民广场见面，带合同。",
+                "from": '"张子长" <sender@example.com>',
+            },
+        },
+    )
+
+    assert candidate is not None
+    assert candidate["title"] == "明天下午4点人民广场见"
+    assert candidate["place"] == "人民广场"
+    assert candidate["certainty"] == "exact"
+    assert candidate["missing_fields"] == []
+    assert candidate["needs_clarification"] is False
+    assert candidate["time_window"]["start"] == "2026-06-21T16:00:00+08:00"
+    assert candidate["metadata"]["parser_mode"] == "rules_first_exact"
+    assert candidate["metadata"]["validation_warnings"] == []
     assert candidate["metadata"]["rule_candidate"]["type"] == "appointment"
 
 
@@ -608,6 +1596,397 @@ def test_persist_agenda_writes_item_and_version_with_reason():
     assert "Alex 说那就周日见" in version_params[5]
 
 
+def test_persist_agenda_creates_offline_time_reminder_40_minutes_before_start():
+    from app.worker import persist_agenda
+
+    executed = []
+
+    class Cursor:
+        rowcount = 1
+
+        def __init__(self, rows=None):
+            self.rows = rows or []
+
+        def fetchone(self):
+            return self.rows[0] if self.rows else None
+
+    class Conn:
+        def execute(self, sql, params=()):
+            executed.append((sql, params))
+            normalized = " ".join(sql.split())
+            if "FROM agenda_items WHERE metadata->>'dedupe_key'" in normalized:
+                return Cursor()
+            if "INSERT INTO agenda_items" in normalized:
+                return Cursor([("22222222-2222-2222-2222-222222222222",)])
+            return Cursor()
+
+    persist_agenda(
+        Conn(),
+        "11111111-1111-1111-1111-111111111111",
+        "2026-06-29T09:00:00+08:00",
+        {
+            "intent": "social_plan",
+            "summary": "NOMI_REG_WA_0629 明天15:30人民广场见，带合同",
+            "importance": 0.9,
+            "entities": {"source": "whatsapp", "event_type": "whatsapp_message"},
+            "raw_data": {
+                "chat_name": "陈子扬",
+                "sender": "陈子扬",
+                "message": "NOMI_REG_WA_0629 明天15:30人民广场见，带合同",
+            },
+        },
+    )
+
+    reminder_sql, reminder_params = next(item for item in executed if "INSERT INTO agenda_reminders" in item[0])
+    metadata = json.loads(reminder_params[8])
+    assert "agenda_reminders" in reminder_sql
+    assert str(reminder_params[1]) == "22222222-2222-2222-2222-222222222222"
+    assert reminder_params[4] == 40
+    assert reminder_params[5] == "agenda_reminder:22222222-2222-2222-2222-222222222222:2026-06-30T15:30:00+08:00:40m"
+    assert reminder_params[2].isoformat() == "2026-06-30T15:30:00+08:00"
+    assert reminder_params[3].isoformat() == "2026-06-30T14:50:00+08:00"
+    assert metadata["reminder_policy"]["event_modality"] == "offline"
+    assert metadata["reminder_policy"]["reason"] == "detected_physical_location"
+    assert "查路线" in json.dumps(metadata["actions"], ensure_ascii=False)
+
+
+def test_persist_agenda_creates_online_meeting_reminder_10_minutes_before_start():
+    from app.worker import persist_agenda
+
+    executed = []
+
+    class Cursor:
+        rowcount = 1
+
+        def __init__(self, rows=None):
+            self.rows = rows or []
+
+        def fetchone(self):
+            return self.rows[0] if self.rows else None
+
+    class Conn:
+        def execute(self, sql, params=()):
+            executed.append((sql, params))
+            normalized = " ".join(sql.split())
+            if "FROM agenda_items WHERE metadata->>'dedupe_key'" in normalized:
+                return Cursor()
+            if "INSERT INTO agenda_items" in normalized:
+                return Cursor([("33333333-3333-3333-3333-333333333333",)])
+            return Cursor()
+
+    persist_agenda(
+        Conn(),
+        "11111111-1111-1111-1111-111111111111",
+        "2026-06-29T09:00:00+08:00",
+        {
+            "intent": "schedule",
+            "summary": "明天15:00 Zoom线上会议 https://zoom.us/j/123",
+            "importance": 0.88,
+            "entities": {"source": "gmail", "event_type": "gmail_thread_snapshot"},
+            "raw_data": {
+                "subject": "项目同步会",
+                "sender": "pm@example.com",
+                "body": "明天15:00 Zoom线上会议 https://zoom.us/j/123",
+            },
+        },
+    )
+
+    reminder_sql, reminder_params = next(item for item in executed if "INSERT INTO agenda_reminders" in item[0])
+    metadata = json.loads(reminder_params[8])
+    assert "agenda_reminders" in reminder_sql
+    assert reminder_params[4] == 10
+    assert reminder_params[2].isoformat() == "2026-06-30T15:00:00+08:00"
+    assert reminder_params[3].isoformat() == "2026-06-30T14:50:00+08:00"
+    assert metadata["reminder_policy"]["event_modality"] == "online"
+    assert metadata["reminder_policy"]["reason"] == "detected_online_meeting"
+    assert "打开会议" in json.dumps(metadata["actions"], ensure_ascii=False)
+
+
+def test_persist_agenda_creates_deadline_reminder_without_meeting_copy():
+    from app.worker import persist_agenda
+
+    executed = []
+
+    class Cursor:
+        rowcount = 1
+
+        def __init__(self, rows=None):
+            self.rows = rows or []
+
+        def fetchone(self):
+            return self.rows[0] if self.rows else None
+
+    class Conn:
+        def execute(self, sql, params=()):
+            executed.append((sql, params))
+            normalized = " ".join(sql.split())
+            if "FROM agenda_items WHERE metadata->>'dedupe_key'" in normalized:
+                return Cursor()
+            if "INSERT INTO agenda_items" in normalized:
+                return Cursor([("55555555-5555-5555-5555-555555555555",)])
+            return Cursor()
+
+    persist_agenda(
+        Conn(),
+        "11111111-1111-1111-1111-111111111111",
+        "2026-07-01T20:27:18+08:00",
+        {
+            "intent": "task_request",
+            "summary": "周五18点前把报价单发我，记得核对成本和利润率。 测试码T1",
+            "importance": 0.8,
+            "entities": {"source": "whatsapp", "event_type": "whatsapp_message", "labels": ["deadline", "todo"]},
+            "raw_data": {
+                "chat_name": "大刚",
+                "sender": "大刚",
+                "message": "周五18点前把报价单发我，记得核对成本和利润率。 测试码T1",
+            },
+        },
+    )
+
+    reminder_sql, reminder_params = next(item for item in executed if "INSERT INTO agenda_reminders" in item[0])
+    metadata = json.loads(reminder_params[8])
+    assert "agenda_reminders" in reminder_sql
+    assert reminder_params[4] == 60
+    assert reminder_params[2].isoformat() == "2026-07-03T18:00:00+08:00"
+    assert reminder_params[3].isoformat() == "2026-07-03T17:00:00+08:00"
+    assert metadata["reminder_policy"]["event_modality"] == "deadline"
+    assert metadata["reminder_policy"]["reason"] == "detected_deadline"
+    assert "会议链接" not in reminder_params[7]
+    assert "打开会议" not in json.dumps(metadata["actions"], ensure_ascii=False)
+
+
+def test_persist_agenda_does_not_create_time_reminder_for_fuzzy_event():
+    from app.worker import persist_agenda
+
+    executed = []
+
+    class Cursor:
+        rowcount = 1
+
+        def __init__(self, rows=None):
+            self.rows = rows or []
+
+        def fetchone(self):
+            return self.rows[0] if self.rows else None
+
+    class Conn:
+        def execute(self, sql, params=()):
+            executed.append((sql, params))
+            normalized = " ".join(sql.split())
+            if "FROM agenda_items WHERE metadata->>'dedupe_key'" in normalized:
+                return Cursor()
+            if "INSERT INTO agenda_items" in normalized:
+                return Cursor([("44444444-4444-4444-4444-444444444444",)])
+            return Cursor()
+
+    persist_agenda(
+        Conn(),
+        "11111111-1111-1111-1111-111111111111",
+        "2026-06-29T09:00:00+08:00",
+        {
+            "intent": "social_plan",
+            "summary": "Maya 说周末找时间见。",
+            "importance": 0.82,
+            "entities": {"source": "telegram", "event_type": "telegram_message"},
+            "raw_data": {"chat_name": "Maya", "sender": "Maya", "message": "周末找时间见"},
+        },
+    )
+
+    assert not any("INSERT INTO agenda_reminders" in sql for sql, _ in executed)
+
+
+def test_dispatch_due_agenda_reminders_publishes_realtime_suggestion_once():
+    from app.worker import dispatch_due_agenda_reminders
+
+    executed = []
+    published = []
+
+    class Cursor:
+        rowcount = 1
+
+        def __init__(self, rows=None):
+            self.rows = rows or []
+
+        def fetchone(self):
+            return self.rows[0] if self.rows else None
+
+        def fetchall(self):
+            return self.rows
+
+    class Conn:
+        def execute(self, sql, params=()):
+            executed.append((sql, params))
+            normalized = " ".join(sql.split())
+            if "FROM agenda_reminders r" in normalized:
+                return Cursor(
+                    [
+                        (
+                            "55555555-5555-5555-5555-555555555555",
+                            "22222222-2222-2222-2222-222222222222",
+                            "agenda_reminder:22222222-2222-2222-2222-222222222222:2026-06-30T15:30:00+08:00:40m",
+                            "即将出发：人民广场见面",
+                            "提醒：你 2026-06-30 周二 15:30 要去人民广场见面，记得带合同。",
+                            {
+                                "source": "whatsapp",
+                                "actions": [{"id": "route_lookup", "label": "查路线"}],
+                                "source_event_ids": ["11111111-1111-1111-1111-111111111111"],
+                            },
+                            ["11111111-1111-1111-1111-111111111111"],
+                        )
+                    ]
+                )
+            if "FROM events" in normalized:
+                return Cursor([(params[0],)])
+            if "FROM proactive_suggestions" in normalized:
+                return Cursor()
+            return Cursor()
+
+    class Redis:
+        def publish(self, channel, payload):
+            published.append((channel, payload))
+
+    dispatched = dispatch_due_agenda_reminders(Conn(), Redis(), limit=10)
+
+    assert dispatched == 1
+    assert any("INSERT INTO proactive_suggestions" in sql for sql, _ in executed)
+    assert any("UPDATE agenda_reminders" in sql and "sent_at" in sql for sql, _ in executed)
+    assert published[0][0] == "par:realtime"
+    payload = json.loads(published[0][1])
+    assert payload["type"] == "proactive_message"
+    assert payload["title"] == "即将出发：人民广场见面"
+    assert payload["actions"][0]["label"] == "查路线"
+
+
+def test_dispatch_due_agenda_reminders_without_source_event_uses_null_fk():
+    from app.worker import dispatch_due_agenda_reminders
+
+    executed = []
+    published = []
+
+    class Cursor:
+        rowcount = 1
+
+        def __init__(self, rows=None):
+            self.rows = rows or []
+
+        def fetchone(self):
+            return self.rows[0] if self.rows else None
+
+        def fetchall(self):
+            return self.rows
+
+    class Conn:
+        def execute(self, sql, params=()):
+            executed.append((sql, params))
+            normalized = " ".join(sql.split())
+            if "FROM agenda_reminders r" in normalized:
+                return Cursor(
+                    [
+                        (
+                            "55555555-5555-5555-5555-555555555555",
+                            "22222222-2222-2222-2222-222222222222",
+                            "agenda_reminder:22222222-2222-2222-2222-222222222222:2026-06-30T15:30:00+08:00:40m",
+                            "即将出发：人民广场见面",
+                            "提醒：你 2026-06-30 周二 15:30 要去人民广场见面，记得带合同。",
+                            {"source": "agenda", "actions": [{"id": "route_lookup", "label": "查路线"}]},
+                            [],
+                        )
+                    ]
+                )
+            if "FROM proactive_suggestions" in normalized:
+                return Cursor()
+            return Cursor()
+
+    class Redis:
+        def publish(self, channel, payload):
+            published.append((channel, payload))
+
+    dispatched = dispatch_due_agenda_reminders(Conn(), Redis(), limit=10)
+
+    assert dispatched == 1
+    insert_params = next(params for sql, params in executed if "INSERT INTO proactive_suggestions" in sql)
+    assert insert_params[1] is None
+    payload = json.loads(published[0][1])
+    assert payload["source_event_id"] == ""
+
+
+def test_dispatch_due_agenda_reminders_skips_stale_source_event_ids():
+    from app.worker import dispatch_due_agenda_reminders
+
+    executed = []
+    published = []
+    missing_event_id = "c1b886d2-120b-58c8-8350-5d0efe0e8813"
+    valid_event_id = "b4d40ebe-d118-4280-b79e-6e912761b286"
+
+    class Cursor:
+        rowcount = 1
+
+        def __init__(self, rows=None):
+            self.rows = rows or []
+
+        def fetchone(self):
+            return self.rows[0] if self.rows else None
+
+        def fetchall(self):
+            return self.rows
+
+    class Conn:
+        def execute(self, sql, params=()):
+            executed.append((sql, params))
+            normalized = " ".join(sql.split())
+            if "FROM agenda_reminders r" in normalized:
+                return Cursor(
+                    [
+                        (
+                            "ae01e221-5b9c-4fef-b917-bc6b9d4d1e62",
+                            "17a11760-fb46-4133-8e97-8c29584e3e37",
+                            "agenda_reminder:17a11760-fb46-4133-8e97-8c29584e3e37:2026-07-03T10:00:00+08:00:40m",
+                            "即将出发：静安寺地铁站见面",
+                            "提醒：你 2026-07-03 周五 10:00 要去静安寺地铁站见面。",
+                            {"source": "telegram", "source_event_ids": [missing_event_id, valid_event_id]},
+                            [missing_event_id, valid_event_id],
+                        )
+                    ]
+                )
+            if "FROM events" in normalized:
+                return Cursor([(valid_event_id,)] if params and params[0] == valid_event_id else [])
+            if "FROM proactive_suggestions" in normalized:
+                return Cursor()
+            return Cursor()
+
+    class Redis:
+        def publish(self, channel, payload):
+            published.append((channel, payload))
+
+    dispatched = dispatch_due_agenda_reminders(Conn(), Redis(), limit=10)
+
+    assert dispatched == 1
+    insert_params = next(params for sql, params in executed if "INSERT INTO proactive_suggestions" in sql)
+    assert insert_params[1] == valid_event_id
+    payload = json.loads(published[0][1])
+    assert payload["source_event_id"] == valid_event_id
+
+
+def test_maybe_dispatch_due_agenda_reminders_respects_scan_interval(monkeypatch):
+    import app.worker as worker
+
+    calls = []
+
+    monkeypatch.setattr(worker, "WORKER_REMINDER_SCAN_INTERVAL_SECONDS", 30)
+    monkeypatch.setattr(worker.time, "monotonic", lambda: 100.0)
+
+    def fake_dispatch(redis_client, last_scan_at):
+        calls.append((redis_client, last_scan_at))
+        return 100.0
+
+    monkeypatch.setattr(worker, "_dispatch_due_agenda_reminders_if_due", fake_dispatch)
+
+    assert worker.maybe_dispatch_due_agenda_reminders("redis", 80.0) == 80.0
+    assert calls == []
+    assert worker.maybe_dispatch_due_agenda_reminders("redis", 69.0) == 100.0
+    assert calls == [("redis", 69.0)]
+
+
 def test_persist_agenda_version_records_previous_value_when_updating_existing_item():
     from app.worker import persist_agenda
 
@@ -721,6 +2100,125 @@ def test_suggestion_for_chinese_appointment_intent_and_label_includes_route_ride
     assert action_ids == ["route_lookup", "ride_prepare", "snooze"]
 
 
+def test_suggestion_for_nomi_chat_events_are_suppressed_at_source():
+    from app.worker import suggestion_for_event
+
+    user_message_suggestion = suggestion_for_event(
+        "11111111-1111-1111-1111-111111111111",
+        {
+            "intent": "user_instruction",
+            "summary": "user said to Nomi: 保利广场的安排缺什么信息？请给出来源。",
+            "importance": 0.76,
+            "entities": {
+                "source": "nomi_chat",
+                "event_type": "user_message",
+                "labels": ["todo", "user_instruction"],
+                "primary_label": "todo",
+                "conversation_id": "conv-1",
+            },
+            "raw_data": {
+                "source": "nomi_chat",
+                "event_type": "user_message",
+                "role": "user",
+                "content": "保利广场的安排缺什么信息？请给出来源。",
+            },
+        },
+    )
+    dialogue_batch_suggestion = suggestion_for_event(
+        "22222222-2222-2222-2222-222222222222",
+        {
+            "intent": "dialogue_batch_summary",
+            "summary": "Nomi 对话批次摘要：用户关注人民广场会面，最后回复为下午4点。",
+            "importance": 0.78,
+            "entities": {
+                "source": "nomi_chat",
+                "event_type": "dialogue_batch",
+                "labels": ["todo"],
+                "primary_label": "todo",
+                "conversation_id": "conv-1",
+            },
+            "raw_data": {
+                "source": "nomi_chat",
+                "event_type": "dialogue_batch",
+                "conversation_id": "conv-1",
+            },
+        },
+    )
+
+    assert user_message_suggestion is None
+    assert dialogue_batch_suggestion is None
+
+
+def test_suggestion_suppresses_whatsapp_title_badge_snapshot():
+    from app.worker import suggestion_for_event
+
+    suggestion = suggestion_for_event(
+        "33333333-3333-3333-3333-333333333333",
+        {
+            "intent": "social_plan",
+            "summary": "(2) WhatsApp",
+            "importance": 0.9,
+            "entities": {
+                "source": "whatsapp",
+                "event_type": "whatsapp_snapshot",
+                "labels": ["appointment"],
+                "primary_label": "appointment",
+            },
+            "raw_data": {"title": "(2) WhatsApp", "source": "whatsapp", "event_type": "whatsapp_snapshot"},
+        },
+    )
+
+    assert suggestion is None
+
+
+def test_suggestion_suppresses_focus_page_title_even_with_appointment_label():
+    from app.worker import suggestion_for_event
+
+    suggestion = suggestion_for_event(
+        "11111111-1111-1111-1111-111111111111",
+        {
+            "intent": "schedule",
+            "summary": "Gmail: Secure, AI-Powered Email for Everyone | Google Workspace",
+            "importance": 0.43,
+            "entities": {
+                "source": "focus",
+                "event_type": "deep_focus",
+                "labels": ["appointment"],
+                "primary_label": "appointment",
+            },
+        },
+    )
+
+    assert suggestion is None
+
+
+def test_agenda_candidate_suppresses_focus_page_title_even_with_appointment_label():
+    from app.worker import agenda_candidate_from_semantic
+
+    candidate = agenda_candidate_from_semantic(
+        "11111111-1111-1111-1111-111111111111",
+        "2026-06-10T10:00:00+08:00",
+        {
+            "intent": "schedule",
+            "summary": "Gmail: Secure, AI-Powered Email for Everyone | Google Workspace",
+            "importance": 0.43,
+            "entities": {
+                "source": "focus",
+                "event_type": "deep_focus",
+                "labels": ["appointment"],
+                "primary_label": "appointment",
+            },
+            "raw_data": {
+                "source": "focus",
+                "event_type": "deep_focus",
+                "title": "Gmail: Secure, AI-Powered Email for Everyone | Google Workspace",
+            },
+        },
+    )
+
+    assert candidate is None
+
+
 def test_suggestion_for_canceled_meeting_does_not_offer_route_or_ride():
     from app.worker import suggestion_for_event
 
@@ -735,6 +2233,8 @@ def test_suggestion_for_canceled_meeting_does_not_offer_route_or_ride():
     )
 
     assert suggestion is not None
+    assert suggestion["title"] == "确认取消安排"
+    assert suggestion["metadata"]["suggestion_type"] == "calendar_cancellation"
     action_ids = [item["id"] for item in suggestion["metadata"]["actions"]]
     assert "route_lookup" not in action_ids
     assert "ride_prepare" not in action_ids
@@ -1064,6 +2564,264 @@ def test_memory_state_upsert_preserves_state_category_and_current_value():
     assert "quiet hotels" in memory_state_params[1]
 
 
+def test_linkedin_browser_observation_persists_vector_without_generic_fact_graph(monkeypatch):
+    from app import worker
+
+    executed = []
+
+    class Cursor:
+        rowcount = 1
+
+        def fetchone(self):
+            return ["99999999-9999-9999-9999-999999999999"]
+
+    class Conn:
+        def execute(self, sql, params=()):
+            executed.append((sql, params))
+            return Cursor()
+
+    monkeypatch.setattr(worker, "text_embedding_with_provider", lambda content: ([0.1, 0.2, 0.3], "test"))
+    monkeypatch.setattr(worker, "vector_literal", lambda embedding: "[0.1,0.2,0.3]")
+    monkeypatch.setattr(worker, "embedding_status", lambda: {"model": "test-embedding"})
+
+    worker.persist_memory_enrichment(
+        Conn(),
+        "11111111-1111-1111-1111-111111111111",
+        "2026-07-04T17:27:55+00:00",
+        {
+            "intent": "generic_event",
+            "entities": {
+                "source": "linkedin",
+                "event_type": "linkedin_job_search_results",
+                "labels": ["low_value"],
+                "primary_label": "low_value",
+            },
+            "importance": 0.2,
+            "summary": "LinkedIn 搜索到 AI Agent Engineer 和 Staff Software Engineer 岗位。",
+            "raw_data": {
+                "source": "linkedin",
+                "event_type": "linkedin_job_search_results",
+                "job_results": [
+                    {"title": "AI Agent Engineer", "company": "LianLian"},
+                    {"title": "Staff Software Engineer", "company": "Airwallex"},
+                ],
+            },
+        },
+        "linkedin",
+        "linkedin_job_search_results",
+    )
+
+    combined_sql = "\n".join(sql for sql, _ in executed)
+    assert "INSERT INTO memory_vectors" in combined_sql
+    assert "INSERT INTO facts" not in combined_sql
+    assert "INSERT INTO relationships" not in combined_sql
+    assert "INSERT INTO memory_states" not in combined_sql
+
+
+def test_job_recruiter_company_role_relationships_are_persisted():
+    from app.worker import persist_fact_graph_and_state
+
+    executed = []
+
+    class Cursor:
+        def fetchone(self):
+            return ["99999999-9999-9999-9999-999999999999"]
+
+    class Conn:
+        def execute(self, sql, params=()):
+            executed.append((sql, params))
+            return Cursor()
+
+    persist_fact_graph_and_state(
+        Conn(),
+        "11111111-1111-1111-1111-111111111111",
+        "2026-06-09T00:00:00+00:00",
+        {
+            "intent": "career_opportunity",
+            "entities": {
+                "source": "gmail",
+                "event_type": "gmail_thread_snapshot",
+                "recruiter": "RG_Maya",
+                "company": "Example AI",
+                "role": "AI PM role",
+            },
+            "importance": 0.88,
+            "summary": "RG_Maya 是 Example AI 的 recruiter，正在跟进 AI PM role。",
+            "raw_data": {
+                "subject": "AI PM role at Example AI",
+                "sender": "RG_Maya",
+                "body": "I am the recruiter for Example AI and would like to discuss the AI PM role.",
+            },
+        },
+    )
+
+    relationship_params = [params for sql, params in executed if "INSERT INTO relationships" in sql]
+    relation_types = [params[3] for params in relationship_params]
+    assert "recruits_for_company" in relation_types
+    assert "recruits_for_role" in relation_types
+    assert "company_hiring_role" in relation_types
+    metadata_payloads = [str(params[-1]) for params in relationship_params]
+    assert any("RG_Maya" in payload and "Example AI" in payload for payload in metadata_payloads)
+    assert any("AI PM role" in payload for payload in metadata_payloads)
+
+
+def test_linkedin_job_search_rows_prefer_private_openable_urls():
+    from app.worker import linkedin_job_rows_from_raw_data
+
+    protected = {
+        "capture_scope": "visible_job_search_results",
+        "url": "https://www.linkedin.com/jobs/search/?currentJobId=REDACTED",
+        "job_results": [
+            {
+                "job_id": "linkedin_search_backend",
+                "source": "linkedin_browser_observation",
+                "title": "Backend Engineer (Golang&PHP)",
+                "company": "Xsolla",
+                "location": "Beijing, Beijing, China (On-site)",
+                "url": "https://www.linkedin.com/jobs/search/?currentJobId=REDACTED",
+                "text": "Backend Engineer (Golang&PHP)\nXsolla\nBeijing, Beijing, China (On-site)",
+            }
+        ],
+    }
+    private = {
+        **protected,
+        "url": "https://www.linkedin.com/jobs/search/?currentJobId=4429828054&keywords=Backend",
+        "job_results": [
+            {
+                **protected["job_results"][0],
+                "url": "https://www.linkedin.com/jobs/view/4429828054/",
+            }
+        ],
+    }
+
+    rows = linkedin_job_rows_from_raw_data(
+        "693979dd-c0cf-47be-9d4e-76547f368279",
+        private,
+        fallback_raw_data=protected,
+        career_text="Java Go 后端 高并发 Redis MySQL",
+    )
+
+    assert len(rows) == 1
+    assert rows[0]["id"] == "linkedin_search_backend"
+    assert rows[0]["title"] == "Backend Engineer (Golang&PHP)"
+    assert rows[0]["company"] == "Xsolla"
+    assert rows[0]["url"] == "https://www.linkedin.com/jobs/view/4429828054/"
+    assert rows[0]["payload"]["url_openable"] is True
+    assert rows[0]["payload"]["search_query"] == "Backend"
+    assert rows[0]["fit_score"] >= 0.65
+
+
+def test_linkedin_job_rows_clean_pipe_title_and_company():
+    from app.worker import linkedin_job_rows_from_raw_data
+
+    rows = linkedin_job_rows_from_raw_data(
+        "e1f9cc1b-e3b9-44d9-91e9-4bc30da10dbf",
+        {
+            "capture_scope": "visible_job_detail",
+            "job_pages": [
+                {
+                    "job_id": "linkedin_job_4388714215",
+                    "title": "Backend Engineer, AI (Agent Systems) | BJAK | LinkedIn",
+                    "company": "BJAK",
+                    "location": "Beijing, Beijing, China",
+                    "url": "https://www.linkedin.com/jobs/view/4388714215/",
+                    "text": "Backend Engineer, AI (Agent Systems)\nBJAK\nBeijing, Beijing, China\nFull-time",
+                }
+            ],
+        },
+        career_text="Java Go 后端 AI Agent 高并发 Redis MySQL",
+    )
+
+    assert len(rows) == 1
+    assert rows[0]["title"] == "Backend Engineer, AI (Agent Systems)"
+    assert rows[0]["company"] == "BJAK"
+    assert rows[0]["payload"]["title"] == "Backend Engineer, AI (Agent Systems)"
+    assert rows[0]["payload"]["summary"].startswith("BJAK 的 Backend Engineer, AI (Agent Systems)")
+
+
+def test_linkedin_job_search_rows_skip_action_request_query():
+    from app.worker import linkedin_job_rows_from_raw_data
+
+    raw_data = {
+        "capture_scope": "visible_job_search_results",
+        "title": "(16) 基于我刚刚真实 LinkedIn 搜索到的岗位，结合我的后端简历推荐适合我的工作机会，给出推荐理由和可以打开的链接 Jobs | LinkedIn",
+        "url": "https://www.linkedin.com/jobs/search/?keywords=%E5%9F%BA%E4%BA%8E%E6%88%91%E5%88%9A%E5%88%9A%E7%9C%9F%E5%AE%9E%20LinkedIn%20%E6%90%9C%E7%B4%A2%E5%88%B0%E7%9A%84%E5%B2%97%E4%BD%8D%EF%BC%8C%E7%BB%93%E5%90%88%E6%88%91%E7%9A%84%E5%90%8E%E7%AB%AF%E7%AE%80%E5%8E%86%E6%8E%A8%E8%8D%90%E9%80%82%E5%90%88%E6%88%91%E7%9A%84%E5%B7%A5%E4%BD%9C%E6%9C%BA%E4%BC%9A%EF%BC%8C%E7%BB%99%E5%87%BA%E6%8E%A8%E8%8D%90%E7%90%86%E7%94%B1%E5%92%8C%E5%8F%AF%E4%BB%A5%E6%89%93%E5%BC%80%E7%9A%84%E9%93%BE%E6%8E%A5",
+        "job_results": [
+            {
+                "title": "Business Development Manager",
+                "company": "Rock-West",
+                "location": "China",
+                "url": "https://www.linkedin.com/jobs/search/?currentJobId=4413966477",
+                "text": "Business Development Manager Rock-West China",
+            }
+        ],
+    }
+
+    rows = linkedin_job_rows_from_raw_data(
+        "1516758c-7ae7-40d2-8c93-4e45b281cbfa",
+        raw_data,
+        career_text="Java Go 后端 高并发 Redis MySQL",
+    )
+
+    assert rows == []
+
+
+def test_persist_linkedin_job_search_opportunities_upserts_job_rows(monkeypatch):
+    import app.worker as worker
+
+    executed = []
+
+    class Cursor:
+        def __init__(self, row=None):
+            self._row = row
+
+        def fetchone(self):
+            return self._row
+
+    class Conn:
+        def execute(self, sql, params=()):
+            executed.append((sql, params))
+            if "SELECT raw_data_private FROM events" in sql:
+                return Cursor(None)
+            if "FROM career_profiles" in sql:
+                return Cursor(("Java 后端架构", ["Backend Engineer"], ["Beijing"], ["Java", "Go", "Redis"], {"skills": ["Java", "Go"]}))
+            if "FROM career_resumes" in sql:
+                return Cursor(("Java Go 后端 高并发 Redis MySQL", {"skills": ["Java", "Go", "Redis", "MySQL"]}))
+            return Cursor(None)
+
+    count = worker.persist_linkedin_job_search_opportunities(
+        Conn(),
+        "693979dd-c0cf-47be-9d4e-76547f368279",
+        {
+            "raw_data": {
+                "capture_scope": "visible_job_search_results",
+                "job_results": [
+                    {
+                        "job_id": "linkedin_search_backend",
+                        "source": "linkedin_browser_observation",
+                        "title": "Backend Engineer (Golang&PHP)",
+                        "company": "Xsolla",
+                        "location": "Beijing, Beijing, China (On-site)",
+                        "url": "https://www.linkedin.com/jobs/search/?currentJobId=REDACTED",
+                        "text": "Backend Engineer (Golang&PHP)\nXsolla\nBeijing, Beijing, China (On-site)",
+                    }
+                ],
+            }
+        },
+    )
+
+    assert count == 1
+    upserts = [(sql, params) for sql, params in executed if "INSERT INTO job_opportunities" in sql]
+    assert len(upserts) == 1
+    _, params = upserts[0]
+    assert params[0] == "linkedin_search_backend"
+    assert params[1] == "linkedin_browser_observation"
+    assert params[2] == "Backend Engineer (Golang&PHP)"
+    assert params[3] == "Xsolla"
+    assert params[7] >= 0.65
+    assert params[9] == ["693979dd-c0cf-47be-9d4e-76547f368279"]
+
+
 def test_canonical_entity_name_uses_alias_map_and_keeps_original_alias():
     from app.worker import canonical_entity_name
 
@@ -1225,6 +2983,27 @@ def test_suggestion_for_gmail_todo_has_type_confidence_expiry_and_dedupe():
     assert suggestion["metadata"]["expires_at"]
 
 
+def test_suggestion_for_event_drops_low_value_gmail_or_linkedin_notifications():
+    from app.worker import suggestion_for_event
+
+    suggestion = suggestion_for_event(
+        "11111111-1111-1111-1111-111111111112",
+        {
+            "intent": "generic_event",
+            "entities": {
+                "source": "gmail",
+                "event_type": "gmail_message_snapshot",
+                "labels": ["low_value"],
+                "primary_label": "low_value",
+            },
+            "importance": 0.55,
+            "summary": "You have 2 new messages on LinkedIn.",
+        },
+    )
+
+    assert suggestion is None
+
+
 def test_suggestion_for_calendar_schedule_has_reminder_type():
     from app.worker import suggestion_for_event
 
@@ -1249,9 +3028,14 @@ def test_persist_suggestion_publishes_realtime_event():
     published = []
     executed = []
 
+    class Cursor:
+        def fetchone(self):
+            return None
+
     class Conn:
         def execute(self, sql, params=()):
             executed.append((sql, params))
+            return Cursor()
 
     class Redis:
         def publish(self, channel, payload):
@@ -1269,10 +3053,132 @@ def test_persist_suggestion_publishes_realtime_event():
         redis_client=Redis(),
     )
 
-    assert "INSERT INTO proactive_suggestions" in executed[0][0]
+    assert any("INSERT INTO proactive_suggestions" in sql for sql, _ in executed)
     assert published[0][0] == "par:realtime"
     assert '"type": "proactive_message"' in published[0][1]
     assert "处理邮件待办" in published[0][1]
+
+
+def test_persist_suggestion_suppresses_linkedin_profile_browser_observation_without_realtime_publish():
+    from app.worker import persist_suggestion
+
+    published = []
+    executed = []
+
+    class Cursor:
+        def fetchone(self):
+            return ("existing-suggestion-id",)
+
+    class Conn:
+        def execute(self, sql, params=()):
+            normalized = " ".join(sql.split())
+            executed.append((normalized, params))
+            raise AssertionError("LinkedIn browser observations must not create proactive suggestions")
+
+    class Redis:
+        def publish(self, channel, payload):
+            published.append((channel, payload))
+
+    persist_suggestion(
+        Conn(),
+        "22222222-2222-2222-2222-222222222222",
+        {
+            "intent": "information_extraction",
+            "entities": {"source": "linkedin", "event_type": "linkedin_profile_snapshot"},
+            "importance": 0.86,
+            "summary": "张子长是北京三快科技有限公司的项目经理，位于北京。",
+        },
+        redis_client=Redis(),
+    )
+
+    assert executed == []
+    assert published == []
+
+
+def test_persist_suggestion_suppresses_same_visible_message_across_sources_without_realtime_publish():
+    from app.worker import persist_suggestion
+
+    published = []
+    executed = []
+
+    class Cursor:
+        def __init__(self, row=None):
+            self.row = row
+
+        def fetchone(self):
+            return self.row
+
+    class Conn:
+        def execute(self, sql, params=()):
+            normalized = " ".join(sql.split())
+            executed.append((normalized, params))
+            if "pg_advisory_xact_lock" in normalized:
+                return Cursor()
+            if "metadata->>'dedupe_key'" in normalized:
+                return Cursor()
+            if "metadata->>'display_dedupe_key'" in normalized:
+                assert str(params[0]).startswith("display:")
+                assert params[1] == "跟进近期安排"
+                assert params[2] == "这条信息可能需要跟进：NOMI_REG_WA_0629 明天15:30人民广场见，带合同。"
+                return Cursor(("existing-visible-suggestion",))
+            raise AssertionError("visible duplicate suggestions must not be inserted or updated")
+
+    class Redis:
+        def publish(self, channel, payload):
+            published.append((channel, payload))
+
+    persist_suggestion(
+        Conn(),
+        "33333333-3333-3333-3333-333333333333",
+        {
+            "intent": "social_plan",
+            "entities": {"source": "telegram", "event_type": "telegram_message_preview"},
+            "importance": 0.82,
+            "summary": "NOMI_REG_WA_0629 明天15:30人民广场见，带合同。",
+        },
+        redis_client=Redis(),
+    )
+
+    assert [item[0] for item in executed[:2]].count("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))") == 2
+    assert any("metadata->>'display_dedupe_key'" in sql for sql, _ in executed)
+    assert not any("INSERT INTO proactive_suggestions" in sql for sql, _ in executed)
+    assert published == []
+
+
+def test_persist_suggestion_locks_dedupe_key_before_duplicate_lookup():
+    from app.worker import persist_suggestion
+
+    executed = []
+
+    class Cursor:
+        def fetchone(self):
+            return None
+
+    class Conn:
+        def execute(self, sql, params=()):
+            normalized = " ".join(sql.split())
+            executed.append((normalized, params))
+            return Cursor()
+
+    persist_suggestion(
+        Conn(),
+        "33333333-3333-3333-3333-333333333333",
+        {
+            "intent": "social_plan",
+            "entities": {"source": "telegram", "event_type": "telegram_message_preview"},
+            "importance": 0.8,
+            "summary": "NOMI_REG_TG_0629 周五10点静安寺地铁站见 Maya。",
+        },
+    )
+
+    assert "pg_advisory_xact_lock" in executed[0][0]
+    assert executed[0][1] == (
+        "social_followup:telegram:social_plan:NOMI_REG_TG_0629 周五10点静安寺地铁站见 Maya。",
+    )
+    duplicate_lookup_index = next(index for index, item in enumerate(executed) if "FROM proactive_suggestions" in item[0])
+    insert_index = next(index for index, item in enumerate(executed) if "INSERT INTO proactive_suggestions" in item[0])
+    assert duplicate_lookup_index > 0
+    assert insert_index > duplicate_lookup_index
 
 
 def test_suggestion_suppresses_low_value_generic_events():
@@ -1428,6 +3334,112 @@ def test_process_stream_entry_deadletters_bad_payload_and_advances_checkpoint():
     assert ("set", "events:raw:worker:last_id", "1780316000001-0") in calls
 
 
+def test_process_stream_entry_result_does_not_checkpoint_retryable_db_failure(monkeypatch):
+    from app import worker
+
+    calls = []
+
+    class PsycopgModule:
+        OperationalError = worker.psycopg.OperationalError
+
+        def connect(self, url):
+            raise self.OperationalError("connection failed")
+
+    class RedisClient:
+        def xadd(self, stream, fields):
+            calls.append(("xadd", stream, fields["message_id"]))
+
+        def set(self, key, value):
+            calls.append(("set", key, value))
+
+    monkeypatch.setattr(worker, "psycopg", PsycopgModule())
+    monkeypatch.setattr(
+        worker,
+        "extract_semantics",
+        lambda source, event_type, raw_data: {
+            "intent": "social_plan",
+            "entities": {"source": source, "event_type": event_type},
+            "importance": 0.86,
+            "summary": raw_data["message"],
+            "model_version": "test",
+        },
+    )
+
+    result = worker.process_stream_entry_result(
+        RedisClient(),
+        "1780316000002-0",
+        {
+            "event_id": "33333333-3333-3333-3333-333333333333",
+            "timestamp": "2026-06-01T12:00:00+00:00",
+            "source": "gmail",
+            "event_type": "gmail_message_snapshot",
+            "raw_data": json.dumps({"message": "明天3点开会"}, ensure_ascii=False),
+        },
+    )
+
+    assert result.success is False
+    assert result.checkpoint is False
+    assert ("xadd", "events:deadletter", "1780316000002-0") in calls
+    assert [call for call in calls if call[0] == "set"] == []
+
+
+def test_stream_entry_priority_processes_user_messages_before_focus_noise():
+    from app.worker import stream_batch_checkpoint_id, stream_entry_priority
+
+    entries = [
+        ("1780316000001-0", {"source": "focus", "event_type": "deep_focus"}),
+        ("1780316000002-0", {"source": "whatsapp", "event_type": "whatsapp_message"}),
+        ("1780316000003-0", {"source": "browser", "event_type": "browser_network_event"}),
+    ]
+
+    sorted_entries = sorted(entries, key=stream_entry_priority)
+
+    assert sorted_entries[0][1]["source"] == "whatsapp"
+    assert sorted_entries[-1][1]["source"] == "browser"
+    assert stream_batch_checkpoint_id(entries) == "1780316000003-0"
+
+
+def test_persist_semantics_skips_heavy_outputs_for_low_value_telemetry():
+    from app.worker import persist_semantics
+
+    executed = []
+
+    class Cursor:
+        rowcount = 1
+
+    class Conn:
+        def execute(self, sql, params=()):
+            executed.append(" ".join(sql.split()))
+            return Cursor()
+
+    persist_semantics(
+        Conn(),
+        "11111111-1111-1111-1111-111111111111",
+        "2026-06-10T10:00:00+08:00",
+        {
+            "intent": "schedule",
+            "summary": "Gmail: Secure, AI-Powered Email for Everyone | Google Workspace",
+            "importance": 0.43,
+            "model_version": "test",
+            "entities": {
+                "source": "focus",
+                "event_type": "deep_focus",
+                "labels": ["appointment"],
+            },
+            "raw_data": {
+                "source": "focus",
+                "event_type": "deep_focus",
+                "title": "Gmail: Secure, AI-Powered Email for Everyone | Google Workspace",
+            },
+        },
+    )
+
+    combined = "\n".join(executed)
+    assert "INSERT INTO semantic_events" in combined
+    assert "SELECT source, event_type FROM events" not in combined
+    assert "INSERT INTO timeline" not in combined
+
+
 def test_mask_value_redacts_codes_payment_orders_tokens_and_addresses_but_keeps_semantics():
     from app.worker import mask_value
 
@@ -1496,6 +3508,49 @@ def test_mask_value_preserves_calendar_times_while_redacting_amounts():
     assert "10:00" in rendered
     assert "199.00" not in rendered
     assert "AMOUNT_1" in rendered
+
+
+def test_mask_value_preserves_iso_dates_and_deadline_times_before_phone_redaction():
+    from app.worker import mask_value
+
+    masked = mask_value(
+        {
+            "body": "Please send your tailored resume before 2026-06-15 18:00. Call +1 415 555 2671 only if urgent.",
+            "text": "available before 2026-06-15 18:00",
+        }
+    )
+
+    rendered = str(masked)
+    assert "2026-06-15 18:00" in rendered
+    assert "+1 415 555 2671" not in rendered
+    assert "PHONE_1" in rendered
+
+
+def test_mask_value_preserves_iso_times_before_chinese_punctuation():
+    from app.worker import mask_value
+
+    masked = mask_value(
+        {
+            "text": "面试安排在2026-06-13 10:30，Zoom链接稍后发。联系电话 +86 138 0000 0000。",
+        }
+    )
+
+    assert masked["text"] == "面试安排在2026-06-13 10:30，Zoom链接稍后发。联系电话 PHONE_1。"
+
+
+def test_mask_value_preserves_linkedin_job_detail_urls_while_redacting_phone():
+    from app.worker import mask_value
+
+    masked = mask_value(
+        {
+            "url": "https://www.linkedin.com/jobs/view/4404787524/",
+            "text": "岗位链接 https://www.linkedin.com/jobs/view/4378789245/，联系电话 +86 138 0000 0000。",
+        }
+    )
+
+    assert masked["url"] == "https://www.linkedin.com/jobs/view/4404787524/"
+    assert "https://www.linkedin.com/jobs/view/4378789245/" in masked["text"]
+    assert "PHONE_1" in masked["text"]
 
 
 def test_mask_value_preserves_task_identifiers_and_chinese_clock_times():

@@ -18,6 +18,8 @@ import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.IBinder;
+import android.os.SystemClock;
+import android.text.Layout;
 import android.view.Gravity;
 import android.view.MotionEvent;
 import android.view.View;
@@ -25,6 +27,7 @@ import android.view.ViewConfiguration;
 import android.view.ViewTreeObserver;
 import android.view.WindowInsets;
 import android.view.WindowManager;
+import android.view.inputmethod.InputMethodManager;
 import android.widget.Button;
 import android.widget.EditText;
 import android.widget.ImageButton;
@@ -48,6 +51,8 @@ public final class FloatingBallService extends Service {
     static final String EXTRA_AUTH_MESSAGE = "com.par.assistant.android.AUTH_MESSAGE";
     private static final String CHANNEL_ID = "par-floating-ball";
     private static final int NOTIFICATION_ID = 1001;
+    private static final long STREAMING_CHAT_FALLBACK_TIMEOUT_MS =
+            StreamingChatFallbackPolicy.FIRST_DELTA_FALLBACK_TIMEOUT_MS;
 
     private final ExecutorService executor = Executors.newSingleThreadExecutor();
     private WindowManager windowManager;
@@ -64,6 +69,14 @@ public final class FloatingBallService extends Service {
     private LinearLayout accountsView;
     private ScrollView accountsScrollView;
     private LinearLayout chatContentView;
+    private LinearLayout agendaContentView;
+    private LinearLayout agendaListView;
+    private ScrollView agendaScrollView;
+    private TextView agendaStatusView;
+    private LinearLayout careerContentView;
+    private LinearLayout careerListView;
+    private ScrollView careerScrollView;
+    private TextView careerStatusView;
     private LinearLayout settingsContentView;
     private TextView settingsStatusView;
     private LinearLayout chatHistoryView;
@@ -78,6 +91,11 @@ public final class FloatingBallService extends Service {
     private final StringBuilder streamingAnswerBuffer = new StringBuilder();
     private String activeConversationId;
     private TextView streamingPendingView;
+    private String streamingRequestMessage;
+    private String streamingRequestConversationId;
+    private List<FloatingChatContext.Turn> streamingRequestContext;
+    private String streamingRequestClientRequestId;
+    private long streamingRequestStartedAtMs;
     private String activeVoiceSessionId;
     private int activeVoiceLastSeq;
     private boolean activeVoiceReady;
@@ -92,6 +110,7 @@ public final class FloatingBallService extends Service {
             new AccountChannel("whatsapp", "WhatsApp Web", "聊天预览、打开会话历史、新消息监听", true),
             new AccountChannel("telegram", "Telegram Web", "聊天列表和可见消息预览", true),
             new AccountChannel("calendar", "Google Calendar", "日程、会议、提醒", true),
+            new AccountChannel("linkedin", "LinkedIn", "个人主页、岗位 JD、招聘联系人和私信草稿", true),
             new AccountChannel("search", "Google Search", "搜索记录和浏览器页面信号", true),
             new AccountChannel("bookmark", "Chrome Bookmarks", "服务器浏览器书签", false),
             new AccountChannel("focus", "浏览行为", "点击、滚动、输入等本地浏览焦点信号", false),
@@ -101,6 +120,7 @@ public final class FloatingBallService extends Service {
     @Override
     public void onCreate() {
         super.onCreate();
+        activeConversationId = ConfigPrefs.conversationId(this);
         windowManager = (WindowManager) getSystemService(WINDOW_SERVICE);
         startNomiForeground(false);
         showBall();
@@ -200,6 +220,7 @@ public final class FloatingBallService extends Service {
     private void showPanel() {
         unreadCount = 0;
         updateBallBadge();
+        activeConversationId = ConfigPrefs.conversationId(this);
 
         panelView = new LinearLayout(this);
         panelView.setOrientation(LinearLayout.VERTICAL);
@@ -217,13 +238,13 @@ public final class FloatingBallService extends Service {
         title.setTextColor(Color.rgb(15, 23, 42));
         header.addView(title, new LinearLayout.LayoutParams(0, -2, 1));
 
-        ImageButton web = iconButton(android.R.drawable.ic_menu_view, "打开完整工作台");
-        web.setOnClickListener(view -> openWorkbench());
-        header.addView(web, new LinearLayout.LayoutParams(dp(42), dp(42)));
+        ImageButton agenda = iconButton(android.R.drawable.ic_menu_my_calendar, "日程");
+        agenda.setOnClickListener(view -> showAgendaView());
+        header.addView(agenda, new LinearLayout.LayoutParams(dp(42), dp(42)));
 
-        ImageButton settings = iconButton(android.R.drawable.ic_menu_manage, "设置");
-        settings.setOnClickListener(view -> showSettingsView());
-        header.addView(settings, new LinearLayout.LayoutParams(dp(42), dp(42)));
+        ImageButton app = iconButton(android.R.drawable.ic_menu_view, "进入完整 App");
+        app.setOnClickListener(view -> openAppChat());
+        header.addView(app, new LinearLayout.LayoutParams(dp(42), dp(42)));
 
         Button close = closeButton();
         close.setOnClickListener(view -> closePanel());
@@ -241,12 +262,7 @@ public final class FloatingBallService extends Service {
         chatScrollView.addView(chatHistoryView);
         chatContentView.addView(chatScrollView, new LinearLayout.LayoutParams(-1, 0, 1));
 
-        addChatMessage("Nomi", "我在这里。你可以直接发消息，也可以点右上角打开完整工作台。");
-        if (lastProactiveMessage != null) {
-            String proactive = bubbleText(lastProactiveMessage);
-            addChatMessage("Nomi", proactive);
-            chatContext.addAssistant(proactive);
-        }
+        addChatMessage("Nomi", "我在这里。你可以直接发消息，也可以点右上角查看日程或进入完整 App。");
 
         EditText input = new EditText(this);
         input.setHint("和 Nomi 说点什么");
@@ -261,8 +277,13 @@ public final class FloatingBallService extends Service {
         });
         input.setOnClickListener(view -> {
             panelInputFocused = true;
+            showKeyboard(input);
             if (panelView != null) panelView.postDelayed(this::adjustPanelForKeyboard, 250);
         });
+        chatScrollView.setClickable(true);
+        chatScrollView.setOnClickListener(view -> hideKeyboard(input));
+        chatHistoryView.setClickable(true);
+        chatHistoryView.setOnClickListener(view -> hideKeyboard(input));
         LinearLayout composer = new LinearLayout(this);
         composer.setOrientation(LinearLayout.HORIZONTAL);
         composer.setGravity(Gravity.CENTER_VERTICAL);
@@ -270,10 +291,14 @@ public final class FloatingBallService extends Service {
 
         Button send = new Button(this);
         send.setText("发送");
+        send.setFocusable(false);
+        send.setFocusableInTouchMode(false);
         stylePrimaryButton(send);
         send.setOnClickListener(view -> {
             String text = input.getText().toString();
             input.setText("");
+            input.requestFocus();
+            showKeyboard(input);
             sendMessage(text);
         });
         LinearLayout.LayoutParams sendParams = new LinearLayout.LayoutParams(dp(76), dp(48));
@@ -294,6 +319,14 @@ public final class FloatingBallService extends Service {
         settingsContentView.setVisibility(View.GONE);
         panelView.addView(settingsContentView, new LinearLayout.LayoutParams(-1, 0, 1));
         buildSettingsView();
+
+        agendaContentView = buildAgendaContentView();
+        agendaContentView.setVisibility(View.GONE);
+        panelView.addView(agendaContentView, new LinearLayout.LayoutParams(-1, 0, 1));
+
+        careerContentView = buildCareerContentView();
+        careerContentView.setVisibility(View.GONE);
+        panelView.addView(careerContentView, new LinearLayout.LayoutParams(-1, 0, 1));
 
         panelDefaultY = dp(220);
         panelDefaultHeight = dp(440);
@@ -316,15 +349,30 @@ public final class FloatingBallService extends Service {
         TextView pending = addChatMessage("Nomi", "正在思考...");
         responseView.setText("");
         String conversationId = activeConversationId;
-        if (trySendStreamingChat(trimmed, conversationId, pending)) {
+        String clientRequestId = "android-" + UUID.randomUUID();
+        if (trySendStreamingChat(trimmed, conversationId, clientContext, pending, clientRequestId)) {
             return;
         }
+        sendHttpChat(trimmed, conversationId, clientContext, pending, clientRequestId);
+    }
+
+    private void sendHttpChat(String trimmed, String conversationId, List<FloatingChatContext.Turn> clientContext, TextView pending) {
+        sendHttpChat(trimmed, conversationId, clientContext, pending, "");
+    }
+
+    private void sendHttpChat(
+            String trimmed,
+            String conversationId,
+            List<FloatingChatContext.Turn> clientContext,
+            TextView pending,
+            String clientRequestId
+    ) {
         executor.execute(() -> {
             try {
-                ChatResult result = api().chat(trimmed, conversationId, clientContext);
+                ChatResult result = api().chat(trimmed, conversationId, clientContext, clientRequestId);
                 runOnMain(() -> {
                     if (!result.conversationId.trim().isEmpty()) {
-                        activeConversationId = result.conversationId.trim();
+                        rememberActiveConversationId(result.conversationId);
                     }
                     String answer = result.answer.isEmpty() ? "已发送，但没有返回内容。" : result.answer;
                     pending.setText(messageText("Nomi", answer));
@@ -336,16 +384,39 @@ public final class FloatingBallService extends Service {
         });
     }
 
-    private boolean trySendStreamingChat(String message, String conversationId, TextView pending) {
+    private boolean trySendStreamingChat(
+            String message,
+            String conversationId,
+            List<FloatingChatContext.Turn> clientContext,
+            TextView pending,
+            String clientRequestId
+    ) {
         if (realtimeClient == null || streamingPendingView != null) {
             return false;
         }
         streamingPendingView = pending;
+        streamingRequestMessage = message;
+        streamingRequestConversationId = conversationId;
+        streamingRequestContext = clientContext;
+        streamingRequestClientRequestId = clientRequestId;
+        streamingRequestStartedAtMs = SystemClock.elapsedRealtime();
         streamingAnswerBuffer.setLength(0);
         try {
-            boolean sent = realtimeClient.sendChatMessage(message, conversationId, 80, "android");
+            boolean sent = realtimeClient.sendChatMessage(message, conversationId, 12, "android", clientRequestId);
             if (!sent) {
                 clearStreamingChatState();
+            }
+            if (sent) {
+                pending.postDelayed(() -> {
+                    if (!StreamingChatFallbackPolicy.shouldRunHttpFallback(
+                            streamingPendingView == pending,
+                            streamingAnswerBuffer.length(),
+                            SystemClock.elapsedRealtime() - streamingRequestStartedAtMs
+                    )) {
+                        return;
+                    }
+                    fallbackStreamingChatAfterRealtimeIssue("实时通道没有返回，正在切换普通请求...");
+                }, STREAMING_CHAT_FALLBACK_TIMEOUT_MS);
             }
             return sent;
         } catch (Exception error) {
@@ -366,7 +437,7 @@ public final class FloatingBallService extends Service {
     private void completeStreamingChat(String answer, String conversationId) {
         if (streamingPendingView == null) return;
         if (conversationId != null && !conversationId.trim().isEmpty()) {
-            activeConversationId = conversationId.trim();
+            rememberActiveConversationId(conversationId);
         }
         String finalAnswer = answer == null || answer.trim().isEmpty()
                 ? streamingAnswerBuffer.toString().trim()
@@ -386,8 +457,34 @@ public final class FloatingBallService extends Service {
         clearStreamingChatState();
     }
 
+    private void fallbackStreamingChatAfterRealtimeIssue(String statusMessage) {
+        TextView pending = streamingPendingView;
+        String message = streamingRequestMessage;
+        String conversationId = streamingRequestConversationId;
+        List<FloatingChatContext.Turn> clientContext = streamingRequestContext;
+        String clientRequestId = streamingRequestClientRequestId;
+        if (pending == null || message == null || message.trim().isEmpty()) {
+            clearStreamingChatState();
+            return;
+        }
+        clearStreamingChatState();
+        pending.setText(messageText("Nomi", statusMessage));
+        sendHttpChat(
+                message,
+                conversationId,
+                clientContext == null ? List.of() : clientContext,
+                pending,
+                clientRequestId == null ? "" : clientRequestId
+        );
+    }
+
     private void clearStreamingChatState() {
         streamingPendingView = null;
+        streamingRequestMessage = null;
+        streamingRequestConversationId = null;
+        streamingRequestContext = null;
+        streamingRequestClientRequestId = null;
+        streamingRequestStartedAtMs = 0L;
         streamingAnswerBuffer.setLength(0);
     }
 
@@ -570,7 +667,7 @@ public final class FloatingBallService extends Service {
     private void startNomiForeground(boolean withMicrophone) {
         Notification foregroundNotification = notification(
                 withMicrophone ? "Nomi 正在听你说话" : "Nomi 正在陪伴你",
-                withMicrophone ? "松开悬浮球后发送语音输入" : "点击打开完整工作台"
+                withMicrophone ? "松开悬浮球后发送语音输入" : "点击打开 Nomi"
         );
         if (Build.VERSION.SDK_INT >= 34) {
             int type = ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE;
@@ -610,7 +707,7 @@ public final class FloatingBallService extends Service {
             return;
         }
         if (!history.conversationId.trim().isEmpty()) {
-            activeConversationId = history.conversationId.trim();
+            rememberActiveConversationId(history.conversationId);
         }
         chatHistoryView.removeAllViews();
         chatContext.replaceWithHistory(history.messages);
@@ -635,6 +732,14 @@ public final class FloatingBallService extends Service {
         accountsView = null;
         accountsScrollView = null;
         chatContentView = null;
+        agendaContentView = null;
+        agendaListView = null;
+        agendaScrollView = null;
+        agendaStatusView = null;
+        careerContentView = null;
+        careerListView = null;
+        careerScrollView = null;
+        careerStatusView = null;
         settingsContentView = null;
         settingsStatusView = null;
         chatHistoryView = null;
@@ -672,7 +777,7 @@ public final class FloatingBallService extends Service {
                 screenHeight,
                 visibleBottom,
                 panelInputFocused,
-                dp(560),
+                dp(380),
                 dp(120)
         );
         FloatingPanelLayout.Frame frame = FloatingPanelLayout.compute(
@@ -707,6 +812,28 @@ public final class FloatingBallService extends Service {
         return visibleFrame.bottom > 0 ? visibleFrame.bottom : screenHeight;
     }
 
+    private void showKeyboard(EditText input) {
+        input.post(() -> {
+            input.requestFocus();
+            panelInputFocused = true;
+            InputMethodManager imm = (InputMethodManager) getSystemService(INPUT_METHOD_SERVICE);
+            if (imm != null) {
+                imm.showSoftInput(input, InputMethodManager.SHOW_IMPLICIT);
+            }
+            adjustPanelForKeyboard();
+        });
+    }
+
+    private void hideKeyboard(EditText input) {
+        panelInputFocused = false;
+        input.clearFocus();
+        InputMethodManager imm = (InputMethodManager) getSystemService(INPUT_METHOD_SERVICE);
+        if (imm != null) {
+            imm.hideSoftInputFromWindow(input.getWindowToken(), 0);
+        }
+        if (panelView != null) panelView.post(this::adjustPanelForKeyboard);
+    }
+
     private void startRealtime() {
         try {
             realtimeClient = new RealtimeClient(ConfigPrefs.read(this), new RealtimeClient.Callback() {
@@ -719,9 +846,13 @@ public final class FloatingBallService extends Service {
                 public void onError(String message) {
                     runOnMain(() -> {
                         if (streamingPendingView != null) {
-                            failStreamingChat(message);
-                        } else if (responseView != null) {
-                            responseView.setText("实时通道异常：" + message);
+                            if (StreamingChatFallbackPolicy.shouldFallbackOnRealtimeError(true, streamingAnswerBuffer.length())) {
+                                fallbackStreamingChatAfterRealtimeIssue("实时通道异常，正在切换普通请求...");
+                            } else {
+                                failStreamingChat(message);
+                            }
+                        } else {
+                            ignoreBackgroundRealtimeError(message);
                         }
                     });
                 }
@@ -742,7 +873,15 @@ public final class FloatingBallService extends Service {
         }
     }
 
+    private void ignoreBackgroundRealtimeError(String message) {
+        // RealtimeClient already schedules reconnects. A background reconnect failure should not
+        // overwrite visible chat content; active sends are handled by fallbackStreamingChatAfterRealtimeIssue.
+    }
+
     private void showProactiveBubble(ProactiveMessage message) {
+        if (message == null || !message.isDisplayable()) {
+            return;
+        }
         lastProactiveMessage = message;
         unreadCount += 1;
         updateBallBadge();
@@ -777,7 +916,8 @@ public final class FloatingBallService extends Service {
         updateBallBadge();
         Intent intent = new Intent(this, WebWorkspaceActivity.class);
         intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
-        intent.putExtra(WebWorkspaceActivity.EXTRA_URL, ConfigPrefs.baseUrlOrDefault(this) + "#chat");
+        intent.putExtra(WebWorkspaceActivity.EXTRA_URL, ConfigPrefs.baseUrlOrDefault(this) + "#suggestions");
+        intent.putExtra(WebWorkspaceActivity.EXTRA_PROACTIVE_ID, message.id);
         intent.putExtra(WebWorkspaceActivity.EXTRA_PROACTIVE_TITLE, message.title);
         intent.putExtra(WebWorkspaceActivity.EXTRA_PROACTIVE_BODY, message.body);
         if (message.rawJson != null && !message.rawJson.trim().isEmpty()) {
@@ -864,24 +1004,36 @@ public final class FloatingBallService extends Service {
         if (settingsContentView == null) return;
         settingsContentView.removeAllViews();
 
-        LinearLayout row = new LinearLayout(this);
-        row.setOrientation(LinearLayout.HORIZONTAL);
-        row.setGravity(Gravity.CENTER_VERTICAL);
+        TextView title = new TextView(this);
+        title.setText("设置");
+        title.setTextSize(15);
+        title.setTextColor(Color.rgb(15, 23, 42));
+        settingsContentView.addView(title, new LinearLayout.LayoutParams(-1, -2));
 
         Button back = new Button(this);
         back.setText("返回对话");
         styleSecondaryButton(back);
         back.setOnClickListener(view -> showChatView());
-        row.addView(back, new LinearLayout.LayoutParams(0, dp(46), 1));
+        LinearLayout.LayoutParams backParams = new LinearLayout.LayoutParams(-1, dp(44));
+        backParams.setMargins(0, dp(8), 0, 0);
+        settingsContentView.addView(back, backParams);
 
-        Button accounts = new Button(this);
-        accounts.setText("登录账号");
-        stylePrimaryButton(accounts);
-        accounts.setOnClickListener(view -> toggleAccounts());
-        LinearLayout.LayoutParams accountsParams = new LinearLayout.LayoutParams(0, dp(46), 1);
-        accountsParams.setMargins(dp(8), 0, 0, 0);
-        row.addView(accounts, accountsParams);
-        settingsContentView.addView(row);
+        for (FloatingPanelTab shortcut : FloatingPanelTabs.settingsShortcuts()) {
+            Button button = new Button(this);
+            button.setText(shortcut.label);
+            if ("career".equals(shortcut.id)) {
+                stylePrimaryButton(button);
+                button.setOnClickListener(view -> showCareerView());
+            } else if ("accounts".equals(shortcut.id)) {
+                stylePrimaryButton(button);
+                button.setOnClickListener(view -> toggleAccounts());
+            } else {
+                styleSecondaryButton(button);
+            }
+            LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(-1, dp(44));
+            params.setMargins(0, dp(8), 0, 0);
+            settingsContentView.addView(button, params);
+        }
 
         TextView note = new TextView(this);
         note.setText("Gmail、Calendar 等工具授权会打开 Composio；WhatsApp 等网页登录会打开服务器远程浏览器。");
@@ -908,29 +1060,147 @@ public final class FloatingBallService extends Service {
 
     private void showChatView() {
         if (chatContentView != null) chatContentView.setVisibility(View.VISIBLE);
+        if (agendaContentView != null) agendaContentView.setVisibility(View.GONE);
+        if (careerContentView != null) careerContentView.setVisibility(View.GONE);
         if (settingsContentView != null) settingsContentView.setVisibility(View.GONE);
     }
 
     private void showSettingsView() {
         if (chatContentView != null) chatContentView.setVisibility(View.GONE);
+        if (agendaContentView != null) agendaContentView.setVisibility(View.GONE);
+        if (careerContentView != null) careerContentView.setVisibility(View.GONE);
         if (settingsContentView != null) settingsContentView.setVisibility(View.VISIBLE);
         if (accountsScrollView != null) accountsScrollView.setVisibility(View.GONE);
     }
 
-    private void openWorkbench() {
+    private void showAgendaView() {
+        if (chatContentView != null) chatContentView.setVisibility(View.GONE);
+        if (settingsContentView != null) settingsContentView.setVisibility(View.GONE);
+        if (careerContentView != null) careerContentView.setVisibility(View.GONE);
+        if (agendaContentView != null) agendaContentView.setVisibility(View.VISIBLE);
+        loadAgendaItems();
+    }
+
+    private void showCareerView() {
+        if (chatContentView != null) chatContentView.setVisibility(View.GONE);
+        if (agendaContentView != null) agendaContentView.setVisibility(View.GONE);
+        if (settingsContentView != null) settingsContentView.setVisibility(View.GONE);
+        if (careerContentView != null) careerContentView.setVisibility(View.VISIBLE);
+        loadCareerBoard();
+    }
+
+    private LinearLayout buildAgendaContentView() {
+        LinearLayout container = new LinearLayout(this);
+        container.setOrientation(LinearLayout.VERTICAL);
+
+        LinearLayout header = new LinearLayout(this);
+        header.setOrientation(LinearLayout.HORIZONTAL);
+        header.setGravity(Gravity.CENTER_VERTICAL);
+        TextView title = new TextView(this);
+        title.setText("日程");
+        title.setTextSize(15);
+        title.setTextColor(Color.rgb(15, 23, 42));
+        header.addView(title, new LinearLayout.LayoutParams(0, -2, 1));
+
+        Button back = new Button(this);
+        back.setText("对话");
+        styleSecondaryButton(back);
+        back.setOnClickListener(view -> showChatView());
+        header.addView(back, new LinearLayout.LayoutParams(dp(72), dp(42)));
+
+        Button refresh = new Button(this);
+        refresh.setText("刷新");
+        styleSecondaryButton(refresh);
+        refresh.setOnClickListener(view -> loadAgendaItems());
+        LinearLayout.LayoutParams refreshParams = new LinearLayout.LayoutParams(dp(72), dp(42));
+        refreshParams.setMargins(dp(6), 0, 0, 0);
+        header.addView(refresh, refreshParams);
+        container.addView(header);
+
+        agendaStatusView = new TextView(this);
+        agendaStatusView.setText("");
+        agendaStatusView.setTextSize(12);
+        agendaStatusView.setTextColor(Color.rgb(15, 118, 110));
+        container.addView(agendaStatusView, new LinearLayout.LayoutParams(-1, -2));
+
+        agendaListView = new LinearLayout(this);
+        agendaListView.setOrientation(LinearLayout.VERTICAL);
+        agendaListView.setPadding(0, dp(6), 0, dp(6));
+        agendaScrollView = new ScrollView(this);
+        agendaScrollView.addView(agendaListView);
+        container.addView(agendaScrollView, new LinearLayout.LayoutParams(-1, 0, 1));
+        return container;
+    }
+
+    private LinearLayout buildCareerContentView() {
+        LinearLayout container = new LinearLayout(this);
+        container.setOrientation(LinearLayout.VERTICAL);
+
+        LinearLayout header = new LinearLayout(this);
+        header.setOrientation(LinearLayout.HORIZONTAL);
+        header.setGravity(Gravity.CENTER_VERTICAL);
+        TextView title = new TextView(this);
+        title.setText("求职看板");
+        title.setTextSize(15);
+        title.setTextColor(Color.rgb(15, 23, 42));
+        header.addView(title, new LinearLayout.LayoutParams(0, -2, 1));
+
+        Button back = new Button(this);
+        back.setText("设置");
+        styleSecondaryButton(back);
+        back.setOnClickListener(view -> showSettingsView());
+        header.addView(back, new LinearLayout.LayoutParams(dp(72), dp(42)));
+
+        Button refresh = new Button(this);
+        refresh.setText("刷新");
+        styleSecondaryButton(refresh);
+        refresh.setOnClickListener(view -> loadCareerBoard());
+        LinearLayout.LayoutParams refreshParams = new LinearLayout.LayoutParams(dp(72), dp(42));
+        refreshParams.setMargins(dp(6), 0, 0, 0);
+        header.addView(refresh, refreshParams);
+        container.addView(header);
+
+        careerStatusView = new TextView(this);
+        careerStatusView.setText("");
+        careerStatusView.setTextSize(12);
+        careerStatusView.setTextColor(Color.rgb(15, 118, 110));
+        container.addView(careerStatusView, new LinearLayout.LayoutParams(-1, -2));
+
+        careerListView = new LinearLayout(this);
+        careerListView.setOrientation(LinearLayout.VERTICAL);
+        careerListView.setPadding(0, dp(6), 0, dp(6));
+        careerScrollView = new ScrollView(this);
+        careerScrollView.addView(careerListView);
+        container.addView(careerScrollView, new LinearLayout.LayoutParams(-1, 0, 1));
+        return container;
+    }
+
+    private void openAppChat() {
         Intent intent = new Intent(this, WebWorkspaceActivity.class);
         intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
-        intent.putExtra(WebWorkspaceActivity.EXTRA_URL, ConfigPrefs.baseUrlOrDefault(this) + "#chat");
+        intent.putExtra(WebWorkspaceActivity.EXTRA_URL, WorkbenchUrls.chatUrl(ConfigPrefs.baseUrlOrDefault(this), activeConversationId));
         startActivity(intent);
         closePanel();
+    }
+
+    private void rememberActiveConversationId(String conversationId) {
+        String cleanConversationId = conversationId == null ? "" : conversationId.trim();
+        if (cleanConversationId.isEmpty()) return;
+        activeConversationId = cleanConversationId;
+        ConfigPrefs.writeConversationId(this, conversationId);
     }
 
     private TextView addChatMessage(String speaker, String body) {
         TextView message = new TextView(this);
         message.setText(messageText(speaker, body));
+        message.setSingleLine(false);
+        message.setHorizontallyScrolling(false);
+        message.setBreakStrategy(Layout.BREAK_STRATEGY_HIGH_QUALITY);
+        message.setHyphenationFrequency(Layout.HYPHENATION_FREQUENCY_NORMAL);
         message.setTextSize(13);
         message.setTextColor(Color.rgb(15, 23, 42));
         message.setPadding(dp(10), dp(8), dp(10), dp(8));
+        FloatingMessageLinks.enableClickableLinks(message, this::openChatMessageUrl);
         int fill = "你".equals(speaker) ? Color.rgb(204, 251, 241) : Color.rgb(248, 250, 252);
         message.setBackground(rounded(fill, Color.rgb(226, 232, 240), 12));
         LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(-1, -2);
@@ -957,6 +1227,188 @@ public final class FloatingBallService extends Service {
             return;
         }
         openAccountsList("正在读取账号状态...");
+    }
+
+    private void loadCareerBoard() {
+        if (careerListView == null) return;
+        careerListView.removeAllViews();
+        if (careerStatusView != null) careerStatusView.setText("正在读取求职看板...");
+        TextView loading = new TextView(this);
+        loading.setText("求职看板\n正在加载岗位、简历草案和申请状态。");
+        loading.setTextSize(13);
+        loading.setTextColor(Color.rgb(51, 65, 85));
+        loading.setPadding(dp(10), dp(8), dp(10), dp(8));
+        loading.setBackground(rounded(Color.rgb(248, 250, 252), Color.rgb(226, 232, 240), 12));
+        careerListView.addView(loading);
+        executor.execute(() -> {
+            try {
+                CareerBoardResult board = api().careerBoard();
+                runOnMain(() -> {
+                    renderCareerBoard(board);
+                    if (careerStatusView != null) careerStatusView.setText("求职看板已刷新。");
+                });
+            } catch (Exception error) {
+                runOnMain(() -> {
+                    careerListView.removeAllViews();
+                    TextView failed = new TextView(this);
+                    failed.setText("求职看板加载失败\n" + error.getMessage());
+                    failed.setTextSize(13);
+                    failed.setTextColor(Color.rgb(153, 27, 27));
+                    failed.setPadding(dp(10), dp(8), dp(10), dp(8));
+                    failed.setBackground(rounded(Color.rgb(254, 226, 226), Color.rgb(252, 165, 165), 12));
+                    careerListView.addView(failed);
+                    if (careerStatusView != null) careerStatusView.setText("求职看板加载失败。");
+                });
+            }
+        });
+    }
+
+    private void loadAgendaItems() {
+        if (agendaListView == null) return;
+        agendaListView.removeAllViews();
+        if (agendaStatusView != null) agendaStatusView.setText("正在读取日程...");
+        TextView loading = new TextView(this);
+        loading.setText("日程\n正在加载 Gmail、Calendar、WhatsApp、Telegram 等来源整理出的近期安排。");
+        loading.setTextSize(13);
+        loading.setTextColor(Color.rgb(51, 65, 85));
+        loading.setPadding(dp(10), dp(8), dp(10), dp(8));
+        loading.setBackground(rounded(Color.rgb(248, 250, 252), Color.rgb(226, 232, 240), 12));
+        agendaListView.addView(loading);
+        executor.execute(() -> {
+            try {
+                List<AgendaItem> items = api().agendaItems();
+                runOnMain(() -> {
+                    renderAgendaItems(items);
+                    if (agendaStatusView != null) agendaStatusView.setText("日程已刷新。");
+                });
+            } catch (Exception error) {
+                runOnMain(() -> {
+                    agendaListView.removeAllViews();
+                    TextView failed = new TextView(this);
+                    failed.setText("日程加载失败\n" + error.getMessage());
+                    failed.setTextSize(13);
+                    failed.setTextColor(Color.rgb(153, 27, 27));
+                    failed.setPadding(dp(10), dp(8), dp(10), dp(8));
+                    failed.setBackground(rounded(Color.rgb(254, 226, 226), Color.rgb(252, 165, 165), 12));
+                    agendaListView.addView(failed);
+                    if (agendaStatusView != null) agendaStatusView.setText("日程加载失败。");
+                });
+            }
+        });
+    }
+
+    private void renderAgendaItems(List<AgendaItem> items) {
+        if (agendaListView == null) return;
+        agendaListView.removeAllViews();
+        TextView heading = new TextView(this);
+        heading.setText("近期日程");
+        heading.setTextSize(15);
+        heading.setTextColor(Color.rgb(15, 23, 42));
+        agendaListView.addView(heading);
+
+        TextView note = new TextView(this);
+        note.setText("这里展示 Nomi 从私有信息里整理出的会议、约定、截止日期和提醒。时间优先展示具体日期。");
+        note.setTextSize(12);
+        note.setTextColor(Color.rgb(100, 116, 139));
+        agendaListView.addView(note);
+
+        if (items == null || items.isEmpty()) {
+            TextView empty = new TextView(this);
+            empty.setText("暂无近期日程。若你刚刚收到会议邮件，Nomi 会在采集器处理后自动出现在这里。");
+            empty.setTextSize(13);
+            empty.setTextColor(Color.rgb(71, 85, 105));
+            empty.setPadding(dp(10), dp(8), dp(10), dp(8));
+            empty.setBackground(rounded(Color.rgb(248, 250, 252), Color.rgb(226, 232, 240), 12));
+            LinearLayout.LayoutParams emptyParams = new LinearLayout.LayoutParams(-1, -2);
+            emptyParams.setMargins(0, dp(6), 0, 0);
+            agendaListView.addView(empty, emptyParams);
+            return;
+        }
+
+        for (AgendaItem item : items) {
+            TextView card = new TextView(this);
+            card.setText(item.cardText());
+            card.setTextSize(13);
+            card.setTextColor(Color.rgb(15, 23, 42));
+            card.setPadding(dp(10), dp(8), dp(10), dp(8));
+            card.setBackground(rounded(Color.rgb(248, 250, 252), Color.rgb(226, 232, 240), 12));
+            LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(-1, -2);
+            params.setMargins(0, dp(6), 0, 0);
+            agendaListView.addView(card, params);
+        }
+    }
+
+    private void renderCareerBoard(CareerBoardResult board) {
+        if (careerListView == null) return;
+        careerListView.removeAllViews();
+        TextView heading = new TextView(this);
+        heading.setText("求职看板");
+        heading.setTextSize(15);
+        heading.setTextColor(Color.rgb(15, 23, 42));
+        careerListView.addView(heading);
+
+        TextView note = new TextView(this);
+        note.setText("这里展示 Nomi 从 JD、简历、邮件和 LinkedIn 信号里整理出的机会、材料和申请状态。");
+        note.setTextSize(12);
+        note.setTextColor(Color.rgb(100, 116, 139));
+        careerListView.addView(note);
+
+        for (String cardText : CareerBoardPresenter.cards(board)) {
+            TextView card = new TextView(this);
+            card.setText(cardText);
+            card.setTextSize(13);
+            card.setTextColor(Color.rgb(15, 23, 42));
+            card.setPadding(dp(10), dp(8), dp(10), dp(8));
+            card.setBackground(rounded(Color.rgb(248, 250, 252), Color.rgb(226, 232, 240), 12));
+            LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(-1, -2);
+            params.setMargins(0, dp(6), 0, 0);
+            careerListView.addView(card, params);
+        }
+        List<CareerBoardAction> actions = CareerBoardPresenter.actions(board);
+        if (!actions.isEmpty()) {
+            TextView actionHeading = new TextView(this);
+            actionHeading.setText("可执行操作");
+            actionHeading.setTextSize(14);
+            actionHeading.setTextColor(Color.rgb(15, 23, 42));
+            LinearLayout.LayoutParams headingParams = new LinearLayout.LayoutParams(-1, -2);
+            headingParams.setMargins(0, dp(10), 0, 0);
+            careerListView.addView(actionHeading, headingParams);
+        }
+        for (CareerBoardAction action : actions) {
+            Button button = new Button(this);
+            button.setText(action.label);
+            styleSecondaryButton(button);
+            button.setOnClickListener(view -> applyCareerBoardAction(action));
+            LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(-1, dp(42));
+            params.setMargins(0, dp(6), 0, 0);
+            careerListView.addView(button, params);
+        }
+    }
+
+    private void applyCareerBoardAction(CareerBoardAction action) {
+        if (careerStatusView != null) careerStatusView.setText("正在更新求职状态...");
+        executor.execute(() -> {
+            try {
+                api().updateCareerApplication(
+                        action.applicationId,
+                        action.status,
+                        action.stage,
+                        action.nextStep,
+                        action.userNote
+                );
+                CareerBoardResult board = api().careerBoard();
+                runOnMain(() -> {
+                    renderCareerBoard(board);
+                    if (careerStatusView != null) careerStatusView.setText("求职状态已更新。");
+                });
+            } catch (Exception error) {
+                runOnMain(() -> {
+                    if (careerStatusView != null) {
+                        careerStatusView.setText("求职状态更新失败：" + error.getMessage());
+                    }
+                });
+            }
+        });
     }
 
     private void showAccountsAfterExternalAuth(String message) {
@@ -1125,19 +1577,10 @@ public final class FloatingBallService extends Service {
 
     private String statusText(AccountChannel channel, CollectorStatus status) {
         if ("shopping".equals(channel.source)) return "间接";
+        if (status != null) return status.displayLabel(channel.opensBrowser);
         if (!channel.opensBrowser) {
-            if (status == null) return "本地";
-            if (!status.enabled) return "已停用";
-            if (status.paused) return "暂停";
-            if ("failed".equals(status.healthStatus)) return "异常";
             return "本地";
         }
-        if (status == null) return channel.opensBrowser ? "可登录" : "本地";
-        if (!status.enabled) return "已停用";
-        if (status.paused) return "暂停";
-        if ("healthy".equals(status.healthStatus)) return "正常";
-        if ("degraded".equals(status.healthStatus)) return "待登录";
-        if ("failed".equals(status.healthStatus)) return "异常";
         return channel.opensBrowser ? "可登录" : "本地";
     }
 
@@ -1157,23 +1600,82 @@ public final class FloatingBallService extends Service {
 
     private void openRemoteBrowser(String source) {
         String normalizedSource = source == null ? "" : source.trim();
-        if (!normalizedSource.isEmpty()) {
-            if (responseView != null) responseView.setText("正在打开 " + normalizedSource + " 登录页...");
-            executor.execute(() -> {
-                try {
-                    api().requestRemoteBrowserOpen(normalizedSource);
-                } catch (Exception error) {
-                    runOnMain(() -> {
-                        if (responseView != null) {
-                            responseView.setText("远程浏览器导航失败，仍会打开浏览器：" + error.getMessage());
-                        }
-                    });
-                }
-            });
+        if (normalizedSource.isEmpty()) {
+            if (responseView != null) responseView.setText("缺少远程浏览器来源。");
+            return;
         }
+        if (responseView != null) responseView.setText("正在打开 " + normalizedSource + " 登录页...");
+        executor.execute(() -> {
+            try {
+                BrowserOpenResult open = api().requestRemoteBrowserOpen(normalizedSource);
+                if (open.commandId.isEmpty()) {
+                    throw new IllegalStateException("服务器没有返回浏览器命令编号");
+                }
+                BrowserCommandStatus status = api().waitForBrowserCommand(open.commandId, 45000L);
+                runOnMain(() -> {
+                    if (status.isNavigationReady()) {
+                        openRemoteBrowserActivity();
+                        return;
+                    }
+                    if (responseView != null) {
+                        responseView.setText(
+                                normalizedSource
+                                        + " 登录页还没有准备好："
+                                        + (status.status.isEmpty() ? "unknown" : status.status)
+                                        + "。请稍后重试。"
+                        );
+                    }
+                });
+            } catch (Exception error) {
+                runOnMain(() -> {
+                    if (responseView != null) {
+                        responseView.setText("远程浏览器导航失败：" + error.getMessage());
+                    }
+                });
+            }
+        });
+    }
+
+    private boolean openChatMessageUrl(String url) {
+        if (!FloatingMessageLinks.isLinkedInJobDetailUrl(url)) {
+            closePanel();
+            return false;
+        }
+        closePanel();
+        executor.execute(() -> {
+            try {
+                BrowserOpenResult open = api().requestRemoteBrowserOpenLinkedInJob(url);
+                if (open.commandId.isEmpty()) {
+                    throw new IllegalStateException("服务器没有返回岗位打开命令编号");
+                }
+                BrowserCommandStatus status = api().waitForBrowserCommand(open.commandId, 45000L);
+                runOnMain(() -> {
+                    if (status.isNavigationReady()) {
+                        openRemoteBrowserActivity();
+                        return;
+                    }
+                    showPanel();
+                    if (responseView != null) {
+                        responseView.setText("LinkedIn 岗位页还没有准备好：" + (status.status.isEmpty() ? "unknown" : status.status));
+                    }
+                });
+            } catch (Exception error) {
+                runOnMain(() -> {
+                    showPanel();
+                    if (responseView != null) {
+                        responseView.setText("打开 LinkedIn 岗位页失败：" + error.getMessage());
+                    }
+                });
+            }
+        });
+        return true;
+    }
+
+    private void openRemoteBrowserActivity() {
         Intent intent = new Intent(this, WebWorkspaceActivity.class);
         intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
         intent.putExtra(WebWorkspaceActivity.EXTRA_URL, ConfigPrefs.remoteBrowserUrl(this));
+        intent.putExtra(WebWorkspaceActivity.EXTRA_REMOTE_BROWSER_MODE, true);
         startActivity(intent);
         closePanel();
     }

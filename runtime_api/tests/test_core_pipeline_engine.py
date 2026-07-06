@@ -89,6 +89,37 @@ def test_route_words_do_not_get_stolen_by_ride_pipeline(monkeypatch):
     assert result["resolved_slots"]["destination"] == "武康路"
 
 
+def test_natural_route_phrases_dispatch_to_route_pipeline(monkeypatch):
+    monkeypatch.setenv("APP_PASSWORD", "secret")
+    monkeypatch.setenv("PIPELINE_SLOT_MODEL_ENABLED", "0")
+    from app import main
+
+    cases = [
+        ("帮我查去武康路的路线", "武康路"),
+        ("怎么去人民广场", "人民广场"),
+        ("导航到静安寺地铁站", "静安寺地铁站"),
+    ]
+
+    for request, destination in cases:
+        result = main.run_core_pipeline(request)
+        assert result["route_type"] == "core_pipeline"
+        assert result["pipeline_id"] == "route_pipeline"
+        assert result["status"] == "completed_read_only"
+        assert result["resolved_slots"]["destination"] == destination
+
+
+def test_ride_phrase_still_dispatches_to_ride_pipeline(monkeypatch):
+    monkeypatch.setenv("APP_PASSWORD", "secret")
+    monkeypatch.setenv("PIPELINE_SLOT_MODEL_ENABLED", "0")
+    from app import main
+
+    result = main.run_core_pipeline("帮我打车去武康路")
+
+    assert result["route_type"] == "core_pipeline"
+    assert result["pipeline_id"] == "ride_pipeline"
+    assert result["resolved_slots"]["destination"] == "武康路"
+
+
 def test_ride_pipeline_execution_requires_pickup_before_booking(monkeypatch):
     monkeypatch.setenv("APP_PASSWORD", "secret")
     from app import main
@@ -206,6 +237,34 @@ def test_quotation_document_request_strips_trailing_conjunction_with_punctuation
     assert result["resolved_slots"]["file_or_query"] == "PHONE_1 报价单"
 
 
+def test_route_lookup_action_with_document_terms_stays_on_route_pipeline(monkeypatch):
+    monkeypatch.setenv("APP_PASSWORD", "secret")
+    monkeypatch.setenv("PIPELINE_SLOT_MODEL_ENABLED", "0")
+    from app import main
+
+    result = main.run_core_pipeline(
+        "查路线 导航 地图 多久到：跟进近期安排 这条信息可能需要跟进："
+        "明天下午4点在人民广场见，带上合同和PHONE_7报价单。到前请提醒我查路线。"
+    )
+
+    assert result["route_type"] == "core_pipeline"
+    assert result["pipeline_id"] == "route_pipeline"
+    assert result["status"] == "completed_read_only"
+    assert result["resolved_slots"]["destination"] == "人民广场"
+    assert result["output"]["route_request"]["destination"] == "人民广场"
+
+
+def test_route_like_document_search_still_routes_to_document_pipeline(monkeypatch):
+    monkeypatch.setenv("APP_PASSWORD", "secret")
+    monkeypatch.setenv("PIPELINE_SLOT_MODEL_ENABLED", "0")
+    from app import main
+
+    result = main.run_core_pipeline("帮我找路线规划文档，并总结给我")
+
+    assert result["pipeline_id"] == "document_file_pipeline"
+    assert result["resolved_slots"]["document_intent"] in {"summary", "summarize"}
+
+
 def test_reply_pipeline_uses_active_scope_as_recipient_without_model(monkeypatch):
     monkeypatch.setenv("APP_PASSWORD", "secret")
     monkeypatch.setenv("PIPELINE_SLOT_MODEL_ENABLED", "0")
@@ -227,6 +286,53 @@ def test_reply_pipeline_uses_active_scope_as_recipient_without_model(monkeypatch
     assert result["status"] == "draft_ready"
     assert result["resolved_slots"]["recipient"] == "Alice"
     assert result["resolved_slots"]["message_intent"] == "周五八点可以"
+
+
+def test_reply_pipeline_pronoun_email_uses_active_scope_not_literal_this_email(monkeypatch):
+    monkeypatch.setenv("APP_PASSWORD", "secret")
+    monkeypatch.setenv("PIPELINE_SLOT_MODEL_ENABLED", "0")
+    from app import main
+
+    result = main.run_core_pipeline(
+        "帮我回复这封邮件，就说我明天发报价单",
+        {
+            "active_source_scope": {
+                "source": "gmail",
+                "conversation_id": "gmail-thread-rg",
+                "conversation_label": "RG Alice",
+                "counterparty_ids": ["rg-alice"],
+            }
+        },
+    )
+
+    assert result["pipeline_id"] == "reply_pipeline"
+    assert result["status"] == "draft_ready"
+    assert result["resolved_slots"]["recipient"] == "RG Alice"
+    assert result["resolved_slots"]["channel"] == "gmail"
+    assert result["resolved_slots"]["message_intent"] == "我明天发报价单"
+
+
+def test_reply_pipeline_pronoun_email_uses_active_sender_as_recipient(monkeypatch):
+    monkeypatch.setenv("APP_PASSWORD", "secret")
+    monkeypatch.setenv("PIPELINE_SLOT_MODEL_ENABLED", "0")
+    from app import main
+
+    result = main.run_core_pipeline(
+        "帮我回复这封邮件，说我周五八点可以",
+        {
+            "active_source_scope": {
+                "source": "gmail",
+                "sender": "alice@example.com",
+                "from": "alice@example.com",
+            }
+        },
+    )
+
+    assert result["pipeline_id"] == "reply_pipeline"
+    assert result["status"] == "draft_ready"
+    assert result["resolved_slots"]["recipient"] == "alice@example.com"
+    assert result["resolved_slots"]["channel"] == "gmail"
+    assert result["resolved_slots"]["message_intent"] == "我周五八点可以"
 
 
 def test_pipeline_run_endpoint_returns_execution_contract(monkeypatch):
@@ -888,9 +994,19 @@ def test_pipeline_registry_endpoint_exposes_core_pipeline_contract(monkeypatch):
     assert response.status_code == 200
     body = response.json()
     pipeline_ids = [pipeline["id"] for pipeline in body["pipelines"]]
-    assert body["count"] == 18
+    assert body["count"] == 29
     assert "route_pipeline" in pipeline_ids
     assert "document_file_pipeline" in pipeline_ids
+    assert "job_discovery_pipeline" in pipeline_ids
+    assert "job_recommendation_pipeline" in pipeline_ids
+    assert "linkedin_contact_search_pipeline" in pipeline_ids
+    assert "job_application_pipeline" in pipeline_ids
+    for pipeline in body["pipelines"]:
+        assert pipeline["description"]
+        assert pipeline["risk"]["permission"] == pipeline["permission"]
+        assert isinstance(pipeline["risk"]["confirmation_required"], bool)
+        if pipeline["permission"] in {"write", "external_message", "external_execution", "payment_or_purchase"}:
+            assert pipeline["risk"]["confirmation_required"] is True
 
 
 def test_event_trace_uses_explicit_refs_and_returns_pipeline_executions(monkeypatch):
@@ -971,6 +1087,85 @@ def test_event_trace_uses_explicit_refs_and_returns_pipeline_executions(monkeypa
     assert body["route_traces"][0]["source_event_ids"] == ["evt-1"]
     assert body["pipeline_executions"][0]["pipeline_execution_id"] == "exec-1"
     assert body["pipeline_executions"][0]["resolved_slots"]["destination"] == "武康路"
+
+
+def test_conversation_trace_ignores_non_uuid_turn_references(monkeypatch):
+    monkeypatch.setenv("APP_PASSWORD", "secret")
+    from app import main
+
+    executed = []
+    conversation_id = "11111111-2222-3333-4444-555555555555"
+
+    def handler(sql, params):
+        executed.append((sql, params))
+        if "FROM assistant_conversations" in sql:
+            return Cursor(
+                [
+                    (
+                        conversation_id,
+                        "android",
+                        "2026-06-16T09:00:00+00:00",
+                        "2026-06-16T09:01:00+00:00",
+                        None,
+                        {},
+                        "active",
+                    )
+                ]
+            )
+        if "FROM assistant_turns" in sql:
+            return Cursor(
+                [
+                    (
+                        "turn-1",
+                        conversation_id,
+                        "user",
+                        "ping",
+                        "android-event-local-1",
+                        "suggestion-local-1",
+                        None,
+                        "2026-06-16T09:01:00+00:00",
+                        None,
+                    )
+                ]
+            )
+        if "FROM context_snapshots" in sql:
+            assert params == ([],)
+            return Cursor([])
+        if "FROM proactive_suggestions" in sql:
+            assert params == ([], [])
+            return Cursor([])
+        if "FROM task_route_traces" in sql or "FROM pipeline_execution_results" in sql:
+            return Cursor([])
+        return Cursor([])
+
+    monkeypatch.setattr(main, "db", lambda: type("Conn", (), {
+        "__enter__": lambda self: self,
+        "__exit__": lambda self, exc_type, exc, tb: None,
+        "execute": lambda self, sql, params=(): handler(" ".join(sql.split()), params),
+    })())
+
+    response = TestClient(main.app).get(
+        f"/api/chat/conversations/{conversation_id}/trace",
+        headers={"x-par-password": "secret"},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["conversation"]["id"] == conversation_id
+    assert body["turns"][0]["event_id"] == "android-event-local-1"
+
+
+def test_conversation_trace_rejects_non_uuid_conversation_id(monkeypatch):
+    monkeypatch.setenv("APP_PASSWORD", "secret")
+    from app import main
+
+    response = TestClient(main.app).get(
+        "/api/chat/conversations/not-a-uuid/trace",
+        headers={"x-par-password": "secret"},
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "conversation_id must be a UUID"
 
 
 def test_direct_pipeline_dispatch_returns_module_output(monkeypatch):

@@ -1,0 +1,89 @@
+{
+  "cases": [
+    {
+      "id": "contact_family_fact",
+      "category": "relationship_graph",
+      "source": "whatsapp",
+      "contact": "王超",
+      "observed_at": "2026-07-03T14:47:00+08:00",
+      "messages": ["王超他儿子叫张红"],
+      "query": "张红是谁？",
+      "expected": ["张红", "王超", "儿子"],
+      "must_not_include": ["用户的儿子", "您的儿子"],
+      "why_it_matters": "Nomi must bind family facts to the sender/contact, not the user."
+    },
+    {
+      "id": "insurance_preference",
+      "category": "preference_memory",
+      "source": "whatsapp",
+      "contact": "保险顾问",
+      "observed_at": "2026-07-03T14:48:00+08:00",
+      "messages": ["我想买个你之前说的那个保险", "明天下午在保利广场详细聊一下呗"],
+      "query": "我买保险最关心什么？",
+      "expected": ["保险", "购买意向"],
+      "must_not_include": ["没有记录"],
+      "why_it_matters": "Nomi currently misses some WhatsApp-derived purchase intent/preference memories."
+    },
+    {
+      "id": "relative_event_absolute_date",
+      "category": "agenda",
+      "source": "whatsapp",
+      "contact": "大刚",
+      "observed_at": "2026-07-01T19:29:00+08:00",
+      "messages": ["明天下午3点半在人民广场见，带合同。"],
+      "query": "人民广场会面是几月几号几点？",
+      "expected": ["2026年7月2日", "15:30", "人民广场", "合同"],
+      "must_not_include": ["明天"],
+      "why_it_matters": "Relative time must be resolved when stored and when answered."
+    },
+    {
+      "id": "cancellation",
+      "category": "agenda",
+      "source": "whatsapp",
+      "contact": "大刚",
+      "observed_at": "2026-07-01T20:10:00+08:00",
+      "messages": ["明天人民广场那个见面取消了"],
+      "query": "明天我有哪些安排？",
+      "expected": ["取消", "人民广场"],
+      "must_not_include": ["仍需", "需要去人民广场"],
+      "why_it_matters": "Cancelled events must not remain active in proactive suggestions or schedule answers."
+    },
+    {
+      "id": "deadline_quote_sheet",
+      "category": "task_deadline",
+      "source": "whatsapp",
+      "contact": "客户A",
+      "observed_at": "2026-07-01T19:29:00+08:00",
+      "messages": ["周五18点前把报价单发我，记得核对成本和利润率。"],
+      "query": "周五18点前我要做什么？",
+      "expected": ["报价单", "18:00", "成本", "利润率"],
+      "must_not_include": ["没有记录"],
+      "why_it_matters": "Task memories must preserve requested deliverable plus quality constraints."
+    },
+    {
+      "id": "job_intent",
+      "category": "career",
+      "source": "android_chat",
+      "contact": "user",
+      "observed_at": "2026-07-03T16:00:00+08:00",
+      "messages": ["帮我找找看有没有适合我的工作机会"],
+      "query": "帮我找找看有没有适合我的工作机会",
+      "expected": ["简历", "职位", "LinkedIn", "匹配理由"],
+      "must_not_include": ["没有关于您职业背景技能偏好等记录"],
+      "why_it_matters": "Career requests should retrieve resume/profile and invoke job-search pipeline."
+    },
+    {
+      "id": "cross_contact_isolation",
+      "category": "privacy_scope",
+      "source": "whatsapp",
+      "contact": "Alice",
+      "observed_at": "2026-07-03T17:00:00+08:00",
+      "messages": ["Bob这个人不靠谱，别告诉他我这么说。"],
+      "query_context_contact": "Bob",
+      "query": "Alice怎么看我？",
+      "expected": ["不能透露", "没有可共享记录"],
+      "must_not_include": ["不靠谱"],
+      "why_it_matters": "Nomi must not leak private statements from one contact into another contact's interaction."
+    }
+  ]
+}

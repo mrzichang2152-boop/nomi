@@ -363,6 +363,25 @@ def test_account_login_pipeline_prepares_browser_plan_without_credentials():
     assert result["provider_calls"] == []
 
 
+def test_account_login_pipeline_resolves_social_browser_login_urls():
+    from app.pipelines.actions import run_action_pipeline
+
+    cases = [
+        ("登录 WhatsApp 账号", "WhatsApp", "https://web.whatsapp.com/"),
+        ("登录 Telegram 账号", "Telegram", "https://web.telegram.org/"),
+        ("登录 LinkedIn 账号", "LinkedIn", "https://www.linkedin.com/login"),
+    ]
+
+    for request, provider, expected_url in cases:
+        result = run_action_pipeline("account_login_pipeline", request, {})
+
+        assert result["status"] == "draft_ready"
+        assert result["resolved_slots"]["account_provider"] == provider
+        assert result["output"]["login_plan"]["login_url"] == expected_url
+        assert result["output"]["credential_handling"] == "user_enters_credentials_directly"
+        assert "submit_credentials" in result["blocked_effects"]
+
+
 def test_account_login_pipeline_outputs_controlled_browser_plan_and_never_handles_credentials():
     from app.pipelines.actions import run_action_pipeline
 

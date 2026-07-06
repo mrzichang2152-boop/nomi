@@ -250,7 +250,8 @@ def test_store_persists_grants_manifests_traces_and_pause():
     assert store.get_grant(grant.grant_id).metadata["pause_reason"] == "user_requested_pause"
 
 
-def test_delegated_automation_endpoints_require_password_and_expose_evaluate_trace_flow():
+def test_delegated_automation_endpoints_require_password_and_expose_evaluate_trace_flow(monkeypatch):
+    monkeypatch.setenv("APP_PASSWORD", "secret")
     from app.main import app
 
     client = TestClient(app)
@@ -316,3 +317,285 @@ def test_delegated_automation_endpoints_require_password_and_expose_evaluate_tra
     assert paused.status_code == 200
     assert paused.json()["grant"]["status"] == "paused"
     assert paused.json()["grant"]["metadata"]["pause_reason"] == "user_clicked_pause_all"
+
+
+def test_delegated_automation_endpoints_return_422_for_missing_required_fields(monkeypatch):
+    monkeypatch.setenv("APP_PASSWORD", "secret")
+    from app import main
+
+    client = TestClient(main.app, raise_server_exceptions=False)
+    payload = grant_payload()
+    payload.pop("scenario")
+
+    response = client.post(
+        "/api/delegated-automation/grants",
+        headers={"x-par-password": "secret"},
+        json=payload,
+    )
+
+    assert response.status_code == 422
+    assert response.json()["detail"]["missing_field"] == "scenario"
+
+    manifest = manifest_payload()
+    manifest.pop("platform")
+    manifest_response = client.post(
+        "/api/delegated-automation/manifests",
+        headers={"x-par-password": "secret"},
+        json=manifest,
+    )
+    assert manifest_response.status_code == 422
+    assert manifest_response.json()["detail"]["missing_field"] == "platform"
+
+
+def test_delegated_automation_execute_calls_provider_only_after_allowed_decision(monkeypatch):
+    monkeypatch.setenv("APP_PASSWORD", "secret")
+    from app import main
+
+    main._DELEGATED_AUTOMATION_STORE.clear()
+    main._DELEGATED_AUTOMATION_STORE.upsert_grant(
+        main.DelegationGrant.from_dict(
+            grant_payload(
+                grant_id="grant_linkedin_apply",
+                platform="linkedin",
+                action="submit_application",
+                daily_limit=2,
+                batch_limit=2,
+            )
+        )
+    )
+    main._DELEGATED_AUTOMATION_STORE.upsert_manifest(
+        main.TargetManifest.from_dict(
+            manifest_payload(
+                ["target_apply_1"],
+                manifest_id="manifest_linkedin_apply",
+                platform="linkedin",
+                action="submit_application",
+            )
+        )
+    )
+    captured = {}
+
+    def fake_provider(*, grant, manifest, target, decision, request):
+        captured["grant"] = grant.grant_id
+        captured["manifest"] = manifest.manifest_id
+        captured["target"] = target.target_id
+        captured["decision"] = decision.allowed
+        captured["request"] = request
+        return {
+            "status": "completed",
+            "result_summary": "Clicked Apply and Submit for target_apply_1.",
+            "evidence_ids": ["screenshot_apply_1", "dom_submit_1"],
+            "provider": "cloud_playwright_browser",
+            "metadata": {"url": target.profile_url or target.metadata.get("url", "")},
+        }
+
+    monkeypatch.setattr(main, "run_delegated_automation_provider", fake_provider)
+
+    response = TestClient(main.app).post(
+        "/api/delegated-automation/execute",
+        headers={"x-par-password": "secret"},
+        json={
+            "grant_id": "grant_linkedin_apply",
+            "manifest_id": "manifest_linkedin_apply",
+            "target_id": "target_apply_1",
+            "content_evidence_ids": ["jd_1", "resume_1", "draft_apply_1"],
+            "now": "2026-06-05T09:00:00+00:00",
+            "request": {"dry_run": False},
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "completed"
+    assert body["decision"]["allowed"] is True
+    assert body["provider_result"]["provider"] == "cloud_playwright_browser"
+    assert body["trace"]["status"] == "completed"
+    assert body["trace"]["evidence_ids"] == ["screenshot_apply_1", "dom_submit_1"]
+    assert body["trace"]["budget_after"] == {"used_today": 1, "remaining_today": 1}
+    assert captured["decision"] is True
+    assert captured["target"] == "target_apply_1"
+
+
+def test_delegated_automation_execute_blocks_without_grounded_evidence(monkeypatch):
+    monkeypatch.setenv("APP_PASSWORD", "secret")
+    from app import main
+
+    main._DELEGATED_AUTOMATION_STORE.clear()
+    main._DELEGATED_AUTOMATION_STORE.upsert_grant(main.DelegationGrant.from_dict(grant_payload()))
+    main._DELEGATED_AUTOMATION_STORE.upsert_manifest(main.TargetManifest.from_dict(manifest_payload(["target_1"])))
+
+    def fail_provider(**kwargs):
+        raise AssertionError("provider must not run when evidence is missing")
+
+    monkeypatch.setattr(main, "run_delegated_automation_provider", fail_provider)
+    response = TestClient(main.app).post(
+        "/api/delegated-automation/execute",
+        headers={"x-par-password": "secret"},
+        json={
+            "grant_id": "grant_job_linkedin_message",
+            "manifest_id": "manifest_linkedin_outreach",
+            "target_id": "target_1",
+            "content_evidence_ids": [],
+            "now": "2026-06-05T09:00:00+00:00",
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "blocked"
+    assert body["decision"]["allowed"] is False
+    assert "missing_grounded_content" in body["decision"]["reasons"]
+    assert body["trace"]["status"] == "blocked"
+    assert body["trace"]["result_summary"] == "blocked: missing_grounded_content"
+
+
+def test_delegated_automation_execute_reports_provider_misconfigured_without_fake_success(monkeypatch):
+    monkeypatch.setenv("APP_PASSWORD", "secret")
+    monkeypatch.delenv("NOMI_BROWSER_EXECUTOR_URL", raising=False)
+    from app import main
+
+    main._DELEGATED_AUTOMATION_STORE.clear()
+    main._DELEGATED_AUTOMATION_STORE.upsert_grant(main.DelegationGrant.from_dict(grant_payload()))
+    main._DELEGATED_AUTOMATION_STORE.upsert_manifest(main.TargetManifest.from_dict(manifest_payload(["target_1"])))
+
+    response = TestClient(main.app).post(
+        "/api/delegated-automation/execute",
+        headers={"x-par-password": "secret"},
+        json={
+            "grant_id": "grant_job_linkedin_message",
+            "manifest_id": "manifest_linkedin_outreach",
+            "target_id": "target_1",
+            "content_evidence_ids": ["jd_1", "resume_1", "draft_456"],
+            "now": "2026-06-05T09:00:00+00:00",
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "misconfigured"
+    assert body["provider_result"]["status"] == "misconfigured"
+    assert body["provider_result"]["required_env"] == "NOMI_BROWSER_EXECUTOR_URL"
+    assert body["trace"]["status"] == "misconfigured"
+    assert body["trace"]["budget_after"] == {"used_today": 0, "remaining_today": 2}
+
+
+def test_delegated_automation_execute_dry_run_returns_plan_without_provider_or_budget_use(monkeypatch):
+    monkeypatch.setenv("APP_PASSWORD", "secret")
+    from app import main
+
+    main._DELEGATED_AUTOMATION_STORE.clear()
+    main._DELEGATED_AUTOMATION_STORE.upsert_grant(main.DelegationGrant.from_dict(grant_payload()))
+    main._DELEGATED_AUTOMATION_STORE.upsert_manifest(main.TargetManifest.from_dict(manifest_payload(["target_1"])))
+
+    def fail_provider(**kwargs):
+        raise AssertionError("dry-run must not call the real delegated provider")
+
+    monkeypatch.setattr(main, "run_delegated_automation_provider", fail_provider)
+    response = TestClient(main.app).post(
+        "/api/delegated-automation/execute",
+        headers={"x-par-password": "secret"},
+        json={
+            "grant_id": "grant_job_linkedin_message",
+            "manifest_id": "manifest_linkedin_outreach",
+            "target_id": "target_1",
+            "content_evidence_ids": ["jd_1", "resume_1", "draft_456"],
+            "now": "2026-06-05T09:00:00+00:00",
+            "request": {"dry_run": True},
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "dry_run_ready"
+    assert body["decision"]["allowed"] is True
+    assert body["provider_result"]["provider"] == "delegated_dry_run_executor"
+    assert body["provider_result"]["metadata"]["dry_run"] is True
+    plan = body["provider_result"]["metadata"]["execution_plan"]
+    assert plan["platform"] == "linkedin"
+    assert plan["action"] == "send_message"
+    assert plan["target"]["target_id"] == "target_1"
+    assert plan["evidence_ids"] == ["jd_1", "resume_1", "draft_456"]
+    assert plan["would_execute"] is True
+    assert "open_target" in [step["id"] for step in plan["steps"]]
+    assert body["trace"]["status"] == "dry_run_ready"
+    assert body["trace"]["evidence_ids"] == ["jd_1", "resume_1", "draft_456"]
+    assert body["trace"]["budget_after"] == {"used_today": 0, "remaining_today": 2}
+
+
+def test_delegated_automation_execute_uses_google_docs_provider_for_document_writes(monkeypatch):
+    monkeypatch.setenv("APP_PASSWORD", "secret")
+    monkeypatch.setenv("NOMI_GOOGLE_DOCS_PROVIDER_URL", "https://docs-provider.test/write")
+    monkeypatch.setenv("NOMI_GOOGLE_DOCS_PROVIDER_TOKEN", "docs-token")
+    from app import main
+
+    class FakeResponse:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "status": "completed",
+                "provider": "google_docs_provider",
+                "result_summary": "Created tailored resume in Google Docs.",
+                "evidence_ids": ["gdoc_doc_123", "revision_2"],
+                "metadata": {"document_id": "doc_123"},
+            }
+
+    captured = {}
+
+    def fake_post(url, *, json, headers, timeout):
+        captured["url"] = url
+        captured["json"] = json
+        captured["headers"] = headers
+        captured["timeout"] = timeout
+        return FakeResponse()
+
+    monkeypatch.setattr(main.httpx, "post", fake_post)
+    main._DELEGATED_AUTOMATION_STORE.clear()
+    main._DELEGATED_AUTOMATION_STORE.upsert_grant(
+        main.DelegationGrant.from_dict(
+            grant_payload(
+                grant_id="grant_google_docs_resume",
+                platform="google_docs",
+                surface="composio_google_docs",
+                action="write_document",
+                daily_limit=2,
+                batch_limit=2,
+            )
+        )
+    )
+    main._DELEGATED_AUTOMATION_STORE.upsert_manifest(
+        main.TargetManifest.from_dict(
+            manifest_payload(
+                ["target_resume_doc"],
+                manifest_id="manifest_google_docs_resume",
+                platform="google_docs",
+                action="write_document",
+            )
+        )
+    )
+
+    response = TestClient(main.app).post(
+        "/api/delegated-automation/execute",
+        headers={"x-par-password": "secret"},
+        json={
+            "grant_id": "grant_google_docs_resume",
+            "manifest_id": "manifest_google_docs_resume",
+            "target_id": "target_resume_doc",
+            "content_evidence_ids": ["resume_base_1", "jd_1", "rewrite_plan_1"],
+            "now": "2026-06-05T09:00:00+00:00",
+            "request": {"document_title": "AI PM tailored resume"},
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "completed"
+    assert body["provider_result"]["provider"] == "google_docs_provider"
+    assert body["trace"]["evidence_ids"] == ["gdoc_doc_123", "revision_2"]
+    assert body["trace"]["budget_after"] == {"used_today": 1, "remaining_today": 1}
+    assert captured["url"] == "https://docs-provider.test/write"
+    assert captured["headers"]["Authorization"] == "Bearer docs-token"
+    assert captured["json"]["grant"]["platform"] == "google_docs"
+    assert captured["json"]["target"]["target_id"] == "target_resume_doc"
+    assert captured["json"]["request"] == {"document_title": "AI PM tailored resume"}

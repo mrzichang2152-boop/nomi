@@ -1,8 +1,69 @@
 import sys
 from pathlib import Path
+from typing import Optional
 
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+
+class RecordingGmailAdapter:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+
+    def send_message(
+        self,
+        *,
+        sender: str,
+        recipient: str,
+        subject: str,
+        body_text: str,
+        thread_id: Optional[str] = None,
+    ) -> dict[str, object]:
+        self.calls.append(
+            {
+                "sender": sender,
+                "recipient": recipient,
+                "subject": subject,
+                "body_text": body_text,
+                "thread_id": thread_id or "",
+            }
+        )
+        return {
+            "status": "sent",
+            "provider": "recording_gmail",
+            "provider_message_id": "gmail-provider-1",
+            "provider_result": {"status_code": 200, "body": {"id": "gmail-provider-1"}},
+        }
+
+
+class RecordingPhoneCallAdapter:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+
+    def create_playback_call(
+        self,
+        *,
+        from_number: str,
+        to_number: str,
+        script_text: str,
+        audio_url: Optional[str] = None,
+        voice: str = "default",
+    ) -> dict[str, object]:
+        self.calls.append(
+            {
+                "from_number": from_number,
+                "to_number": to_number,
+                "script_text": script_text,
+                "audio_url": audio_url or "",
+                "voice": voice,
+            }
+        )
+        return {
+            "status": "queued",
+            "provider": "recording_phone",
+            "provider_call_id": "call-provider-1",
+            "provider_result": {"status_code": 201, "body": {"call_id": "call-provider-1"}},
+        }
 
 
 def test_third_party_email_request_creates_draft_not_send():
@@ -46,7 +107,8 @@ def test_cancelled_draft_never_calls_provider():
 def test_send_requires_explicit_confirmation_token():
     from app.assistant_identity.outbound import OutboundMessagePipeline
 
-    pipeline = OutboundMessagePipeline()
+    adapter = RecordingGmailAdapter()
+    pipeline = OutboundMessagePipeline(gmail_adapter=adapter)
     draft = pipeline.prepare_draft(
         identity_id="nomi_gmail_primary",
         channel="gmail",
@@ -62,6 +124,70 @@ def test_send_requires_explicit_confirmation_token():
         assert "confirmation" in str(exc).lower()
     else:
         raise AssertionError("send succeeded without confirmation")
+
+    assert adapter.calls == []
+
+
+def test_confirmed_gmail_send_calls_adapter_and_records_provider_result(monkeypatch):
+    from app.assistant_identity.outbound import OutboundMessagePipeline
+
+    monkeypatch.setenv("ASSISTANT_GMAIL_ADDRESS", "nomi@example.com")
+    adapter = RecordingGmailAdapter()
+    pipeline = OutboundMessagePipeline(gmail_adapter=adapter)
+
+    draft = pipeline.prepare_draft(
+        identity_id="nomi_gmail_primary",
+        channel="gmail",
+        recipient="alice@example.com",
+        subject="Hi",
+        body_text="我是 Nomi。",
+        source_evidence_ids=["evt_3b"],
+    )
+
+    result = pipeline.confirm_and_send(draft["draft_id"], confirmation_token="confirm-send")
+
+    assert result["status"] == "sent"
+    assert result["send_called"] is True
+    assert result["provider"] == "recording_gmail"
+    assert result["provider_message_id"] == "gmail-provider-1"
+    assert result["provider_result"]["status_code"] == 200
+    assert adapter.calls == [
+        {
+            "sender": "nomi@example.com",
+            "recipient": "alice@example.com",
+            "subject": "Hi",
+            "body_text": "我是 Nomi。",
+            "thread_id": "",
+        }
+    ]
+
+
+def test_default_gmail_send_returns_misconfigured_after_confirmation(monkeypatch):
+    from app.assistant_identity.outbound import OutboundMessagePipeline
+
+    for name in [
+        "ASSISTANT_GMAIL_ADDRESS",
+        "ASSISTANT_GMAIL_ACCESS_TOKEN",
+    ]:
+        monkeypatch.delenv(name, raising=False)
+
+    pipeline = OutboundMessagePipeline()
+    draft = pipeline.prepare_draft(
+        identity_id="nomi_gmail_primary",
+        channel="gmail",
+        recipient="alice@example.com",
+        subject="Hi",
+        body_text="我是 Nomi。",
+        source_evidence_ids=["evt_3c"],
+    )
+
+    result = pipeline.confirm_and_send(draft["draft_id"], confirmation_token="confirm-send")
+
+    assert result["status"] == "blocked"
+    assert result["send_called"] is True
+    assert result["provider"] == "gmail"
+    assert result["reason"] == "misconfigured"
+    assert result["provider_result"]["status"] == "misconfigured"
 
 
 def test_sms_draft_uses_sms_confirmation_card():
@@ -103,7 +229,8 @@ def test_phone_call_draft_uses_call_confirmation_card():
 def test_call_requires_explicit_confirmation_token():
     from app.assistant_identity.outbound import OutboundMessagePipeline
 
-    pipeline = OutboundMessagePipeline()
+    adapter = RecordingPhoneCallAdapter()
+    pipeline = OutboundMessagePipeline(phone_call_adapter=adapter)
     draft = pipeline.prepare_draft(
         identity_id="nomi_phone_primary",
         channel="phone_call",
@@ -120,10 +247,14 @@ def test_call_requires_explicit_confirmation_token():
     else:
         raise AssertionError("call succeeded without confirmation")
 
+    assert adapter.calls == []
+
     called = pipeline.confirm_and_call(draft["draft_id"], confirmation_token="confirm-call")
     assert called["status"] == "call_queued"
     assert called["call_called"] is True
-    assert called["provider_call_id"].startswith("local-call-")
+    assert called["provider_call_id"] == "call-provider-1"
+    assert called["provider_result"]["status_code"] == 201
+    assert adapter.calls[0]["to_number"] == "+15551234567"
 
 
 def test_communication_pipeline_returns_agent_policy_for_long_tail_request():

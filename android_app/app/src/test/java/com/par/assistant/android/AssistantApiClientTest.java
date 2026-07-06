@@ -59,6 +59,187 @@ public final class AssistantApiClientTest {
     }
 
     @Test
+    public void chatPostsClientRequestIdForFallbackIdempotency() throws Exception {
+        server.enqueue(
+                new MockResponse()
+                        .setResponseCode(200)
+                        .setHeader("content-type", "application/json")
+                        .setBody("{\"answer\":\"pong\",\"conversation_id\":\"conv-1\",\"client_request_id\":\"android-request-1\"}")
+        );
+        AssistantApiClient client = new AssistantApiClient(ServerConfig.create(server.url("/").toString(), "secret"));
+
+        ChatResult result = client.chat("ping", "conv-1", java.util.List.of(), "android-request-1");
+
+        RecordedRequest request = server.takeRequest();
+        assertEquals("/api/chat", request.getPath());
+        assertEquals("secret", request.getHeader("x-par-password"));
+        String requestBody = request.getBody().readUtf8();
+        assertTrue(requestBody.contains("\"client_request_id\":\"android-request-1\""));
+        assertTrue(requestBody.contains("\"conversation_id\":\"conv-1\""));
+        assertEquals("pong", result.answer);
+        assertEquals("conv-1", result.conversationId);
+    }
+
+    @Test
+    public void chatRetriesTransientBadGatewayWithSameClientRequestId() throws Exception {
+        server.enqueue(
+                new MockResponse()
+                        .setResponseCode(502)
+                        .setHeader("content-type", "application/json")
+                        .setBody("{\"detail\":\"runtime-api restarting\"}")
+        );
+        server.enqueue(
+                new MockResponse()
+                        .setResponseCode(200)
+                        .setHeader("content-type", "application/json")
+                        .setBody("{\"answer\":\"已恢复\",\"conversation_id\":\"conv-502\",\"client_request_id\":\"android-retry-1\"}")
+        );
+        AssistantApiClient client = new AssistantApiClient(ServerConfig.create(server.url("/").toString(), "secret"));
+
+        ChatResult result = client.chat("ping", "conv-502", java.util.List.of(), "android-retry-1");
+
+        RecordedRequest first = server.takeRequest();
+        RecordedRequest second = server.takeRequest();
+        assertEquals("/api/chat", first.getPath());
+        assertEquals("/api/chat", second.getPath());
+        assertTrue(first.getBody().readUtf8().contains("\"client_request_id\":\"android-retry-1\""));
+        assertTrue(second.getBody().readUtf8().contains("\"client_request_id\":\"android-retry-1\""));
+        assertEquals("已恢复", result.answer);
+        assertEquals("conv-502", result.conversationId);
+    }
+
+    @Test
+    public void agendaItemsFetchesRecentScheduleWithAbsoluteTime() throws Exception {
+        server.enqueue(
+                new MockResponse()
+                        .setResponseCode(200)
+                        .setHeader("content-type", "application/json")
+                        .setBody("{"
+                                + "\"items\":["
+                                + "{"
+                                + "\"id\":\"agenda-1\","
+                                + "\"title\":\"2026-06-25 周四 16:00 人民广场会面\","
+                                + "\"status\":\"pending\","
+                                + "\"certainty\":\"time_specific\","
+                                + "\"time_window\":{\"display\":\"2026-06-25 周四 16:00\",\"text\":\"2026-06-25 周四 16:00\"},"
+                                + "\"place\":\"人民广场\","
+                                + "\"participants\":[\"Alice\"],"
+                                + "\"missing_fields\":[],"
+                                + "\"metadata\":{\"source\":\"gmail\"}"
+                                + "}"
+                                + "]"
+                                + "}")
+        );
+        AssistantApiClient client = new AssistantApiClient(ServerConfig.create(server.url("/").toString(), "secret"));
+
+        java.util.List<AgendaItem> items = client.agendaItems();
+
+        RecordedRequest request = server.takeRequest();
+        assertEquals("/api/agenda?status=scheduled&limit=50", request.getPath());
+        assertEquals("secret", request.getHeader("x-par-password"));
+        assertEquals(1, items.size());
+        AgendaItem item = items.get(0);
+        assertEquals("agenda-1", item.id);
+        assertEquals("2026-06-25 周四 16:00 人民广场会面", item.title);
+        assertEquals("2026-06-25 周四 16:00", item.timeDisplay());
+        assertEquals("人民广场", item.place);
+        assertEquals("Alice", item.participants.get(0));
+        assertEquals("gmail", item.source);
+    }
+
+    @Test
+    public void agendaItemsDropsInactiveLinkedInBrowserNoiseIfServerReturnsIt() throws Exception {
+        server.enqueue(
+                new MockResponse()
+                        .setResponseCode(200)
+                        .setHeader("content-type", "application/json")
+                        .setBody("{"
+                                + "\"items\":["
+                                + "{"
+                                + "\"id\":\"bad-linkedin-agenda\","
+                                + "\"title\":\"0 notifications\\nSkip to footer\\nBJAK\\nBackend Engineer, AI (Agent Systems)\","
+                                + "\"status\":\"dismissed\","
+                                + "\"certainty\":\"fuzzy\","
+                                + "\"time_window\":{\"display\":\"待补充\"},"
+                                + "\"metadata\":{\"source\":\"linkedin\"}"
+                                + "},"
+                                + "{"
+                                + "\"id\":\"agenda-2\","
+                                + "\"title\":\"2026-07-06 周一 15:30 人民广场会面\","
+                                + "\"status\":\"scheduled\","
+                                + "\"certainty\":\"exact\","
+                                + "\"time_window\":{\"display\":\"2026-07-06 周一 15:30\"},"
+                                + "\"place\":\"人民广场\","
+                                + "\"participants\":[],"
+                                + "\"missing_fields\":[],"
+                                + "\"metadata\":{\"source\":\"whatsapp\"}"
+                                + "}"
+                                + "]"
+                                + "}")
+        );
+        AssistantApiClient client = new AssistantApiClient(ServerConfig.create(server.url("/").toString(), "secret"));
+
+        java.util.List<AgendaItem> items = client.agendaItems();
+
+        assertEquals(1, items.size());
+        assertEquals("agenda-2", items.get(0).id);
+        assertEquals("2026-07-06 周一 15:30 人民广场会面", items.get(0).title);
+    }
+
+    @Test
+    public void connectionStatusChecksProtectedApiAndReportsPasswordFailure() throws Exception {
+        server.enqueue(
+                new MockResponse()
+                        .setResponseCode(200)
+                        .setHeader("content-type", "application/json")
+                        .setBody("{\"status\":\"ok\"}")
+        );
+        server.enqueue(
+                new MockResponse()
+                        .setResponseCode(401)
+                        .setHeader("content-type", "application/json")
+                        .setBody("{\"detail\":\"invalid password\"}")
+        );
+        AssistantApiClient client = new AssistantApiClient(ServerConfig.create(server.url("/").toString(), "wrong"));
+
+        ConnectionStatus status = client.connectionStatus();
+
+        RecordedRequest health = server.takeRequest();
+        RecordedRequest protectedApi = server.takeRequest();
+        assertEquals("/health", health.getPath());
+        assertEquals("/api/model/status", protectedApi.getPath());
+        assertEquals("wrong", protectedApi.getHeader("x-par-password"));
+        assertEquals(false, status.ok);
+        assertEquals("服务器可达，但访问密码不正确。", status.message);
+    }
+
+    @Test
+    public void connectionStatusReportsProtectedApiAvailable() throws Exception {
+        server.enqueue(
+                new MockResponse()
+                        .setResponseCode(200)
+                        .setHeader("content-type", "application/json")
+                        .setBody("{\"status\":\"ok\"}")
+        );
+        server.enqueue(
+                new MockResponse()
+                        .setResponseCode(200)
+                        .setHeader("content-type", "application/json")
+                        .setBody("{\"providers\":[]}")
+        );
+        AssistantApiClient client = new AssistantApiClient(ServerConfig.create(server.url("/").toString(), "secret"));
+
+        ConnectionStatus status = client.connectionStatus();
+
+        assertEquals("/health", server.takeRequest().getPath());
+        RecordedRequest protectedApi = server.takeRequest();
+        assertEquals("/api/model/status", protectedApi.getPath());
+        assertEquals("secret", protectedApi.getHeader("x-par-password"));
+        assertTrue(status.ok);
+        assertEquals("服务器可达，访问密码正确，受保护 API 可用。", status.message);
+    }
+
+    @Test
     public void assistantIdentitiesFetchesNomiOwnedAccounts() throws Exception {
         server.enqueue(
                 new MockResponse()
@@ -153,5 +334,204 @@ public final class AssistantApiClientTest {
         assertTrue(draft.cardText().contains("将使用：Nomi Phone"));
         assertTrue(draft.cardText().contains("电话只会播放这段语音，不会实时对话"));
         assertTrue(draft.cardText().contains("拨打 / 编辑 / 取消"));
+    }
+
+    @Test
+    public void careerBoardFetchesJobAgentStateForWorkTab() throws Exception {
+        server.enqueue(
+                new MockResponse()
+                        .setResponseCode(200)
+                        .setHeader("content-type", "application/json")
+                        .setBody("{"
+                                + "\"profiles\":[{\"id\":\"career_profile_default\",\"headline\":\"AI workflow product manager\",\"target_roles\":[\"AI Product Manager\"],\"target_locations\":[\"Shanghai\"],\"skills\":[\"LLM product\",\"workflow automation\"],\"source_event_ids\":[\"resume_evt_1\"],\"payload\":{},\"updated_at\":\"2026-06-08T09:00:00+08:00\"}],"
+                                + "\"opportunities\":[{\"id\":\"job_pm_ai_1\",\"source\":\"linkedin_browser\",\"title\":\"AI Product Manager\",\"company\":\"Example AI\",\"location\":\"Shanghai\",\"url\":\"https://www.linkedin.com/jobs/view/job_pm_ai_1\",\"status\":\"tracked\",\"fit_score\":0.82,\"requirements\":[\"LLM product\",\"workflow automation\"],\"source_event_ids\":[\"job_evt_1\"],\"payload\":{},\"created_at\":\"2026-06-08T09:10:00+08:00\",\"updated_at\":\"2026-06-08T09:20:00+08:00\"}],"
+                                + "\"resume_versions\":[{\"id\":\"resume_version_resume_base_1_job_pm_ai_1\",\"base_resume_id\":\"resume_base_1\",\"target_job_id\":\"job_pm_ai_1\",\"status\":\"draft\",\"source_event_ids\":[\"resume_evt_1\"],\"payload\":{\"changes\":[{\"section\":\"summary\",\"change\":\"突出 LLM product\"}]},\"created_at\":\"2026-06-08T09:30:00+08:00\",\"updated_at\":\"2026-06-08T09:30:00+08:00\"}],"
+                                + "\"applications\":[{\"id\":\"application_job_pm_ai_1_submit_application\",\"job_id\":\"job_pm_ai_1\",\"status\":\"blocked_until_delegated_grant\",\"stage\":\"apply_submit_blocked\",\"next_step\":\"request_delegated_grant_and_target_manifest\",\"application_action\":\"submit_application\",\"platform\":\"linkedin\",\"source_event_ids\":[\"jd_evt_1\"],\"payload\":{},\"created_at\":\"2026-06-08T09:40:00+08:00\",\"updated_at\":\"2026-06-08T09:40:00+08:00\"}]"
+                                + "}")
+        );
+        AssistantApiClient client = new AssistantApiClient(ServerConfig.create(server.url("/").toString(), "secret"));
+
+        CareerBoardResult board = client.careerBoard();
+
+        RecordedRequest request = server.takeRequest();
+        assertEquals("/api/career/board?limit=50", request.getPath());
+        assertEquals("secret", request.getHeader("x-par-password"));
+        assertEquals("AI workflow product manager", board.profiles.get(0).headline);
+        assertEquals("AI Product Manager", board.opportunities.get(0).title);
+        assertEquals("Example AI", board.opportunities.get(0).company);
+        assertEquals("匹配 82% · tracked", board.opportunities.get(0).statusLine());
+        assertEquals("resume_base_1", board.resumeVersions.get(0).baseResumeId);
+        assertEquals("等待授权 · request_delegated_grant_and_target_manifest", board.applications.get(0).statusLine());
+    }
+
+    @Test
+    public void updateCareerApplicationPostsTrackingState() throws Exception {
+        server.enqueue(
+                new MockResponse()
+                        .setResponseCode(200)
+                        .setHeader("content-type", "application/json")
+                        .setBody("{"
+                                + "\"id\":\"application_job_pm_ai_1_submit_application\","
+                                + "\"job_id\":\"job_pm_ai_1\","
+                                + "\"status\":\"submitted\","
+                                + "\"stage\":\"submitted\","
+                                + "\"next_step\":\"prepare_interview_if_replied\","
+                                + "\"application_action\":\"submit_application\","
+                                + "\"platform\":\"linkedin\","
+                                + "\"source_event_ids\":[\"jd_evt_1\"],"
+                                + "\"payload\":{},"
+                                + "\"created_at\":\"2026-06-08T09:40:00+08:00\","
+                                + "\"updated_at\":\"2026-06-08T10:00:00+08:00\""
+                                + "}")
+        );
+        AssistantApiClient client = new AssistantApiClient(ServerConfig.create(server.url("/").toString(), "secret"));
+
+        JobApplicationState state = client.updateCareerApplication(
+                "application_job_pm_ai_1_submit_application",
+                "submitted",
+                "submitted",
+                "prepare_interview_if_replied",
+                "用户确认已投递"
+        );
+
+        RecordedRequest request = server.takeRequest();
+        assertEquals("/api/career/applications/application_job_pm_ai_1_submit_application", request.getPath());
+        assertEquals("PATCH", request.getMethod());
+        assertEquals("secret", request.getHeader("x-par-password"));
+        String requestBody = request.getBody().readUtf8();
+        assertTrue(requestBody.contains("\"status\":\"submitted\""));
+        assertTrue(requestBody.contains("\"next_step\":\"prepare_interview_if_replied\""));
+        assertEquals("submitted", state.status);
+        assertEquals("submitted", state.stage);
+        assertEquals("submitted · prepare_interview_if_replied", state.statusLine());
+    }
+
+    @Test
+    public void accountStatusesPreserveCollectorHealthWhileMergingComposioAuthorization() throws Exception {
+        server.enqueue(
+                new MockResponse()
+                        .setResponseCode(200)
+                        .setHeader("content-type", "application/json")
+                        .setBody("{"
+                                + "\"collectors\":["
+                                + "{"
+                                + "\"source\":\"gmail\","
+                                + "\"enabled\":true,"
+                                + "\"paused\":false,"
+                                + "\"health_status\":\"degraded\","
+                                + "\"auth_status\":\"api_not_connected\","
+                                + "\"browser_login_status\":\"logged_out\","
+                                + "\"collection_status\":\"degraded\","
+                                + "\"status_label\":\"浏览器未登录\","
+                                + "\"status_detail\":\"浏览器停在 Google 登录页\""
+                                + "},"
+                                + "{"
+                                + "\"source\":\"whatsapp\","
+                                + "\"enabled\":true,"
+                                + "\"paused\":false,"
+                                + "\"health_status\":\"degraded\","
+                                + "\"auth_status\":\"browser_required\","
+                                + "\"browser_login_status\":\"logged_out\","
+                                + "\"collection_status\":\"degraded\","
+                                + "\"status_label\":\"未登录\","
+                                + "\"status_detail\":\"请扫码登录 WhatsApp Web\""
+                                + "},"
+                                + "{"
+                                + "\"source\":\"telegram\","
+                                + "\"enabled\":true,"
+                                + "\"paused\":false,"
+                                + "\"health_status\":\"healthy\","
+                                + "\"auth_status\":\"browser_required\","
+                                + "\"browser_login_status\":\"logged_in\","
+                                + "\"collection_status\":\"healthy\","
+                                + "\"status_label\":\"已登录\","
+                                + "\"status_detail\":\"可采集当前可见聊天列表\""
+                                + "}"
+                                + "]"
+                                + "}")
+        );
+        server.enqueue(
+                new MockResponse()
+                        .setResponseCode(200)
+                        .setHeader("content-type", "application/json")
+                        .setBody("{\"toolkits\":[{\"slug\":\"gmail\",\"connected\":true}]}")
+        );
+        server.enqueue(
+                new MockResponse()
+                        .setResponseCode(200)
+                        .setHeader("content-type", "application/json")
+                        .setBody("{\"toolkits\":[]}")
+        );
+        AssistantApiClient client = new AssistantApiClient(ServerConfig.create(server.url("/").toString(), "secret"));
+
+        java.util.Map<String, CollectorStatus> statuses = client.accountStatuses();
+
+        assertEquals("/api/collectors/status", server.takeRequest().getPath());
+        assertEquals("/api/integrations/composio/toolkits?session_kind=readonly", server.takeRequest().getPath());
+        assertEquals("/api/integrations/composio/toolkits?session_kind=write", server.takeRequest().getPath());
+        CollectorStatus gmail = statuses.get("gmail");
+        assertEquals("degraded", gmail.healthStatus);
+        assertEquals("api_connected", gmail.authStatus);
+        assertEquals("logged_out", gmail.browserLoginStatus);
+        assertEquals("API 已连接", gmail.statusLabel);
+        assertTrue(gmail.statusDetail.contains("浏览器未登录"));
+
+        assertEquals("未登录", statuses.get("whatsapp").displayLabel(true));
+        assertEquals("已登录", statuses.get("telegram").displayLabel(true));
+    }
+
+    @Test
+    public void remoteBrowserOpenReturnsCommandAndCanWaitUntilNavigationCompletes() throws Exception {
+        server.enqueue(
+                new MockResponse()
+                        .setResponseCode(200)
+                        .setHeader("content-type", "application/json")
+                        .setBody("{"
+                                + "\"status\":\"queued\","
+                                + "\"command_id\":\"cmd-whatsapp\","
+                                + "\"source\":\"whatsapp\","
+                                + "\"target_url\":\"https://web.whatsapp.com/\","
+                                + "\"host_fragment\":\"web.whatsapp.com\""
+                                + "}")
+        );
+        server.enqueue(
+                new MockResponse()
+                        .setResponseCode(200)
+                        .setHeader("content-type", "application/json")
+                        .setBody("{"
+                                + "\"command_id\":\"cmd-whatsapp\","
+                                + "\"status\":\"queued\","
+                                + "\"source\":\"whatsapp\","
+                                + "\"target_url\":\"https://web.whatsapp.com/\""
+                                + "}")
+        );
+        server.enqueue(
+                new MockResponse()
+                        .setResponseCode(200)
+                        .setHeader("content-type", "application/json")
+                        .setBody("{"
+                                + "\"command_id\":\"cmd-whatsapp\","
+                                + "\"status\":\"navigated\","
+                                + "\"source\":\"whatsapp\","
+                                + "\"target_url\":\"https://web.whatsapp.com/\","
+                                + "\"details\":{\"url\":\"https://web.whatsapp.com/\"}"
+                                + "}")
+        );
+        AssistantApiClient client = new AssistantApiClient(ServerConfig.create(server.url("/").toString(), "secret"));
+
+        BrowserOpenResult open = client.requestRemoteBrowserOpen("whatsapp");
+        BrowserCommandStatus status = client.waitForBrowserCommand(open.commandId, 2000);
+
+        RecordedRequest openRequest = server.takeRequest();
+        RecordedRequest firstPoll = server.takeRequest();
+        RecordedRequest secondPoll = server.takeRequest();
+        assertEquals("/api/browser/open", openRequest.getPath());
+        assertEquals("{\"source\":\"whatsapp\"}", openRequest.getBody().readUtf8());
+        assertEquals("/api/browser/commands/cmd-whatsapp/status", firstPoll.getPath());
+        assertEquals("/api/browser/commands/cmd-whatsapp/status", secondPoll.getPath());
+        assertEquals("cmd-whatsapp", open.commandId);
+        assertEquals("whatsapp", open.source);
+        assertEquals("navigated", status.status);
+        assertTrue(status.isNavigationReady());
     }
 }

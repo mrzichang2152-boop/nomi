@@ -24,7 +24,7 @@ public final class SuggestionDeduper {
             return visible;
         }
         for (AssistantSuggestion suggestion : suggestions) {
-            if (suggestion != null && shouldDisplay(suggestion.id())) {
+            if (suggestion != null && suggestion.isDisplayable() && shouldDisplay(suggestion.id())) {
                 visible.add(suggestion);
             }
         }

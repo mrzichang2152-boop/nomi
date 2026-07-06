@@ -7,6 +7,7 @@ public final class CoreLogicTest {
     public static void main(String[] args) {
         testNormalizesServerBaseUrl();
         testRejectsInvalidServerBaseUrl();
+        testSuppressesInternalSuggestionText();
         testDedupesSuggestionIds();
         testFiltersAlreadySeenSuggestions();
         System.out.println("CoreLogicTest passed");
@@ -24,6 +25,24 @@ public final class CoreLogicTest {
         assertThrows(() -> ServerConfig.create("", "secret"), "empty base url");
         assertThrows(() -> ServerConfig.create("ftp://par.example.com", "secret"), "unsupported scheme");
         assertThrows(() -> ServerConfig.create("http://par.example.com", ""), "empty password");
+    }
+
+    private static void testSuppressesInternalSuggestionText() {
+        assertFalse(
+                AssistantSuggestion.isDisplayableText(
+                        "可能值得关注",
+                        "user said to Nomi: 保利广场的安排缺什么信息？请只基于我的真实记录回答。"
+                ),
+                "internal Nomi user question should not display as proactive suggestion"
+        );
+        assertFalse(
+                AssistantSuggestion.isDisplayableText("跟进近期安排", "这条信息可能需要跟进：(2) WhatsApp。"),
+                "WhatsApp title badge should not display as appointment suggestion"
+        );
+        assertTrue(
+                AssistantSuggestion.isDisplayableText("跟进近期安排", "这条信息可能需要跟进：明天下午3点半人民广场见，带合同。"),
+                "real WhatsApp appointment should remain displayable"
+        );
     }
 
     private static void testDedupesSuggestionIds() {

@@ -157,9 +157,19 @@ def main_script() -> int:
                     "write_tables": [sql.split(" ")[2] for sql, _ in executed if sql.startswith("INSERT INTO ")],
                 },
                 {
-                    "redirect_is_connect_link": link["redirect_url"].startswith("https://connect.composio.dev/link/"),
+                    "status_is_actionable": (
+                        link["status"] == "already_connected" and bool(link.get("connected_account_id"))
+                    )
+                    or (
+                        link["status"] == "link_created"
+                        and link["redirect_url"].startswith("https://connect.composio.dev/link/")
+                    ),
                     "manual_connections_disabled": captured.get("create", {}).get("manage_connections") is False,
-                    "gmail_authorized": captured.get("authorize", {}).get("toolkit_slug") == "gmail",
+                    "gmail_authorized_or_already_connected": (
+                        captured.get("authorize", {}).get("toolkit_slug") == "gmail"
+                        if captured.get("authorize")
+                        else link["status"] == "already_connected"
+                    ),
                     "destructive_disabled": captured.get("create", {}).get("tags", {}).get("disable") == ["destructiveHint"],
                     "secrets_redacted": "sdk-secret" not in link_text and "test-key" not in link_text,
                     "local_audit_written": any("INSERT INTO composio_connect_requests" in sql for sql, _ in executed)
@@ -212,4 +222,3 @@ def main_script() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main_script())
-

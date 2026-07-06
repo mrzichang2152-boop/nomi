@@ -88,6 +88,35 @@ def test_tool_registry_routes_assistant_owned_call_to_one_way_confirmation_pipel
     assert "duplex_call" in decision["forbidden_actions"]
 
 
+def test_tool_registry_routes_linkedin_outreach_to_career_pipeline():
+    from app.tool_registry import default_tool_registry
+
+    registry = default_tool_registry(connected_adapters={"browser": {"linkedin_browser"}})
+    decision = registry.route_request("帮我在 LinkedIn 给招聘负责人 Maya 发一段自我介绍")
+
+    assert decision["capability_id"] == "career.outreach.draft"
+    assert decision["pipeline_id"] == "outreach_message_pipeline"
+    assert decision["selected_adapter"] == "browser"
+    assert decision["required_toolkit"] == "linkedin_browser"
+    assert decision["permission"] == "external_message"
+    assert decision["confirmation_required"] is True
+    assert "send_without_confirmation" in decision["forbidden_actions"]
+
+
+def test_tool_registry_blocks_linkedin_apply_until_browser_connection():
+    from app.tool_registry import default_tool_registry
+
+    registry = default_tool_registry(connected_adapters={"browser": set()})
+    decision = registry.route_request("帮我自动点击 LinkedIn Apply 并提交")
+
+    assert decision["capability_id"] == "career.application.submit"
+    assert decision["pipeline_id"] == "job_application_pipeline"
+    assert decision["route_type"] == "connect_required"
+    assert decision["connect_action"]["toolkit"] == "linkedin_browser"
+    assert decision["permission"] == "external_execution"
+    assert "submit_without_delegated_grant" in decision["forbidden_actions"]
+
+
 def test_tool_registry_routes_long_tail_to_openclaw_with_minimized_context():
     from app.tool_registry import default_tool_registry
 

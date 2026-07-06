@@ -56,7 +56,7 @@ services:
       DATABASE_URL: postgresql://par:par_dev_password@postgres:5432/par
       REDIS_URL: redis://redis:6379/0
       MODEL_MODE: standard
-      MODEL_BASE_URL: ${MODEL_BASE_URL:-http://localhost:9161}
+      MODEL_BASE_URL: ${MODEL_BASE_URL:-http://81.70.177.246:9161/v1}
       MODEL_NAME: ${MODEL_NAME:-qwen3.6}
       APP_PASSWORD: ${APP_PASSWORD:-par-dev}
       RAW_DATA_ENCRYPTION_KEY: ${RAW_DATA_ENCRYPTION_KEY:-}
@@ -68,6 +68,19 @@ services:
       COMPOSIO_WRITE_TOOLKITS: ${COMPOSIO_WRITE_TOOLKITS:-gmail,googlecalendar,googledrive,googledocs,googlesheets,googletasks,github,slack,notion,todoist,linear,jira}
       EMBEDDING_PROVIDER: ${EMBEDDING_PROVIDER:-fastembed}
       FASTEMBED_MODEL: ${FASTEMBED_MODEL:-sentence-transformers/all-MiniLM-L6-v2}
+      ASR_PROVIDER: ${ASR_PROVIDER:-volcengine}
+      ASR_BASE_URL: ${ASR_BASE_URL:-wss://openspeech.bytedance.com/api/v3/sauc/bigmodel_async}
+      ASR_MODEL: ${ASR_MODEL:-bigmodel}
+      ASR_LANGUAGE_HINT: ${ASR_LANGUAGE_HINT:-zh-CN}
+      ASR_CONNECT_TIMEOUT_SECONDS: ${ASR_CONNECT_TIMEOUT_SECONDS:-5}
+      ASR_STREAM_TIMEOUT_SECONDS: ${ASR_STREAM_TIMEOUT_SECONDS:-90}
+      ASR_MAX_AUDIO_SECONDS: ${ASR_MAX_AUDIO_SECONDS:-60}
+      VOICE_MAX_DECODED_AUDIO_CHUNK_BYTES: ${VOICE_MAX_DECODED_AUDIO_CHUNK_BYTES:-16384}
+      VOICE_MAX_AUDIO_CHUNK_BASE64_CHARS: ${VOICE_MAX_AUDIO_CHUNK_BASE64_CHARS:-24576}
+      VOLC_ASR_ENDPOINT: ${VOLC_ASR_ENDPOINT:-wss://openspeech.bytedance.com/api/v3/sauc/bigmodel_async}
+      VOLC_ASR_RESOURCE_ID: ${VOLC_ASR_RESOURCE_ID:-volc.bigasr.sauc.duration}
+      VOLC_ASR_ACCESS_TOKEN: ${VOLC_ASR_ACCESS_TOKEN:-}
+      VOLC_ASR_SECRET_KEY: ${VOLC_ASR_SECRET_KEY:-}
       ENABLE_DAILY_MAINTENANCE: ${ENABLE_DAILY_MAINTENANCE:-true}
       DAILY_MAINTENANCE_HOUR_UTC: ${DAILY_MAINTENANCE_HOUR_UTC:-19}
       RAW_RETENTION_DAYS: ${RAW_RETENTION_DAYS:-30}
@@ -95,8 +108,10 @@ services:
       REDIS_URL: redis://redis:6379/0
       MODEL_MODE: standard
       MODEL_ROUTER_URL: http://model-router:8090
-      MODEL_BASE_URL: ${MODEL_BASE_URL:-http://localhost:9161}
+      MODEL_BASE_URL: ${MODEL_BASE_URL:-http://81.70.177.246:9161/v1}
       MODEL_NAME: ${MODEL_NAME:-qwen3.6}
+      APP_PASSWORD: ${APP_PASSWORD:-par-dev}
+      RAW_DATA_ENCRYPTION_KEY: ${RAW_DATA_ENCRYPTION_KEY:-}
       REDIS_START_ID: ${REDIS_START_ID:-0-0}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       EMBEDDING_PROVIDER: ${EMBEDDING_PROVIDER:-fastembed}
@@ -119,7 +134,7 @@ services:
     mem_limit: 256m
     logging: *default-logging
     environment:
-      MODEL_BASE_URL: ${MODEL_BASE_URL:-http://localhost:9161}
+      MODEL_BASE_URL: ${MODEL_BASE_URL:-http://81.70.177.246:9161/v1}
       MODEL_NAME: ${MODEL_NAME:-qwen3.6}
       FASTEMBED_MODEL: ${FASTEMBED_MODEL:-sentence-transformers/all-MiniLM-L6-v2}
     healthcheck:
@@ -135,7 +150,7 @@ services:
       context: ./chromium_runtime
     restart: unless-stopped
     cpus: "1.50"
-    mem_limit: 2304m
+    mem_limit: 5120m
     logging: *default-logging
     environment:
       RUNTIME_API_URL: http://runtime-api:8080
@@ -147,9 +162,9 @@ services:
       CHROMIUM_WINDOW_HEIGHT: "1920"
       CHROMIUM_HEADLESS: "false"
       CHROMIUM_CDP_URL: http://127.0.0.1:9222
-      GMAIL_AUTO_OPEN: ${GMAIL_AUTO_OPEN:-true}
-      CHROMIUM_AUTO_OPEN_SOURCES: ${CHROMIUM_AUTO_OPEN_SOURCES:-gmail,whatsapp,calendar,telegram,search}
-      WHATSAPP_HISTORY_SYNC: ${WHATSAPP_HISTORY_SYNC:-true}
+      GMAIL_AUTO_OPEN: ${GMAIL_AUTO_OPEN:-false}
+      CHROMIUM_AUTO_OPEN_SOURCES: ${CHROMIUM_AUTO_OPEN_SOURCES:-}
+      WHATSAPP_HISTORY_SYNC: ${WHATSAPP_HISTORY_SYNC:-false}
       VNC_PASSWORD: ${VNC_PASSWORD:-par-dev-vnc}
     shm_size: "1gb"
     volumes:

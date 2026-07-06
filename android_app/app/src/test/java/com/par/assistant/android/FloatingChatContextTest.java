@@ -37,6 +37,24 @@ public final class FloatingChatContextTest {
     }
 
     @Test
+    public void snapshotsDeltaCapsAtThirtyTurnsForFifteenRounds() {
+        FloatingChatContext context = new FloatingChatContext();
+        for (int index = 0; index < 40; index++) {
+            if (index % 2 == 0) {
+                context.addUser("第 " + index + " 条用户消息");
+            } else {
+                context.addAssistant("第 " + index + " 条助手消息");
+            }
+        }
+
+        List<FloatingChatContext.Turn> snapshot = context.snapshotDelta(12000);
+
+        assertEquals(30, snapshot.size());
+        assertEquals("第 10 条用户消息", snapshot.get(0).content);
+        assertEquals("第 39 条助手消息", snapshot.get(29).content);
+    }
+
+    @Test
     public void replacesLocalTurnsWithServerHistoryForRestartRecovery() {
         FloatingChatContext context = new FloatingChatContext();
         context.addUser("本地临时内容");

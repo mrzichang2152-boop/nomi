@@ -1,10 +1,16 @@
 from __future__ import annotations
 
 import re
+from datetime import datetime, timedelta
 from typing import Any
 
 
 OWNED_PIPELINES = {"agenda_pipeline", "task_todo_pipeline", "proactive_suggestion_pipeline"}
+WEEKDAY_LABELS = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
+
+
+def _format_absolute_time_window(target: datetime) -> str:
+    return f"{target.date().isoformat()} {WEEKDAY_LABELS[target.weekday()]} {target:%H:%M}"
 
 
 def _list_refs(value: Any) -> list[str]:
@@ -81,6 +87,78 @@ def _is_exact_time(value: Any) -> bool:
     return False
 
 
+def _parse_anchor_time(context: dict[str, Any]) -> datetime | None:
+    raw = (
+        context.get("anchor_time")
+        or context.get("occurred_at")
+        or context.get("created_at")
+        or context.get("source_created_at")
+    )
+    if not raw:
+        return None
+    try:
+        return datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _resolve_clear_relative_time_window(value: Any, context: dict[str, Any]) -> Any:
+    if _is_exact_time(value):
+        return value
+    if isinstance(value, dict):
+        raw_text = str(value.get("raw_text") or value.get("text") or "").strip()
+        if value.get("exact_time_supported") is False:
+            return value
+    else:
+        raw_text = str(value or "").strip()
+    if not raw_text:
+        return value
+    anchor = _parse_anchor_time(context)
+    if anchor is None:
+        return value
+
+    day_offsets = {"今天": 0, "明天": 1, "后天": 2}
+    day_offset: int | None = None
+    for marker, offset in day_offsets.items():
+        if marker in raw_text:
+            day_offset = offset
+            break
+    if day_offset is None:
+        return value
+
+    match = re.search(r"(凌晨|早上|上午|中午|下午|晚上|今晚)?\s*(\d{1,2})\s*[点:：](?:\s*(\d{1,2})\s*分?)?", raw_text)
+    if not match:
+        return value
+    period = match.group(1) or ""
+    hour = int(match.group(2))
+    minute = int(match.group(3) or 0)
+    if hour > 23 or minute > 59:
+        return value
+    if period in {"下午", "晚上", "今晚"} and 1 <= hour < 12:
+        hour += 12
+    if period == "中午" and hour < 11:
+        hour += 12
+    target = (anchor + timedelta(days=day_offset)).replace(hour=hour, minute=minute, second=0, microsecond=0)
+    display = _format_absolute_time_window(target)
+    resolved = dict(value) if isinstance(value, dict) else {"raw_text": raw_text}
+    resolved.update(
+        {
+            "type": "exact",
+            "raw_text": raw_text,
+            "text": display,
+            "display": display,
+            "date": target.date().isoformat(),
+            "weekday": WEEKDAY_LABELS[target.weekday()],
+            "start": target.isoformat(),
+            "display_date": target.date().isoformat(),
+            "display_time": f"{hour:02d}:{minute:02d}",
+            "anchor_time": anchor.isoformat(),
+            "resolution": "relative_datetime_from_anchor",
+        }
+    )
+    return resolved
+
+
 def _agenda_slots(request: str, context: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
     rule_candidate = _context_candidate(context)
     model_candidate = context.get("model_candidate") if isinstance(context.get("model_candidate"), dict) else {}
@@ -107,6 +185,11 @@ def _agenda_slots(request: str, context: dict[str, Any]) -> tuple[dict[str, Any]
         resolved["time_window"] = model_time
     elif context.get("time_phrase"):
         resolved["time_window"] = {"text": str(context["time_phrase"]), "type": "fuzzy"}
+    if "time_window" in resolved and not rule_rejects_exact:
+        before_time_window = resolved["time_window"]
+        resolved["time_window"] = _resolve_clear_relative_time_window(before_time_window, context)
+        if resolved["time_window"] != before_time_window and _is_exact_time(resolved["time_window"]):
+            warnings.append("resolved_relative_time_window:time_window")
 
     operation = str(context.get("operation") or rule_candidate.get("operation") or model_candidate.get("operation") or "create")
     if operation not in {"create", "reschedule", "cancel", "update", "complete"}:

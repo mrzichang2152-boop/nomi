@@ -424,6 +424,11 @@ def _recipient_from_active_scope(active_scope: dict[str, Any]) -> str:
         active_scope.get("contact_name"),
         active_scope.get("counterparty_name"),
         active_scope.get("chat_name"),
+        active_scope.get("sender_name"),
+        active_scope.get("sender"),
+        active_scope.get("from"),
+        active_scope.get("email"),
+        active_scope.get("contact_email"),
     ]
     counterparty_ids = active_scope.get("counterparty_ids")
     if isinstance(counterparty_ids, list):

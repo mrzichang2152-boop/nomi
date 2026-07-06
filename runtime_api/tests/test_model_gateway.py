@@ -15,6 +15,8 @@ class FakeProvider:
             display_name=provider_id,
             base_url=f"http://{provider_id}.local",
             model="fake",
+            provider_type="openai_compatible",
+            api_key="sk-fake-secret" if provider_id == "primary" else "",
             priority=10 if provider_id == "primary" else 20,
             enabled=True,
             supports_streaming=True,
@@ -83,6 +85,34 @@ async def test_gateway_reports_structured_failure_when_all_stream_providers_fail
 
 
 @pytest.mark.asyncio
+async def test_gateway_redacts_provider_exception_secrets_from_payload():
+    from app.model_gateway import ModelGateway, ModelGatewayError
+
+    gateway = ModelGateway(
+        [
+            FakeProvider(
+                "primary",
+                error=RuntimeError("Authorization: Bearer secret-token token=abc123 secret=raw-secret password=plain"),
+            ),
+        ],
+        failure_threshold=1,
+    )
+
+    with pytest.raises(ModelGatewayError) as exc_info:
+        await gateway.chat([{"role": "user", "content": "hi"}])
+
+    payload = exc_info.value.to_payload()
+    serialized = str(payload)
+    assert "secret-token" not in serialized
+    assert "abc123" not in serialized
+    assert "raw-secret" not in serialized
+    assert "plain" not in serialized
+    assert "Bearer REDACTED" in serialized
+    assert "token=REDACTED" in serialized
+    assert "secret=REDACTED" in serialized
+
+
+@pytest.mark.asyncio
 async def test_gateway_falls_back_for_non_stream_chat_and_records_trace():
     from app.model_gateway import ModelGateway
 
@@ -112,3 +142,32 @@ def test_gateway_status_uses_configured_provider_order():
 
     assert [item["provider_id"] for item in status["providers"]] == ["primary", "fallback"]
     assert status["active_provider_id"] == "primary"
+    assert status["providers"][0]["provider_type"] == "openai_compatible"
+    assert status["providers"][0]["api_key_configured"] is True
+    assert "api_key" not in status["providers"][0]
+
+
+def test_default_model_provider_uses_4sapi_gpt54mini_without_env(monkeypatch):
+    from app.model_gateway import default_model_providers
+
+    for key in [
+        "MODEL_PROVIDER_ID",
+        "MODEL_PROVIDER_NAME",
+        "MODEL_PROVIDER_TYPE",
+        "MODEL_BASE_URL",
+        "MODEL_NAME",
+        "MODEL_API_KEY",
+        "MODEL_AUTH_HEADER_FORMAT",
+    ]:
+        monkeypatch.delenv(key, raising=False)
+
+    providers = default_model_providers()
+    config = providers[0].config
+
+    assert config.provider_id == "4sapi_primary"
+    assert config.display_name == "4sapi GPT-5.4 mini"
+    assert config.provider_type == "openai_compatible"
+    assert config.base_url == "https://4sapi.com/v1"
+    assert config.model == "gpt-5.4-mini"
+    assert config.api_key == ""
+    assert config.privacy_tier == "external_api"

@@ -100,12 +100,6 @@ public final class MainActivity extends Activity {
         overlay.setOnClickListener(view -> startFloatingBall());
         root.addView(overlay, matchWidth());
 
-        Button web = new Button(this);
-        web.setText("打开完整工作台");
-        styleSecondaryButton(web);
-        web.setOnClickListener(view -> startActivity(new Intent(this, WebWorkspaceActivity.class)));
-        root.addView(web, matchWidth());
-
         statusText = new TextView(this);
         statusText.setText("保存配置后，Nomi 会以小人形象留在屏幕上。");
         statusText.setTextColor(Color.rgb(71, 85, 105));
@@ -120,8 +114,8 @@ public final class MainActivity extends Activity {
             statusText.setText("连接测试中...");
             executor.execute(() -> {
                 try {
-                    boolean ok = new AssistantApiClient(config).health();
-                    runOnUiThread(() -> statusText.setText(ok ? "连接正常" : "服务器状态异常"));
+                    ConnectionStatus status = new AssistantApiClient(config).connectionStatus();
+                    runOnUiThread(() -> statusText.setText(status.message));
                 } catch (Exception error) {
                     runOnUiThread(() -> statusText.setText("连接失败：" + error.getMessage()));
                 }

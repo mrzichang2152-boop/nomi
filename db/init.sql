@@ -177,6 +177,22 @@ CREATE TABLE IF NOT EXISTS agenda_item_versions (
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+CREATE TABLE IF NOT EXISTS agenda_reminders (
+  id UUID PRIMARY KEY,
+  agenda_item_id UUID REFERENCES agenda_items(id) ON DELETE CASCADE,
+  starts_at TIMESTAMPTZ NOT NULL,
+  remind_at TIMESTAMPTZ NOT NULL,
+  lead_minutes INTEGER NOT NULL,
+  dedupe_key TEXT NOT NULL,
+  title TEXT NOT NULL,
+  body TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending',
+  metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  sent_at TIMESTAMPTZ
+);
+
 CREATE TABLE IF NOT EXISTS entities (
   id UUID PRIMARY KEY,
   entity_type TEXT NOT NULL,
@@ -409,6 +425,70 @@ CREATE TABLE IF NOT EXISTS search_audit (
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+CREATE TABLE IF NOT EXISTS career_profiles (
+  id TEXT PRIMARY KEY,
+  headline TEXT NOT NULL DEFAULT '',
+  target_roles TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[],
+  target_locations TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[],
+  skills TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[],
+  source_event_ids TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[],
+  payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS career_resumes (
+  id TEXT PRIMARY KEY,
+  filename TEXT NOT NULL DEFAULT '',
+  file_type TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'active',
+  source_event_ids TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[],
+  parsed_text TEXT NOT NULL DEFAULT '',
+  payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS job_opportunities (
+  id TEXT PRIMARY KEY,
+  source TEXT NOT NULL DEFAULT '',
+  title TEXT NOT NULL DEFAULT '',
+  company TEXT NOT NULL DEFAULT '',
+  location TEXT NOT NULL DEFAULT '',
+  url TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'tracked',
+  fit_score DOUBLE PRECISION,
+  requirements JSONB NOT NULL DEFAULT '[]'::jsonb,
+  source_event_ids TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[],
+  payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS resume_versions (
+  id TEXT PRIMARY KEY,
+  base_resume_id TEXT NOT NULL DEFAULT '',
+  target_job_id TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'draft',
+  source_event_ids TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[],
+  payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS job_applications (
+  id TEXT PRIMARY KEY,
+  job_id TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'tracked',
+  stage TEXT NOT NULL DEFAULT '',
+  next_step TEXT NOT NULL DEFAULT '',
+  application_action TEXT NOT NULL DEFAULT '',
+  platform TEXT NOT NULL DEFAULT '',
+  source_event_ids TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[],
+  payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
 CREATE TABLE IF NOT EXISTS account_connections (
   provider TEXT PRIMARY KEY,
   status TEXT NOT NULL DEFAULT 'not_connected',
@@ -503,6 +583,7 @@ CREATE INDEX IF NOT EXISTS facts_subject_idx ON facts(subject);
 CREATE INDEX IF NOT EXISTS memory_states_updated_idx ON memory_states(updated_at DESC);
 CREATE INDEX IF NOT EXISTS memory_vectors_embedding_idx ON memory_vectors USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100);
 CREATE INDEX IF NOT EXISTS proactive_suggestions_status_idx ON proactive_suggestions(status, priority DESC);
+CREATE INDEX IF NOT EXISTS proactive_suggestions_dedupe_idx ON proactive_suggestions ((metadata->>'dedupe_key'), status, updated_at DESC);
 CREATE INDEX IF NOT EXISTS proactive_candidates_decision_idx ON proactive_candidates(decision, created_at DESC);
 CREATE INDEX IF NOT EXISTS user_feedback_suggestion_idx ON user_feedback(suggestion_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS assistant_turns_conversation_idx ON assistant_turns(conversation_id, created_at DESC);
@@ -510,6 +591,8 @@ CREATE INDEX IF NOT EXISTS assistant_turns_event_idx ON assistant_turns(event_id
 CREATE INDEX IF NOT EXISTS context_snapshots_event_idx ON context_snapshots(event_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS agenda_items_status_idx ON agenda_items(status, updated_at DESC);
 CREATE INDEX IF NOT EXISTS agenda_items_metadata_dedupe_idx ON agenda_items ((metadata->>'dedupe_key'));
+CREATE UNIQUE INDEX IF NOT EXISTS agenda_reminders_dedupe_key_idx ON agenda_reminders(dedupe_key);
+CREATE INDEX IF NOT EXISTS agenda_reminders_due_idx ON agenda_reminders(status, remind_at);
 CREATE INDEX IF NOT EXISTS collector_settings_enabled_idx ON collector_settings(enabled, paused_until);
 CREATE INDEX IF NOT EXISTS memory_audit_log_target_idx ON memory_audit_log(target_type, target_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS task_route_traces_created_idx ON task_route_traces(created_at DESC);
@@ -532,6 +615,13 @@ CREATE INDEX IF NOT EXISTS provider_call_traces_task_idx ON provider_call_traces
 CREATE INDEX IF NOT EXISTS confirmation_ledger_task_idx ON confirmation_ledger(task_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS pipeline_health_metrics_pipeline_idx ON pipeline_health_metrics(pipeline_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS search_audit_query_idx ON search_audit(query, created_at DESC);
+CREATE INDEX IF NOT EXISTS career_profiles_updated_idx ON career_profiles(updated_at DESC);
+CREATE INDEX IF NOT EXISTS career_resumes_updated_idx ON career_resumes(updated_at DESC);
+CREATE INDEX IF NOT EXISTS job_opportunities_status_idx ON job_opportunities(status, updated_at DESC);
+CREATE INDEX IF NOT EXISTS job_opportunities_fit_idx ON job_opportunities(fit_score DESC);
+CREATE INDEX IF NOT EXISTS resume_versions_job_idx ON resume_versions(target_job_id, updated_at DESC);
+CREATE INDEX IF NOT EXISTS job_applications_stage_idx ON job_applications(stage, updated_at DESC);
+CREATE INDEX IF NOT EXISTS job_applications_job_idx ON job_applications(job_id, updated_at DESC);
 CREATE INDEX IF NOT EXISTS composio_sessions_user_kind_idx ON composio_sessions(user_id, session_kind, updated_at DESC);
 CREATE INDEX IF NOT EXISTS composio_connect_requests_toolkit_idx ON composio_connect_requests(toolkit_slug, status, created_at DESC);
 CREATE INDEX IF NOT EXISTS composio_tool_invocations_tool_idx ON composio_tool_invocations(toolkit_slug, tool_slug, created_at DESC);

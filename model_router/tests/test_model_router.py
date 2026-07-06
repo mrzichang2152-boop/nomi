@@ -57,6 +57,68 @@ def test_model_route_forwards_chat_to_openai_compatible_backend(monkeypatch):
     assert calls[0][1]["messages"][0]["content"] == "提取语义"
 
 
+def test_model_route_forwards_non_thinking_flags(monkeypatch):
+    main = load_router_main()
+
+    calls = []
+
+    class Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"choices": [{"message": {"content": "ok"}}]}
+
+    def fake_post(url, json, timeout):
+        calls.append((url, json, timeout))
+        return Response()
+
+    monkeypatch.setattr(main.httpx, "post", fake_post)
+
+    response = TestClient(main.app).post(
+        "/model/route",
+        json={
+            "task": "semantic_extraction",
+            "messages": [{"role": "user", "content": "ping"}],
+            "reasoning_effort": "none",
+            "enable_thinking": False,
+        },
+    )
+
+    assert response.status_code == 200
+    assert calls[0][1]["reasoning_effort"] == "none"
+    assert calls[0][1]["enable_thinking"] is False
+
+
+def test_model_route_does_not_duplicate_v1_when_base_url_includes_v1(monkeypatch):
+    monkeypatch.setenv("MODEL_BASE_URL", "http://model.local:9161/v1")
+    main = load_router_main()
+
+    calls = []
+
+    class Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"choices": [{"message": {"content": "模型可用"}}]}
+
+    def fake_post(url, json, timeout):
+        calls.append((url, json, timeout))
+        return Response()
+
+    monkeypatch.setattr(main.httpx, "post", fake_post)
+
+    response = TestClient(main.app).post(
+        "/model/route",
+        json={"task": "semantic_extraction", "messages": [{"role": "user", "content": "ping"}]},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["content"] == "模型可用"
+    assert calls[0][0] == "http://model.local:9161/v1/chat/completions"
+
+
 def test_model_route_describes_embedding_without_remote_chat_call(monkeypatch):
     main = load_router_main()
 

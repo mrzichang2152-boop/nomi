@@ -7,8 +7,6 @@ import android.os.Looper;
 
 import org.json.JSONObject;
 
-import java.net.URLEncoder;
-import java.nio.charset.StandardCharsets;
 import java.util.Base64;
 
 import okhttp3.OkHttpClient;
@@ -29,7 +27,7 @@ final class StreamingAsrClient {
     private final ServerConfig config;
     private final Callback callback;
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
-    private final OkHttpClient client = new OkHttpClient();
+    private final OkHttpClient client = NomiHttpClients.privateCloudBuilder().build();
     private WebSocket socket;
     private boolean stopped;
 
@@ -120,7 +118,7 @@ final class StreamingAsrClient {
         } else {
             wsBase = base;
         }
-        String password = URLEncoder.encode(config.password(), StandardCharsets.UTF_8);
+        String password = UrlEncoding.queryComponent(config.password());
         return wsBase + "/ws/voice?password=" + password;
     }
 

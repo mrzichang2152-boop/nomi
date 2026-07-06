@@ -11,6 +11,31 @@ os.environ.setdefault("REDIS_URL", "redis://test")
 from app.pipelines.agenda import run_agenda_pipeline
 
 
+def test_agenda_resolves_clear_relative_datetime_against_anchor_time():
+    result = run_agenda_pipeline(
+        "agenda_pipeline",
+        "明天下午5点在人民广场见，带合同",
+        {
+            "operation": "create",
+            "title": "人民广场见面",
+            "time_window": {"text": "明天下午5点", "type": "fuzzy"},
+            "anchor_time": "2026-06-18T10:00:00+08:00",
+            "source_event_ids": ["evt-relative-time"],
+        },
+    )
+
+    time_window = result["resolved_slots"]["time_window"]
+    assert time_window["type"] == "exact"
+    assert time_window["start"] == "2026-06-19T17:00:00+08:00"
+    assert time_window["display_date"] == "2026-06-19"
+    assert time_window["display_time"] == "17:00"
+    assert time_window["display"] == "2026-06-19 周五 17:00"
+    assert time_window["text"] == "2026-06-19 周五 17:00"
+    assert time_window["raw_text"] == "明天下午5点"
+    assert result["output"]["notification_plan"]["time_precision"] == "exact"
+    assert result["output"]["notification_plan"]["concrete_reminder"]["time_window"]["start"] == "2026-06-19T17:00:00+08:00"
+
+
 def test_agenda_rejects_unsupported_model_exact_time_and_keeps_fuzzy_rule_time():
     result = run_agenda_pipeline(
         "agenda_pipeline",

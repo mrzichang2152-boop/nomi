@@ -5,12 +5,15 @@ import android.content.SharedPreferences;
 
 import com.par.assistant.core.ServerConfig;
 
+import java.io.UnsupportedEncodingException;
 import java.net.URL;
+import java.net.URLEncoder;
 
 final class ConfigPrefs {
     static final String PREFS = "par_config";
     static final String KEY_BASE_URL = "base_url";
     static final String KEY_PASSWORD = "password";
+    static final String KEY_CONVERSATION_ID = "conversation_id";
     static final String DEFAULT_BASE_URL = "http://10.0.2.2:8080";
 
     private ConfigPrefs() {
@@ -44,23 +47,57 @@ final class ConfigPrefs {
         return prefs(context).getString(KEY_PASSWORD, "");
     }
 
+    static String conversationId(Context context) {
+        return prefs(context).getString(KEY_CONVERSATION_ID, "");
+    }
+
+    static void writeConversationId(Context context, String conversationId) {
+        String cleanConversationId = conversationId == null ? "" : conversationId.trim();
+        SharedPreferences.Editor editor = prefs(context).edit();
+        if (cleanConversationId.isEmpty()) {
+            editor.remove(KEY_CONVERSATION_ID);
+        } else {
+            editor.putString(KEY_CONVERSATION_ID, cleanConversationId);
+        }
+        editor.apply();
+    }
+
     static String remoteBrowserUrl(Context context) {
-        return remoteBrowserUrlFor(baseUrlOrDefault(context));
+        return remoteBrowserUrlFor(baseUrlOrDefault(context), password(context));
     }
 
     static String remoteBrowserUrlFor(String baseUrl) {
+        return remoteBrowserUrlFor(baseUrl, "");
+    }
+
+    static String remoteBrowserUrlFor(String baseUrl, String appPassword) {
         try {
             URL url = new URL(baseUrl);
             String protocol = url.getProtocol();
             String host = url.getHost();
             if (host == null || host.isEmpty()) return baseUrl;
-            return protocol + "://" + host + ":6080/vnc.html" + noVncQuery();
+            return protocol + "://" + host + ":6080/vnc_lite.html" + noVncQuery(appPassword);
         } catch (Exception ignored) {
-            return DEFAULT_BASE_URL + ":6080/vnc.html" + noVncQuery();
+            return DEFAULT_BASE_URL + ":6080/vnc_lite.html" + noVncQuery(appPassword);
         }
     }
 
-    private static String noVncQuery() {
-        return "?autoconnect=1&resize=scale&quality=6&compression=2&show_dot=1";
+    private static String noVncQuery(String appPassword) {
+        return "?path=websockify&autoconnect=1&resize=remote&quality=6&compression=2&show_dot=1&password="
+                + encode(vncPassword(appPassword));
+    }
+
+    private static String vncPassword(String appPassword) {
+        String trimmed = appPassword == null ? "" : appPassword.trim();
+        if (trimmed.isEmpty()) return "";
+        return trimmed.endsWith("-vnc") ? trimmed : trimmed + "-vnc";
+    }
+
+    private static String encode(String value) {
+        try {
+            return URLEncoder.encode(value, "UTF-8");
+        } catch (UnsupportedEncodingException ignored) {
+            return value;
+        }
     }
 }

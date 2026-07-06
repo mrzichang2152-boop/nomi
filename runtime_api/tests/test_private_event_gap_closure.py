@@ -107,12 +107,206 @@ def test_agenda_list_filters_fuzzy_items_with_latest_version(monkeypatch):
     assert item["source_event_ids"] == [EVENT_ID]
 
 
+def test_agenda_list_filters_low_value_browser_ui_noise(monkeypatch):
+    monkeypatch.setenv("APP_PASSWORD", "secret")
+    from app import main
+
+    def handler(sql, params):
+        if "FROM agenda_items" in sql:
+            return Cursor(
+                [
+                    agenda_row(
+                        agenda_id="aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+                        title="0 notifications total\nKeyboard shortcuts\nClose jump menu",
+                        metadata={"source": "linkedin"},
+                    ),
+                    agenda_row(
+                        agenda_id="bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+                        title="2026-06-25 周四 16:00 人民广场会面",
+                        certainty="exact",
+                        metadata={"source": "gmail"},
+                    ),
+                ]
+            )
+        return Cursor()
+
+    install_fake_db(monkeypatch, main, handler)
+    response = TestClient(main.app).get(
+        "/api/agenda?limit=50",
+        headers={"x-par-password": "secret"},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert [item["id"] for item in body["items"]] == ["bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"]
+
+
+def test_agenda_list_filters_low_value_gmail_receipts_marketing_and_policy(monkeypatch):
+    monkeypatch.setenv("APP_PASSWORD", "secret")
+    from app import main
+
+    def handler(sql, params):
+        if "FROM agenda_items" in sql:
+            return Cursor(
+                [
+                    agenda_row(
+                        agenda_id="aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+                        title="Apple 收据：Your receipt from Apple, total $0.99",
+                        metadata={"source": "gmail", "event_type": "gmail_message_snapshot"},
+                    ),
+                    agenda_row(
+                        agenda_id="bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+                        title="Limited time offer upgrade today, unsubscribe anytime",
+                        metadata={"source": "gmail", "event_type": "gmail_message_snapshot"},
+                    ),
+                    agenda_row(
+                        agenda_id="cccccccc-cccc-cccc-cccc-cccccccccccc",
+                        title="We updated our Privacy Policy and Terms of Service",
+                        metadata={"source": "gmail", "event_type": "gmail_message_snapshot"},
+                    ),
+                    agenda_row(
+                        agenda_id="eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee",
+                        title=(
+                            "He was offered six figures to leave Kajabi. He said no.："
+                            "Five platforms tried to buy Roberto Blake away from Kajabi. "
+                            "Here's why none of them could. Nearly $1M. Almost a Decade. Zero Temptation to Switch Platforms."
+                        ),
+                        metadata={"source": "gmail", "event_type": "gmail_message_snapshot"},
+                    ),
+                    agenda_row(
+                        agenda_id="dddddddd-dddd-dddd-dddd-dddddddddddd",
+                        title="2026-07-02 14:00 后端岗位技术面",
+                        certainty="exact",
+                        metadata={"source": "gmail", "event_type": "gmail_message_snapshot"},
+                    ),
+                ]
+            )
+        return Cursor()
+
+    install_fake_db(monkeypatch, main, handler)
+    response = TestClient(main.app).get(
+        "/api/agenda?limit=50",
+        headers={"x-par-password": "secret"},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert [item["id"] for item in body["items"]] == ["dddddddd-dddd-dddd-dddd-dddddddddddd"]
+
+
+def test_agenda_list_filters_real_world_gmail_and_telegram_noise(monkeypatch):
+    monkeypatch.setenv("APP_PASSWORD", "secret")
+    from app import main
+
+    def handler(sql, params):
+        if "FROM agenda_items" in sql:
+            return Cursor(
+                [
+                    agenda_row(
+                        agenda_id="aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+                        title="让您提供的服务更清晰，开始撰写，OpenAI 1455 3rd Street，取消订阅，隐私 · 条款",
+                        metadata={"source": "gmail", "event_type": "gmail_message_snapshot"},
+                    ),
+                    agenda_row(
+                        agenda_id="bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+                        title="You have 2 new messages View messages:https://www.linkedin.com/comm/messaging/",
+                        metadata={"source": "gmail", "event_type": "gmail_message_snapshot"},
+                    ),
+                    agenda_row(
+                        agenda_id="cccccccc-cccc-cccc-cccc-cccccccccccc",
+                        title="订单支付成功：https://www.henghost.com/ 客户名称：请更新姓名",
+                        metadata={"source": "gmail", "event_type": "gmail_message_snapshot"},
+                    ),
+                    agenda_row(
+                        agenda_id="dddddddd-dddd-dddd-dddd-dddddddddddd",
+                        title="官方安全中心提醒您，请前往安全中心进行账号验证：https://www.tregsafety.com Telegram Web",
+                        metadata={"source": "telegram", "event_type": "telegram_visible_snapshot"},
+                    ),
+                    agenda_row(
+                        agenda_id="eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee",
+                        title="2026-07-03 15:30 人民广场见面，带合同",
+                        certainty="exact",
+                        metadata={"source": "whatsapp", "event_type": "whatsapp_message_snapshot"},
+                    ),
+                ]
+            )
+        return Cursor()
+
+    install_fake_db(monkeypatch, main, handler)
+    response = TestClient(main.app).get(
+        "/api/agenda?limit=50",
+        headers={"x-par-password": "secret"},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert [item["id"] for item in body["items"]] == ["eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee"]
+
+
+def test_agenda_list_filters_current_cloud_gmail_noise_without_hiding_useful_reminders(monkeypatch):
+    monkeypatch.setenv("APP_PASSWORD", "secret")
+    from app import main
+
+    def handler(sql, params):
+        if "FROM agenda_items" in sql:
+            return Cursor(
+                [
+                    agenda_row(
+                        agenda_id="aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+                        title="She cried in front of 1,462 people and made zero sales. Then this happened.",
+                        metadata={"source": "gmail", "event_type": "gmail_message_snapshot"},
+                    ),
+                    agenda_row(
+                        agenda_id="bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+                        title='比较两种完成方式：<!DOCTYPE html><html dir="ltr"><head><meta charset="utf-8">',
+                        metadata={"source": "gmail", "event_type": "gmail_message_snapshot"},
+                    ),
+                    agenda_row(
+                        agenda_id="cccccccc-cccc-cccc-cccc-cccccccccccc",
+                        title="订单已生成，请及时支付",
+                        metadata={"source": "gmail", "event_type": "gmail_message_snapshot"},
+                    ),
+                    agenda_row(
+                        agenda_id="dddddddd-dddd-dddd-dddd-dddddddddddd",
+                        title="订单支付提醒",
+                        metadata={"source": "gmail", "event_type": "gmail_message_snapshot"},
+                    ),
+                    agenda_row(
+                        agenda_id="eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee",
+                        title="明天3点记得在腾讯会议上开线上会议",
+                        certainty="exact",
+                        metadata={"source": "gmail", "event_type": "gmail_message_snapshot"},
+                    ),
+                    agenda_row(
+                        agenda_id="ffffffff-ffff-ffff-ffff-ffffffffffff",
+                        title="云服务器产品即将到期，请及时续费",
+                        certainty="exact",
+                        metadata={"source": "gmail", "event_type": "gmail_message_snapshot"},
+                    ),
+                ]
+            )
+        return Cursor()
+
+    install_fake_db(monkeypatch, main, handler)
+    response = TestClient(main.app).get(
+        "/api/agenda?limit=50",
+        headers={"x-par-password": "secret"},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert [item["id"] for item in body["items"]] == [
+        "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee",
+        "ffffffff-ffff-ffff-ffff-ffffffffffff",
+    ]
+
+
 def test_agenda_patch_writes_user_correction_version(monkeypatch):
     monkeypatch.setenv("APP_PASSWORD", "secret")
     from app import main
 
     def handler(sql, params):
-        if "SELECT id, type, title, status, certainty" in sql and "FROM agenda_items" in sql:
+        if "FROM agenda_items" in sql and "LEFT JOIN LATERAL" in sql:
             return Cursor([agenda_row(title="Alex 说周末见。")])
         return Cursor()
 
@@ -134,12 +328,34 @@ def test_agenda_patch_writes_user_correction_version(monkeypatch):
     assert any("INSERT INTO agenda_item_versions" in sql for sql, _ in executed)
 
 
+def test_agenda_patch_fetch_query_qualifies_agenda_timestamps(monkeypatch):
+    monkeypatch.setenv("APP_PASSWORD", "secret")
+    from app import main
+
+    def handler(sql, params):
+        if "FROM agenda_items" in sql and "LEFT JOIN LATERAL" in sql:
+            assert "agenda_items.created_at" in sql
+            assert "agenda_items.updated_at" in sql
+            assert "metadata, created_at, updated_at" not in sql
+            return Cursor([agenda_row(title="LinkedIn browser noise")])
+        return Cursor()
+
+    install_fake_db(monkeypatch, main, handler)
+    response = TestClient(main.app).patch(
+        f"/api/agenda/{AGENDA_ID}",
+        headers={"x-par-password": "secret"},
+        json={"status": "dismissed", "reason": "cleanup polluted agenda item"},
+    )
+
+    assert response.status_code == 200
+
+
 def test_agenda_snooze_updates_metadata_and_version(monkeypatch):
     monkeypatch.setenv("APP_PASSWORD", "secret")
     from app import main
 
     def handler(sql, params):
-        if "SELECT id, type, title, status, certainty" in sql and "FROM agenda_items" in sql:
+        if "FROM agenda_items" in sql and "LEFT JOIN LATERAL" in sql:
             return Cursor([agenda_row()])
         return Cursor()
 
@@ -233,6 +449,13 @@ def test_suggestion_action_records_feedback_and_routes_to_pipeline(monkeypatch):
     assert body["route_result"]["route_type"] == "core_pipeline"
     assert body["route_result"]["pipeline"]["id"] == "route_pipeline"
     assert body["route_result"]["execution_guard"]["requires_confirmation"] is False
+    assert body["pipeline_result"]["pipeline_id"] == "route_pipeline"
+    assert body["pipeline_result"]["status"] == "completed_read_only"
+    assert body["pipeline_result"]["resolved_slots"]["destination"] == "武康路"
+    assert body["pipeline_result"]["output"]["route_request"]["destination"] == "武康路"
+    assert "路线查询 Pipeline" in body["chat_summary"]
+    assert "目的地：武康路" in body["chat_summary"]
+    assert "执行状态：completed_read_only" in body["chat_summary"]
     assert published_route_traces
 
 

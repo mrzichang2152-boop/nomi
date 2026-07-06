@@ -36,22 +36,78 @@ if ! pgrep -x chromium >/dev/null 2>&1; then
     /app/user_profile/Default/LOCK
 fi
 
+# Keep account cookies/local storage, but do not restore stale tabs after a
+# container/browser crash. A restored tab storm makes the VNC workspace unusable
+# and can leave the visible tab out of sync with the CDP target used by Nomi.
+# Do not clear site Session Storage here: WhatsApp Web and Google account
+# linking can depend on it during and after login.
+rm -rf \
+  /app/user_profile/Default/Sessions \
+  /app/user_profile/Default/Current\ Session \
+  /app/user_profile/Default/Current\ Tabs \
+  /app/user_profile/Default/Last\ Session \
+  /app/user_profile/Default/Last\ Tabs
+
+PREFERENCES_FILE="/app/user_profile/Default/Preferences"
+if [ -f "$PREFERENCES_FILE" ]; then
+  python3 - <<'PY'
+import json
+from pathlib import Path
+
+path = Path("/app/user_profile/Default/Preferences")
+try:
+    preferences = json.loads(path.read_text(encoding="utf-8"))
+except Exception:
+    raise SystemExit(0)
+
+profile = preferences.setdefault("profile", {})
+profile["exited_cleanly"] = True
+profile["exit_type"] = "Normal"
+sessions = preferences.setdefault("sessions", {})
+sessions["event_log"] = []
+sessions["session_data_status"] = 0
+path.write_text(json.dumps(preferences, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
+PY
+fi
+
 fluxbox >/tmp/fluxbox.log 2>&1 &
 
 "$CHROMIUM_EXECUTABLE" \
   --user-data-dir=/app/user_profile \
   --remote-debugging-address=127.0.0.1 \
   --remote-debugging-port="$CHROMIUM_CDP_PORT" \
+  --remote-allow-origins=* \
   --no-first-run \
   --no-sandbox \
   --no-default-browser-check \
   --password-store=basic \
+  --disable-popup-blocking \
   --disable-dev-shm-usage \
   --disable-gpu \
+  --disable-gpu-rasterization \
+  --disable-session-crashed-bubble \
   --start-maximized \
   --window-size="${CHROMIUM_WINDOW_WIDTH},${CHROMIUM_WINDOW_HEIGHT}" \
+  --window-position=0,0 \
   https://www.google.com \
   >/tmp/chromium.log 2>&1 &
+
+(
+  for _ in $(seq 1 80); do
+    CHROMIUM_WINDOW_IDS="$(xdotool search --class chromium 2>/dev/null || true)"
+    if [ -n "$CHROMIUM_WINDOW_IDS" ]; then
+      for CHROMIUM_WINDOW_ID in $CHROMIUM_WINDOW_IDS; do
+        xdotool windowmap "$CHROMIUM_WINDOW_ID" >/dev/null 2>&1 || true
+        xdotool windowmove "$CHROMIUM_WINDOW_ID" 0 0 >/dev/null 2>&1 || true
+        xdotool windowsize "$CHROMIUM_WINDOW_ID" "$CHROMIUM_WINDOW_WIDTH" "$CHROMIUM_WINDOW_HEIGHT" >/dev/null 2>&1 || true
+        xdotool windowraise "$CHROMIUM_WINDOW_ID" >/dev/null 2>&1 || true
+      done
+      xdotool windowactivate "$(printf '%s\n' "$CHROMIUM_WINDOW_IDS" | tail -n 1)" >/dev/null 2>&1 || true
+      break
+    fi
+    sleep 0.25
+  done
+) &
 
 x11vnc \
   -display "$DISPLAY" \
@@ -59,6 +115,8 @@ x11vnc \
   -shared \
   -rfbport 5900 \
   -passwd "$VNC_PASSWORD" \
+  -noxdamage \
+  -ncache 0 \
   -quiet \
   >/tmp/x11vnc.log 2>&1 &
 

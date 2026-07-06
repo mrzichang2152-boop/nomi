@@ -39,7 +39,14 @@ final class FloatingPanelLayout {
         if (!inputFocused) {
             return screenHeight;
         }
-        return Math.max(0, screenHeight - estimatedKeyboardHeight);
+        int estimatedBottom = Math.max(0, screenHeight - estimatedKeyboardHeight);
+        int detectedKeyboardHeight = Math.max(0, screenHeight - detectedVisibleBottom);
+        if (detectedKeyboardHeight > keyboardThreshold
+                && detectedKeyboardHeight >= estimatedKeyboardHeight - keyboardThreshold
+                && detectedKeyboardHeight <= estimatedKeyboardHeight + keyboardThreshold) {
+            return Math.max(0, detectedVisibleBottom);
+        }
+        return estimatedBottom;
     }
 
     static final class Frame {

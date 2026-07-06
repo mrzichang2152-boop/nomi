@@ -45,6 +45,7 @@ final class AccountChannelRoute {
                 return composio(normalized);
             case "whatsapp":
             case "telegram":
+            case "linkedin":
             case "search":
             case "shopping":
                 return new AccountChannelRoute(Kind.REMOTE_BROWSER, "", normalized, false);
@@ -73,11 +74,18 @@ final class AccountChannelRoute {
         if (kind == Kind.LOCAL_ONLY) {
             return false;
         }
+        if (kind == Kind.REMOTE_BROWSER
+                && status != null
+                && status.enabled
+                && !status.paused
+                && "logged_in".equals(status.browserLoginStatus)) {
+            return false;
+        }
         if (kind == Kind.COMPOSIO_CONNECT
                 && status != null
                 && status.enabled
                 && !status.paused
-                && "healthy".equals(status.healthStatus)) {
+                && ("api_connected".equals(status.authStatus) || "healthy".equals(status.healthStatus))) {
             return false;
         }
         return true;

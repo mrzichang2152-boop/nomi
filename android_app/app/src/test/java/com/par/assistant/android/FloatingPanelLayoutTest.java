@@ -73,7 +73,7 @@ public final class FloatingPanelLayoutTest {
     }
 
     @Test
-    public void keepsFocusedKeyboardTopStableWhenVisibleFrameChanges() {
+    public void usesDetectedKeyboardTopWhenItLooksLikeRealImeInset() {
         int visibleBottom = FloatingPanelLayout.visibleBottomForInputFocus(
                 900,
                 620,
@@ -82,11 +82,11 @@ public final class FloatingPanelLayoutTest {
                 120
         );
 
-        assertEquals(580, visibleBottom);
+        assertEquals(620, visibleBottom);
     }
 
     @Test
-    public void ignoresShrunkenOverlayVisibleFrameWhenInputIsFocused() {
+    public void ignoresImplausiblyShrunkenOverlayVisibleFrameWhenInputIsFocused() {
         int visibleBottom = FloatingPanelLayout.visibleBottomForInputFocus(
                 900,
                 420,
@@ -96,6 +96,19 @@ public final class FloatingPanelLayoutTest {
         );
 
         assertEquals(580, visibleBottom);
+    }
+
+    @Test
+    public void ignoresUnderreportedImeInsetWhenInputIsFocused() {
+        int visibleBottom = FloatingPanelLayout.visibleBottomForInputFocus(
+                2400,
+                1794,
+                true,
+                1060,
+                337
+        );
+
+        assertEquals(1340, visibleBottom);
     }
 
     @Test

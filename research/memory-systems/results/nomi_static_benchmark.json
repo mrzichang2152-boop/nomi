@@ -1,0 +1,1409 @@
+{
+  "criteria_scale": "0=not present, 1=limited/reference only, 2=usable with adaptation, 3=strong direct reference",
+  "fixture_count": 7,
+  "fixtures": [
+    "contact_family_fact",
+    "insurance_preference",
+    "relative_event_absolute_date",
+    "cancellation",
+    "deadline_quote_sheet",
+    "job_intent",
+    "cross_contact_isolation"
+  ],
+  "results": [
+    {
+      "name": "graphiti",
+      "commit": "f4330dc",
+      "remote": "https://github.com/getzep/graphiti.git",
+      "total_score": 20,
+      "criteria": {
+        "memory_write_lifecycle": {
+          "score": 3,
+          "evidence": [
+            {
+              "path": "tests/evals/data/longmemeval_data/longmemeval_oracle.json",
+              "line": 3541,
+              "matched_terms": [
+                "episode"
+              ],
+              "snippet": "L3540: \"role\": \"user\", | L3541: \"content\": \"I'm able to focus on the story and characters pretty well while walking, but I do get distracted occasionally by interesting sights or sounds around me. Like, if we're walking in a new neighborhood, I might g | L3542: \"has_answer\": false"
+            },
+            {
+              "path": "tests/test_graphiti_mock.py",
+              "line": 27,
+              "matched_terms": [
+                "episode"
+              ],
+              "snippet": "L26: from graphiti_core.llm_client import LLMClient | L27: from graphiti_core.nodes import CommunityNode, EntityNode, EpisodeType, EpisodicNode | L28: from graphiti_core.search.search_filters import ComparisonOperator, DateFilter, SearchFilters"
+            },
+            {
+              "path": "graphiti_core/graphiti.py",
+              "line": 36,
+              "matched_terms": [
+                "episode"
+              ],
+              "snippet": "L35: EpisodicEdge, | L36: HasEpisodeEdge, | L37: NextEpisodeEdge,"
+            }
+          ]
+        },
+        "temporal_correctness": {
+          "score": 3,
+          "evidence": [
+            {
+              "path": "tests/evals/data/longmemeval_data/longmemeval_oracle.json",
+              "line": 4,
+              "matched_terms": [
+                "temporal"
+              ],
+              "snippet": "L3: \"question_id\": \"gpt4_2655b836\", | L4: \"question_type\": \"temporal-reasoning\", | L5: \"question\": \"What was the first issue I had with my new car after its first service?\","
+            },
+            {
+              "path": "graphiti_core/graphiti.py",
+              "line": 450,
+              "matched_terms": [
+                "temporal"
+              ],
+              "snippet": "L449: past is still picked up next run. | L450: - ``last_summarized_episode_valid_at`` is the *temporal* watermark: | L451: the maximum ``valid_at`` (episode reference time) across the"
+            },
+            {
+              "path": "mcp_server/src/graphiti_mcp_server.py",
+              "line": 131,
+              "matched_terms": [
+                "temporal"
+              ],
+              "snippet": "L130: GRAPHITI_MCP_INSTRUCTIONS = \"\"\" | L131: Graphiti is a memory service for AI agents built on a temporally-aware knowledge graph. It performs | L132: well with dynamic data such as user interactions, changing enterprise data, and external information."
+            }
+          ]
+        },
+        "relationship_graph": {
+          "score": 3,
+          "evidence": [
+            {
+              "path": "tests/evals/data/longmemeval_data/longmemeval_oracle.json",
+              "line": 2372,
+              "matched_terms": [
+                "entity",
+                "relationship"
+              ],
+              "snippet": "L2371: \"role\": \"assistant\", | L2372: \"content\": \"What a great idea! A farm store can be a fantastic way to connect with customers and showcase your farm's bounty. Here are some tips to help you design and stock your farm store:\\n\\n**Design:**\\n\\n1. **Locati | L2373: \"has_answer\": false"
+            },
+            {
+              "path": "tests/test_graphiti_mock.py",
+              "line": 24,
+              "matched_terms": [
+                "entity"
+              ],
+              "snippet": "L23: from graphiti_core.cross_encoder.client import CrossEncoderClient | L24: from graphiti_core.edges import CommunityEdge, EntityEdge, EpisodicEdge | L25: from graphiti_core.graphiti import Graphiti"
+            },
+            {
+              "path": "graphiti_core/graphiti.py",
+              "line": 34,
+              "matched_terms": [
+                "entity"
+              ],
+              "snippet": "L33: Edge, | L34: EntityEdge, | L35: EpisodicEdge,"
+            }
+          ]
+        },
+        "hybrid_retrieval": {
+          "score": 3,
+          "evidence": [
+            {
+              "path": "tests/evals/data/longmemeval_data/longmemeval_oracle.json",
+              "line": 181,
+              "matched_terms": [
+                "hybrid"
+              ],
+              "snippet": "L180: \"role\": \"assistant\", | L181: \"content\": \"Loyalty programs can be a great way to save money and earn rewards. In your case, since you've already been earning points through Shell's rewards program, it's definitely worth considering filling up at Shel | L182: \"has_answer\": false"
+            },
+            {
+              "path": "tests/test_graphiti_mock.py",
+              "line": 36,
+              "matched_terms": [
+                "rerank"
+              ],
+              "snippet": "L35: episode_fulltext_search, | L36: episode_mentions_reranker, | L37: get_communities_by_nodes,"
+            },
+            {
+              "path": "graphiti_core/graphiti.py",
+              "line": 65,
+              "matched_terms": [
+                "hybrid",
+                "rerank"
+              ],
+              "snippet": "L64: from graphiti_core.search.search_config_recipes import ( | L65: COMBINED_HYBRID_SEARCH_CROSS_ENCODER, | L66: EDGE_HYBRID_SEARCH_NODE_DISTANCE,"
+            }
+          ]
+        },
+        "routing_planning": {
+          "score": 2,
+          "evidence": [
+            {
+              "path": "graphiti_core/search/search_utils.py",
+              "line": 1,
+              "matched_terms": [
+                "search"
+              ],
+              "snippet": "L1: \"\"\" | L2: Copyright 2024, Zep Software, Inc."
+            },
+            {
+              "path": "graphiti_core/search/search.py",
+              "line": 1,
+              "matched_terms": [
+                "search"
+              ],
+              "snippet": "L1: \"\"\" | L2: Copyright 2024, Zep Software, Inc."
+            },
+            {
+              "path": "graphiti_core/driver/kuzu/operations/search_ops.py",
+              "line": 1,
+              "matched_terms": [
+                "search"
+              ],
+              "snippet": "L1: \"\"\" | L2: Copyright 2024, Zep Software, Inc."
+            }
+          ]
+        },
+        "caching": {
+          "score": 1,
+          "evidence": [
+            {
+              "path": "tests/evals/data/longmemeval_data/longmemeval_oracle.json",
+              "line": 2852,
+              "matched_terms": [
+                "cache"
+              ],
+              "snippet": "L2851: \"role\": \"assistant\", | L2852: \"content\": \"NovaTech! Nice to help a fellow NovaTechian. Optimizing API performance is a crucial task, and I'm happy to provide you with some tips to improve the response time of your API. Here are some suggestions:\\n\\n1 | L2853: \"has_answer\": false"
+            },
+            {
+              "path": "tests/test_graphiti_mock.py",
+              "line": 81,
+              "matched_terms": [
+                "cache"
+              ],
+              "snippet": "L80: mock_llm.max_tokens = 1000 | L81: mock_llm.cache_enabled = False | L82: mock_llm.cache_dir = None"
+            },
+            {
+              "path": "README.md",
+              "line": 633,
+              "matched_terms": [
+                "cache"
+              ],
+              "snippet": "L633: - **Anonymous identifier**: A randomly generated UUID stored locally in `~/.cache/graphiti/telemetry_anon_id` | L634: - **System information**: Operating system, Python version, and system architecture"
+            }
+          ]
+        },
+        "privacy_scope_isolation": {
+          "score": 2,
+          "evidence": [
+            {
+              "path": "tests/evals/data/longmemeval_data/longmemeval_oracle.json",
+              "line": 897,
+              "matched_terms": [
+                "scope"
+              ],
+              "snippet": "L896: \"role\": \"assistant\", | L897: \"content\": \"Catholic Charities' job training and education services are a crucial part of their mission to help individuals and families achieve economic stability and independence. Here's an overview of the types of tra | L898: \"has_answer\": false"
+            },
+            {
+              "path": "graphiti_core/graphiti.py",
+              "line": 50,
+              "matched_terms": [
+                "namespace"
+              ],
+              "snippet": "L49: from graphiti_core.llm_client import LLMClient, OpenAIClient | L50: from graphiti_core.namespaces import EdgeNamespace, NodeNamespace | L51: from graphiti_core.nodes import ("
+            },
+            {
+              "path": "mcp_server/src/graphiti_mcp_server.py",
+              "line": 1149,
+              "matched_terms": [
+                "namespace",
+                "scope"
+              ],
+              "snippet": "L1148: '--group-id', | L1149: help='Namespace for the graph. If not provided, uses config file or generates random UUID.', | L1150: )"
+            }
+          ]
+        },
+        "realtime_suitability": {
+          "score": 2,
+          "evidence": [
+            {
+              "path": "tests/evals/data/longmemeval_data/longmemeval_oracle.json",
+              "line": 3541,
+              "matched_terms": [
+                "episode"
+              ],
+              "snippet": "L3540: \"role\": \"user\", | L3541: \"content\": \"I'm able to focus on the story and characters pretty well while walking, but I do get distracted occasionally by interesting sights or sounds around me. Like, if we're walking in a new neighborhood, I might g | L3542: \"has_answer\": false"
+            },
+            {
+              "path": "tests/test_graphiti_mock.py",
+              "line": 27,
+              "matched_terms": [
+                "episode"
+              ],
+              "snippet": "L26: from graphiti_core.llm_client import LLMClient | L27: from graphiti_core.nodes import CommunityNode, EntityNode, EpisodeType, EpisodicNode | L28: from graphiti_core.search.search_filters import ComparisonOperator, DateFilter, SearchFilters"
+            },
+            {
+              "path": "graphiti_core/graphiti.py",
+              "line": 36,
+              "matched_terms": [
+                "episode"
+              ],
+              "snippet": "L35: EpisodicEdge, | L36: HasEpisodeEdge, | L37: NextEpisodeEdge,"
+            }
+          ]
+        },
+        "operational_fit": {
+          "score": 1,
+          "evidence": [
+            {
+              "path": "tests/evals/data/longmemeval_data/longmemeval_oracle.json",
+              "line": 285,
+              "matched_terms": [
+                "graph"
+              ],
+              "snippet": "L284: \"role\": \"assistant\", | L285: \"content\": \"That's a great goal to have! Continuously learning and expanding your knowledge is essential for personal and professional growth. There are numerous online resources and courses available that can help you a | L286: \"has_answer\": false"
+            },
+            {
+              "path": "tests/test_graphiti_mock.py",
+              "line": 23,
+              "matched_terms": [
+                "graph"
+              ],
+              "snippet": "L23: from graphiti_core.cross_encoder.client import CrossEncoderClient | L24: from graphiti_core.edges import CommunityEdge, EntityEdge, EpisodicEdge"
+            },
+            {
+              "path": "graphiti_core/graphiti.py",
+              "line": 26,
+              "matched_terms": [
+                "graph"
+              ],
+              "snippet": "L26: from graphiti_core.cross_encoder.client import CrossEncoderClient | L27: from graphiti_core.cross_encoder.openai_reranker_client import OpenAIRerankerClient"
+            }
+          ]
+        }
+      },
+      "nomi_fit": "Best conceptual match for temporal relationship memory and evidence-backed graph search; operational cost needs an adapter/spike.",
+      "fixture_coverage": {
+        "strong": "contact_family_fact, relative_event_absolute_date, cancellation, cross_contact_isolation",
+        "weak": "answer caching and lightweight operation on 2C/4G"
+      }
+    },
+    {
+      "name": "mem0",
+      "commit": "cd79fa8",
+      "remote": "https://github.com/mem0ai/mem0.git",
+      "total_score": 18,
+      "criteria": {
+        "memory_write_lifecycle": {
+          "score": 3,
+          "evidence": [
+            {
+              "path": "mem0/memory/main.py",
+              "line": 17,
+              "matched_terms": [
+                "memory"
+              ],
+              "snippet": "L17: from mem0.configs.base import MemoryConfig, MemoryItem | L18: from mem0.configs.enums import MemoryType"
+            },
+            {
+              "path": "tests/test_memory.py",
+              "line": 7,
+              "matched_terms": [
+                "memory"
+              ],
+              "snippet": "L7: from mem0 import Memory | L8: from mem0.configs.base import MemoryConfig"
+            },
+            {
+              "path": "docs/openapi.json",
+              "line": 186,
+              "matched_terms": [
+                "memory"
+              ],
+              "snippet": "L185: \"lang\": \"Python\", | L186: \"source\": \"# To use the Python SDK, install the package:\\n# pip install mem0ai\\n\\nfrom mem0 import MemoryClient\\nclient = MemoryClient(api_key=\\\"your_api_key\\\")\\nusers = client.users()\\nprint(users)\" | L187: },"
+            }
+          ]
+        },
+        "temporal_correctness": {
+          "score": 2,
+          "evidence": [
+            {
+              "path": "mem0/memory/main.py",
+              "line": 37,
+              "matched_terms": [
+                "temporal"
+              ],
+              "snippet": "L36: detect_decay_usage_from_delete_all, | L37: detect_temporal_usage_from_metadata, | L38: detect_temporal_usage_from_search,"
+            },
+            {
+              "path": "docs/openapi.json",
+              "line": 422,
+              "matched_terms": [
+                "temporal"
+              ],
+              "snippet": "L421: \"type\": \"array\", | L422: \"description\": \"Array of results produced by the event. For add events, this confirms the write completed; temporal reasoning enrichment runs asynchronously by default.\" | L423: },"
+            },
+            {
+              "path": "docs/changelog/sdk.mdx",
+              "line": 137,
+              "matched_terms": [
+                "temporal"
+              ],
+              "snippet": "L136: **New Features:** | L137: - **Memory:** Add a contextual OSS-to-Platform notices system that surfaces occasional, situation-aware messages (first run, scale/performance thresholds, slow queries, and when temporal/decay features are relevant) poin"
+            }
+          ]
+        },
+        "relationship_graph": {
+          "score": 2,
+          "evidence": [
+            {
+              "path": "mem0/memory/main.py",
+              "line": 61,
+              "matched_terms": [
+                "entity"
+              ],
+              "snippet": "L60: ) | L61: from mem0.utils.entity_extraction import extract_entities, extract_entities_batch | L62: from mem0.utils.factory import ("
+            },
+            {
+              "path": "tests/test_memory.py",
+              "line": 1079,
+              "matched_terms": [
+                "entity",
+                "graph"
+              ],
+              "snippet": "L1079: # --- Issue #3040: reset() should clean up graph database ---"
+            },
+            {
+              "path": "docs/openapi.json",
+              "line": 125,
+              "matched_terms": [
+                "entity"
+              ],
+              "snippet": "L124: \"type\": \"string\", | L125: \"description\": \"Unique identifier for the entity.\" | L126: },"
+            }
+          ]
+        },
+        "hybrid_retrieval": {
+          "score": 2,
+          "evidence": [
+            {
+              "path": "mem0/memory/main.py",
+              "line": 503,
+              "matched_terms": [
+                "embed",
+                "embedding",
+                "hybrid",
+                "rerank"
+              ],
+              "snippet": "L502: \"The '%s' vector store does not support keyword search. \" | L503: \"Hybrid (BM25) scoring will be disabled and search will use \" | L504: \"semantic similarity only. To enable hybrid search, switch to a \""
+            },
+            {
+              "path": "tests/test_memory.py",
+              "line": 1222,
+              "matched_terms": [
+                "embed",
+                "embedding",
+                "hybrid"
+              ],
+              "snippet": "L1222: class TestHybridSearchWarning: | L1223: \"\"\"Warn at init when vector store does not support keyword_search.\"\"\""
+            },
+            {
+              "path": "docs/openapi.json",
+              "line": 2085,
+              "matched_terms": [
+                "hybrid",
+                "rerank"
+              ],
+              "snippet": "L2084: \"summary\": \"Search memories (V3)\", | L2085: \"description\": \"Relevance-ranked search across stored memories. V3 uses hybrid retrieval and can also apply temporal reasoning for time-aware queries. Entity IDs **must** be passed inside the `filters` object — top-level | L2086: \"operationId\": \"memories_search_v3\","
+            }
+          ]
+        },
+        "routing_planning": {
+          "score": 2,
+          "evidence": [
+            {
+              "path": "mem0/memory/main.py",
+              "line": 1162,
+              "matched_terms": [
+                "memory",
+                "retrieval",
+                "retrieve"
+              ],
+              "snippet": "L1161: \"\"\" | L1162: Retrieve a memory by ID."
+            },
+            {
+              "path": "tests/test_memory.py",
+              "line": 7,
+              "matched_terms": [
+                "memory"
+              ],
+              "snippet": "L7: from mem0 import Memory | L8: from mem0.configs.base import MemoryConfig"
+            },
+            {
+              "path": "docs/openapi.json",
+              "line": 115,
+              "matched_terms": [
+                "memory",
+                "retrieval",
+                "retrieve"
+              ],
+              "snippet": "L114: \"200\": { | L115: \"description\": \"Successfully retrieved list of entities.\", | L116: \"content\": {"
+            }
+          ]
+        },
+        "caching": {
+          "score": 1,
+          "evidence": [
+            {
+              "path": "tests/test_memory.py",
+              "line": 686,
+              "matched_terms": [
+                "cache"
+              ],
+              "snippet": "L685: Root cause: _create_memory expected a dict for existing_embeddings but received a raw list[float], | L686: causing the cache check `data in existing_embeddings` to always fail and trigger a redundant embed. | L687: \"\"\""
+            },
+            {
+              "path": "docs/changelog/sdk.mdx",
+              "line": 1377,
+              "matched_terms": [
+                "cache"
+              ],
+              "snippet": "L1376: **Improvements:** | L1377: - **Performance:** Cached prepared statements in `SQLiteManager` for faster history operations | L1378: - **Performance:** Batch `insert()` in `MemoryVectorStore` wrapped in a transaction for atomicity"
+            },
+            {
+              "path": "LLM.md",
+              "line": 933,
+              "matched_terms": [
+                "cache"
+              ],
+              "snippet": "L932: memory.add( | L933: \"Customer John Smith reported login issues with 2FA on mobile app. Resolved by clearing app cache.\", | L934: user_id=customer_id,"
+            }
+          ]
+        },
+        "privacy_scope_isolation": {
+          "score": 2,
+          "evidence": [
+            {
+              "path": "mem0/memory/main.py",
+              "line": 320,
+              "matched_terms": [
+                "scope"
+              ],
+              "snippet": "L319: - base_metadata_template (Dict[str, Any]): Metadata template for storing memories, | L320: scoped to the provided session(s). | L321: - effective_query_filters (Dict[str, Any]): Filters for querying memories,"
+            },
+            {
+              "path": "docs/openapi.json",
+              "line": 1743,
+              "matched_terms": [
+                "scope"
+              ],
+              "snippet": "L1742: \"summary\": \"Get all memories (V3, paginated)\", | L1743: \"description\": \"List memories scoped by filters, paginated. Entity IDs **must** be passed inside the `filters` object — top-level `user_id` / `agent_id` / `run_id` are rejected with 400. `filters` supports the same opera | L1744: \"operationId\": \"memories_list_v3\","
+            },
+            {
+              "path": "docs/changelog/sdk.mdx",
+              "line": 225,
+              "matched_terms": [
+                "scope"
+              ],
+              "snippet": "L224: - **Batch Operations:** Batch embedding, batch persist, and batch entity linking (8-phase pipeline) for both sync `Memory` and async `AsyncMemory` at full parity ([#4805](https://github.com/mem0ai/mem0/pull/4805)) | L225: - **Message Persistence:** SQLite-based rolling window (10 messages per session scope) for LLM context ([#4805](https://github.com/mem0ai/mem0/pull/4805)) | L226: - **Valkey Cluster Mode:** Added `cluster_mode` parameter for Valkey Cluster Mode Enabled (CME) deployments ([#4759](https://github.com/mem0ai/mem0/pull/4759))"
+            }
+          ]
+        },
+        "realtime_suitability": {
+          "score": 2,
+          "evidence": [
+            {
+              "path": "mem0/memory/main.py",
+              "line": 17,
+              "matched_terms": [
+                "memory"
+              ],
+              "snippet": "L17: from mem0.configs.base import MemoryConfig, MemoryItem | L18: from mem0.configs.enums import MemoryType"
+            },
+            {
+              "path": "tests/test_memory.py",
+              "line": 7,
+              "matched_terms": [
+                "memory"
+              ],
+              "snippet": "L7: from mem0 import Memory | L8: from mem0.configs.base import MemoryConfig"
+            },
+            {
+              "path": "docs/openapi.json",
+              "line": 186,
+              "matched_terms": [
+                "memory"
+              ],
+              "snippet": "L185: \"lang\": \"Python\", | L186: \"source\": \"# To use the Python SDK, install the package:\\n# pip install mem0ai\\n\\nfrom mem0 import MemoryClient\\nclient = MemoryClient(api_key=\\\"your_api_key\\\")\\nusers = client.users()\\nprint(users)\" | L187: },"
+            }
+          ]
+        },
+        "operational_fit": {
+          "score": 2,
+          "evidence": [
+            {
+              "path": "mem0/memory/main.py",
+              "line": 17,
+              "matched_terms": [
+                "memory"
+              ],
+              "snippet": "L17: from mem0.configs.base import MemoryConfig, MemoryItem | L18: from mem0.configs.enums import MemoryType"
+            },
+            {
+              "path": "tests/test_memory.py",
+              "line": 7,
+              "matched_terms": [
+                "memory"
+              ],
+              "snippet": "L7: from mem0 import Memory | L8: from mem0.configs.base import MemoryConfig"
+            },
+            {
+              "path": "docs/openapi.json",
+              "line": 186,
+              "matched_terms": [
+                "memory"
+              ],
+              "snippet": "L185: \"lang\": \"Python\", | L186: \"source\": \"# To use the Python SDK, install the package:\\n# pip install mem0ai\\n\\nfrom mem0 import MemoryClient\\nclient = MemoryClient(api_key=\\\"your_api_key\\\")\\nusers = client.users()\\nprint(users)\" | L187: },"
+            }
+          ]
+        }
+      },
+      "nomi_fit": "Strong reference for memory CRUD/lifecycle and user-scoped semantic memory, but should be wrapped instead of embedded wholesale.",
+      "fixture_coverage": {
+        "strong": "contact_family_fact, insurance_preference, deadline_quote_sheet",
+        "weak": "strict temporal event state and cross-contact leakage need Nomi-side policy"
+      }
+    },
+    {
+      "name": "langmem",
+      "commit": "c01e273",
+      "remote": "https://github.com/langchain-ai/langmem.git",
+      "total_score": 17,
+      "criteria": {
+        "memory_write_lifecycle": {
+          "score": 3,
+          "evidence": [
+            {
+              "path": "tests/cassettes/ed2e87ca-f890-4900-9a09-dfbc12b51964.yaml",
+              "line": 81,
+              "matched_terms": [
+                "memory"
+              ],
+              "snippet": "L80: with extracting or upserting memories for all entities, concepts, etc.\\n\\nExtract | L81: all important facts or entities. If an existing MEMORY is incorrect or outdated, | L82: update it based on the new information.\\n\\n\\nEnrich, prune, and organize memories"
+            },
+            {
+              "path": "src/langmem/knowledge/extraction.py",
+              "line": 29,
+              "matched_terms": [
+                "memory"
+              ],
+              "snippet": "L28: from langmem import utils | L29: from langmem.knowledge.tools import create_search_memory_tool"
+            },
+            {
+              "path": "src/langmem/knowledge/tools.py",
+              "line": 25,
+              "matched_terms": [
+                "memory"
+              ],
+              "snippet": "L25: def create_manage_memory_tool( | L26: namespace: tuple[str, ...] | str,"
+            }
+          ]
+        },
+        "temporal_correctness": {
+          "score": 1,
+          "evidence": [
+            {
+              "path": "tests/cassettes/ed2e87ca-f890-4900-9a09-dfbc12b51964.yaml",
+              "line": 94,
+              "matched_terms": [
+                "episode"
+              ],
+              "snippet": "L93: multiple new memories.\",\"properties\":{\"content\":{\"description\":\"The memory as | L94: a well-written, standalone episode/fact/note/preference/etc. Refer to the user''s | L95: instructions for more information the prefered memory organization.\",\"title\":\"Content\",\"type\":\"string\"}},\"required\":[\"content\"],\"title\":\"Memory\",\"type\":\"object\"}}]}'"
+            },
+            {
+              "path": "src/langmem/knowledge/extraction.py",
+              "line": 90,
+              "matched_terms": [
+                "episode"
+              ],
+              "snippet": "L89: content: str = Field( | L90: description=\"The memory as a well-written, standalone episode/fact/note/preference/etc.\" | L91: \" Refer to the user's instructions for more information the preferred memory organization.\""
+            },
+            {
+              "path": "docs/docs/concepts/conceptual_guide.md",
+              "line": 171,
+              "matched_terms": [
+                "episode"
+              ],
+              "snippet": "L171: ??? example \"Defining and extracting episodes\""
+            }
+          ]
+        },
+        "relationship_graph": {
+          "score": 2,
+          "evidence": [
+            {
+              "path": "tests/cassettes/ed2e87ca-f890-4900-9a09-dfbc12b51964.yaml",
+              "line": 1167,
+              "matched_terms": [
+                "graph",
+                "relationship"
+              ],
+              "snippet": "L1166: Format your response with:\\n   - Clear section headings\\n   - Logical flow between | L1167: topics\\n   - Bullet points for key information\\n   - Proper paragraph structure\\n\\nPresent | L1168: the information in a clear, engaging manner suitable for a general audience"
+            },
+            {
+              "path": "src/langmem/knowledge/extraction.py",
+              "line": 12,
+              "matched_terms": [
+                "graph",
+                "relationship"
+              ],
+              "snippet": "L11: from langchain_core.runnables.config import get_executor_for_config | L12: from langgraph.store.base import ( | L13: NOT_PROVIDED,"
+            },
+            {
+              "path": "src/langmem/knowledge/tools.py",
+              "line": 7,
+              "matched_terms": [
+                "graph"
+              ],
+              "snippet": "L6: from langchain_core.tools import StructuredTool | L7: from langgraph.store.base import BaseStore | L8: from langgraph.utils.config import get_store"
+            }
+          ]
+        },
+        "hybrid_retrieval": {
+          "score": 1,
+          "evidence": [
+            {
+              "path": "src/langmem/knowledge/extraction.py",
+              "line": 1325,
+              "matched_terms": [
+                "embed",
+                "embedding",
+                "retrieve"
+              ],
+              "snippet": "L1324: ) -> typing.Optional[Item]: | L1325: \"\"\"Retrieve a single item in the store."
+            },
+            {
+              "path": "src/langmem/knowledge/tools.py",
+              "line": 103,
+              "matched_terms": [
+                "embed",
+                "embedding"
+              ],
+              "snippet": "L102: \"dims\": 1536, | L103: \"embed\": \"openai:text-embedding-3-small\", | L104: }"
+            },
+            {
+              "path": "docs/docs/concepts/conceptual_guide.md",
+              "line": 370,
+              "matched_terms": [
+                "retrieve"
+              ],
+              "snippet": "L370: If you use one of the managed APIs, LangMem will integrate directly with LangGraph's [BaseStore](https://langchain-ai.github.io/langgraph/reference/store/#langgraph.store.base.BaseStore) interface for memory storage and "
+            }
+          ]
+        },
+        "routing_planning": {
+          "score": 2,
+          "evidence": [
+            {
+              "path": "src/langmem/knowledge/extraction.py",
+              "line": 1,
+              "matched_terms": [
+                "extract"
+              ],
+              "snippet": "L1: import asyncio | L2: import datetime"
+            },
+            {
+              "path": "src/langmem/knowledge/tools.py",
+              "line": 1,
+              "matched_terms": [
+                "tool"
+              ],
+              "snippet": "L1: import functools | L2: import logging"
+            },
+            {
+              "path": "docs/docs/guides/extract_semantic_memories.md",
+              "line": 1,
+              "matched_terms": [
+                "extract"
+              ],
+              "snippet": "L1: --- | L2: title: How to Extract Semantic Memories"
+            }
+          ]
+        },
+        "caching": {
+          "score": 1,
+          "evidence": [
+            {
+              "path": "tests/cassettes/ed2e87ca-f890-4900-9a09-dfbc12b51964.yaml",
+              "line": 25,
+              "matched_terms": [
+                "cache"
+              ],
+              "snippet": "L24: headers: | L25: CF-Cache-Status: | L26: - DYNAMIC"
+            },
+            {
+              "path": "src/langmem/knowledge/tools.py",
+              "line": 514,
+              "matched_terms": [
+                "cache"
+              ],
+              "snippet": "L513: class _ToolWithRequired(StructuredTool): | L514: @functools.cached_property | L515: def tool_call_schema(self) -> \"ArgsSchema\":"
+            },
+            {
+              "path": "docs/_scripts/generate_api_reference_links.py",
+              "line": 5,
+              "matched_terms": [
+                "cache"
+              ],
+              "snippet": "L4: import re | L5: from functools import lru_cache | L6: from typing import List, Literal, Optional"
+            }
+          ]
+        },
+        "privacy_scope_isolation": {
+          "score": 3,
+          "evidence": [
+            {
+              "path": "tests/cassettes/ed2e87ca-f890-4900-9a09-dfbc12b51964.yaml",
+              "line": 1276,
+              "matched_terms": [
+                "scope"
+              ],
+              "snippet": "L1275: summarized\\n\\nAim to be informative, clear, and thorough in your explanations | L1276: while maintaining accuracy.\\\"\\n\\nThis updated prompt:\\n- Broadens the scope | L1277: beyond just research summarization\\n- Provides clear guidelines for response"
+            },
+            {
+              "path": "src/langmem/knowledge/extraction.py",
+              "line": 38,
+              "matched_terms": [
+                "namespace"
+              ],
+              "snippet": "L37: #     \"anthropic:claude-3-5-sonnet-latest\", | L38: #     namespace=(\"chat\",), | L39: #     store=InMemoryStore(),"
+            },
+            {
+              "path": "src/langmem/knowledge/tools.py",
+              "line": 26,
+              "matched_terms": [
+                "namespace"
+              ],
+              "snippet": "L25: def create_manage_memory_tool( | L26: namespace: tuple[str, ...] | str, | L27: *,"
+            }
+          ]
+        },
+        "realtime_suitability": {
+          "score": 2,
+          "evidence": [
+            {
+              "path": "tests/cassettes/ed2e87ca-f890-4900-9a09-dfbc12b51964.yaml",
+              "line": 81,
+              "matched_terms": [
+                "memory"
+              ],
+              "snippet": "L80: with extracting or upserting memories for all entities, concepts, etc.\\n\\nExtract | L81: all important facts or entities. If an existing MEMORY is incorrect or outdated, | L82: update it based on the new information.\\n\\n\\nEnrich, prune, and organize memories"
+            },
+            {
+              "path": "src/langmem/knowledge/extraction.py",
+              "line": 29,
+              "matched_terms": [
+                "memory"
+              ],
+              "snippet": "L28: from langmem import utils | L29: from langmem.knowledge.tools import create_search_memory_tool"
+            },
+            {
+              "path": "src/langmem/knowledge/tools.py",
+              "line": 25,
+              "matched_terms": [
+                "memory"
+              ],
+              "snippet": "L25: def create_manage_memory_tool( | L26: namespace: tuple[str, ...] | str,"
+            }
+          ]
+        },
+        "operational_fit": {
+          "score": 2,
+          "evidence": [
+            {
+              "path": "tests/cassettes/ed2e87ca-f890-4900-9a09-dfbc12b51964.yaml",
+              "line": 1167,
+              "matched_terms": [
+                "graph"
+              ],
+              "snippet": "L1166: Format your response with:\\n   - Clear section headings\\n   - Logical flow between | L1167: topics\\n   - Bullet points for key information\\n   - Proper paragraph structure\\n\\nPresent | L1168: the information in a clear, engaging manner suitable for a general audience"
+            },
+            {
+              "path": "src/langmem/knowledge/extraction.py",
+              "line": 12,
+              "matched_terms": [
+                "graph"
+              ],
+              "snippet": "L11: from langchain_core.runnables.config import get_executor_for_config | L12: from langgraph.store.base import ( | L13: NOT_PROVIDED,"
+            },
+            {
+              "path": "src/langmem/knowledge/tools.py",
+              "line": 7,
+              "matched_terms": [
+                "graph"
+              ],
+              "snippet": "L6: from langchain_core.tools import StructuredTool | L7: from langgraph.store.base import BaseStore | L8: from langgraph.utils.config import get_store"
+            }
+          ]
+        }
+      },
+      "nomi_fit": "Good reference for extraction/reflection and namespace-scoped memory tools, especially if Nomi later aligns with LangGraph patterns.",
+      "fixture_coverage": {
+        "strong": "namespace-scoped extraction and memory update workflows",
+        "weak": "less direct support for temporal graph/event cancellation"
+      }
+    },
+    {
+      "name": "gptcache",
+      "commit": "c59fb3a",
+      "remote": "https://github.com/zilliztech/gptcache.git",
+      "total_score": 10,
+      "criteria": {
+        "memory_write_lifecycle": {
+          "score": 0,
+          "evidence": []
+        },
+        "temporal_correctness": {
+          "score": 0,
+          "evidence": []
+        },
+        "relationship_graph": {
+          "score": 0,
+          "evidence": []
+        },
+        "hybrid_retrieval": {
+          "score": 1,
+          "evidence": [
+            {
+              "path": "gptcache/adapter/adapter.py",
+              "line": 36,
+              "matched_terms": [
+                "embed",
+                "embedding"
+              ],
+              "snippet": "L35: context = kwargs.pop(\"cache_context\", {}) | L36: embedding_data = None | L37: # you want to retry to send the request to chatgpt when the cache is negative"
+            },
+            {
+              "path": "examples/README.md",
+              "line": 5,
+              "matched_terms": [
+                "embed",
+                "embedding"
+              ],
+              "snippet": "L4: - [How to run Visual Question Answering with MiniGPT-4](#how-to-run-visual-question-answering-with-minigpt-4) | L5: - [How to set the `embedding` function](#how-to-set-the-embedding-function) | L6: - [Default embedding function](#default-embedding-function)"
+            },
+            {
+              "path": "docs/release_note.md",
+              "line": 14,
+              "matched_terms": [
+                "embed",
+                "embedding",
+                "rerank"
+              ],
+              "snippet": "L13: Some improvements: | L14: 1. Handle openai change of api base for just embeddings | L15: 2. Support for custom class schema in weaviate vector store"
+            }
+          ]
+        },
+        "routing_planning": {
+          "score": 0,
+          "evidence": []
+        },
+        "caching": {
+          "score": 3,
+          "evidence": [
+            {
+              "path": "gptcache/adapter/adapter.py",
+              "line": 5,
+              "matched_terms": [
+                "cache"
+              ],
+              "snippet": "L5: from gptcache import cache | L6: from gptcache.processor.post import temperature_softmax, LlmVerifier"
+            },
+            {
+              "path": "examples/README.md",
+              "line": 7,
+              "matched_terms": [
+                "cache"
+              ],
+              "snippet": "L6: - [Default embedding function](#default-embedding-function) | L7: - [Suitable for embedding methods consisting of a cached storage and vector store](#suitable-for-embedding-methods-consisting-of-a-cached-storage-and-vector-store) | L8: - [Custom embedding](#custom-embedding)"
+            },
+            {
+              "path": "docs/release_note.md",
+              "line": 3,
+              "matched_terms": [
+                "cache"
+              ],
+              "snippet": "L3: To read the following content, you need to understand the basic use of GPTCache, references:"
+            }
+          ]
+        },
+        "privacy_scope_isolation": {
+          "score": 1,
+          "evidence": [
+            {
+              "path": "docs/release_note.md",
+              "line": 42,
+              "matched_terms": [
+                "namespace"
+              ],
+              "snippet": "L41: 2. Add a flag for search only operation | L42: 3. Support to change the redis namespace | L43: 4. Add `How to better configure your cache` document"
+            },
+            {
+              "path": "examples/benchmark/mock_data.json",
+              "line": 1815,
+              "matched_terms": [
+                "namespace"
+              ],
+              "snippet": "L1814: { | L1815: \"origin\": \"You can load your dataset in a single line of code using the following command: `dataset = load_dataset(\\\"namespace/your_dataset_name\\\")`.\", | L1816: \"similar\": \"A single line of code is all it takes to load your dataset, just use the command `dataset = load_dataset(\\\"namespace/your_dataset_name\\\")`.\""
+            }
+          ]
+        },
+        "realtime_suitability": {
+          "score": 3,
+          "evidence": [
+            {
+              "path": "gptcache/adapter/adapter.py",
+              "line": 5,
+              "matched_terms": [
+                "cache"
+              ],
+              "snippet": "L5: from gptcache import cache | L6: from gptcache.processor.post import temperature_softmax, LlmVerifier"
+            },
+            {
+              "path": "examples/README.md",
+              "line": 7,
+              "matched_terms": [
+                "cache"
+              ],
+              "snippet": "L6: - [Default embedding function](#default-embedding-function) | L7: - [Suitable for embedding methods consisting of a cached storage and vector store](#suitable-for-embedding-methods-consisting-of-a-cached-storage-and-vector-store) | L8: - [Custom embedding](#custom-embedding)"
+            },
+            {
+              "path": "docs/release_note.md",
+              "line": 3,
+              "matched_terms": [
+                "cache"
+              ],
+              "snippet": "L3: To read the following content, you need to understand the basic use of GPTCache, references:"
+            }
+          ]
+        },
+        "operational_fit": {
+          "score": 2,
+          "evidence": [
+            {
+              "path": "gptcache/adapter/adapter.py",
+              "line": 5,
+              "matched_terms": [
+                "cache"
+              ],
+              "snippet": "L5: from gptcache import cache | L6: from gptcache.processor.post import temperature_softmax, LlmVerifier"
+            },
+            {
+              "path": "examples/README.md",
+              "line": 7,
+              "matched_terms": [
+                "cache"
+              ],
+              "snippet": "L6: - [Default embedding function](#default-embedding-function) | L7: - [Suitable for embedding methods consisting of a cached storage and vector store](#suitable-for-embedding-methods-consisting-of-a-cached-storage-and-vector-store) | L8: - [Custom embedding](#custom-embedding)"
+            },
+            {
+              "path": "docs/release_note.md",
+              "line": 3,
+              "matched_terms": [
+                "cache"
+              ],
+              "snippet": "L3: To read the following content, you need to understand the basic use of GPTCache, references:"
+            }
+          ]
+        }
+      },
+      "nomi_fit": "Good reference for repeated-answer and model-call caching; not a memory system for facts, schedules, or relationships.",
+      "fixture_coverage": {
+        "strong": "repeated stable questions after the first correct answer",
+        "weak": "cannot fix extraction or missing memory by itself"
+      }
+    },
+    {
+      "name": "graphrag",
+      "commit": "6d02c23",
+      "remote": "https://github.com/microsoft/graphrag.git",
+      "total_score": 10,
+      "criteria": {
+        "memory_write_lifecycle": {
+          "score": 1,
+          "evidence": [
+            {
+              "path": "tests/unit/indexing/operations/embed_text/test_embed_text.py",
+              "line": 1,
+              "matched_terms": [
+                "indexing",
+                "operation"
+              ],
+              "snippet": "L1: # Copyright (C) 2026 Microsoft | L2: # Licensed under the MIT License"
+            },
+            {
+              "path": "tests/unit/indexing/test_finalize_graph.py",
+              "line": 1,
+              "matched_terms": [
+                "indexing"
+              ],
+              "snippet": "L1: # Copyright (C) 2026 Microsoft | L2: # Licensed under the MIT License"
+            },
+            {
+              "path": "tests/unit/indexing/test_create_communities.py",
+              "line": 1,
+              "matched_terms": [
+                "indexing"
+              ],
+              "snippet": "L1: # Copyright (C) 2026 Microsoft"
+            }
+          ]
+        },
+        "temporal_correctness": {
+          "score": 0,
+          "evidence": []
+        },
+        "relationship_graph": {
+          "score": 3,
+          "evidence": [
+            {
+              "path": "packages/graphrag/graphrag/prompt_tune/prompt/entity_relationship.py",
+              "line": 4,
+              "matched_terms": [
+                "entity",
+                "relationship"
+              ],
+              "snippet": "L4: \"\"\"Fine-tuning prompts for entity relationship generation.\"\"\""
+            },
+            {
+              "path": "packages/graphrag/graphrag/query/structured_search/local_search/mixed_context.py",
+              "line": 15,
+              "matched_terms": [
+                "entity",
+                "graph",
+                "relationship"
+              ],
+              "snippet": "L14: from graphrag.data_model.covariate import Covariate | L15: from graphrag.data_model.entity import Entity | L16: from graphrag.data_model.relationship import Relationship"
+            },
+            {
+              "path": "packages/graphrag/graphrag/query/context_builder/local_context.py",
+              "line": 13,
+              "matched_terms": [
+                "entity",
+                "graph",
+                "relationship"
+              ],
+              "snippet": "L12: from graphrag.data_model.covariate import Covariate | L13: from graphrag.data_model.entity import Entity | L14: from graphrag.data_model.relationship import Relationship"
+            }
+          ]
+        },
+        "hybrid_retrieval": {
+          "score": 2,
+          "evidence": [
+            {
+              "path": "packages/graphrag/graphrag/query/structured_search/local_search/mixed_context.py",
+              "line": 47,
+              "matched_terms": [
+                "embed",
+                "embedding"
+              ],
+              "snippet": "L46: if TYPE_CHECKING: | L47: from graphrag_llm.embedding import LLMEmbedding"
+            },
+            {
+              "path": "packages/graphrag/graphrag/query/context_builder/local_context.py",
+              "line": 1,
+              "matched_terms": [
+                "context"
+              ],
+              "snippet": "L1: # Copyright (c) 2024 Microsoft Corporation. | L2: # Licensed under the MIT License"
+            },
+            {
+              "path": "tests/unit/indexing/operations/embed_text/test_embed_text.py",
+              "line": 4,
+              "matched_terms": [
+                "embed",
+                "embedding"
+              ],
+              "snippet": "L4: \"\"\"Unit tests for the streaming embed_text operation.\"\"\""
+            }
+          ]
+        },
+        "routing_planning": {
+          "score": 1,
+          "evidence": [
+            {
+              "path": "packages/graphrag/graphrag/query/structured_search/local_search/mixed_context.py",
+              "line": 1,
+              "matched_terms": [
+                "query",
+                "search"
+              ],
+              "snippet": "L1: # Copyright (c) 2024 Microsoft Corporation. | L2: # Licensed under the MIT License"
+            },
+            {
+              "path": "packages/graphrag/graphrag/query/context_builder/local_context.py",
+              "line": 1,
+              "matched_terms": [
+                "query"
+              ],
+              "snippet": "L1: # Copyright (c) 2024 Microsoft Corporation. | L2: # Licensed under the MIT License"
+            },
+            {
+              "path": "packages/graphrag/graphrag/query/structured_search/drift_search/drift_context.py",
+              "line": 1,
+              "matched_terms": [
+                "query",
+                "search"
+              ],
+              "snippet": "L1: # Copyright (c) 2024 Microsoft Corporation. | L2: # Licensed under the MIT License"
+            }
+          ]
+        },
+        "caching": {
+          "score": 1,
+          "evidence": [
+            {
+              "path": "packages/graphrag-llm/graphrag_llm/embedding/embedding_factory.py",
+              "line": 11,
+              "matched_terms": [
+                "cache"
+              ],
+              "snippet": "L11: from graphrag_llm.cache import create_cache_key | L12: from graphrag_llm.config.tokenizer_config import TokenizerConfig"
+            },
+            {
+              "path": "tests/unit/config/utils.py",
+              "line": 27,
+              "matched_terms": [
+                "cache"
+              ],
+              "snippet": "L26: ) | L27: from graphrag_cache import CacheConfig | L28: from graphrag_chunking.chunking_config import ChunkingConfig"
+            },
+            {
+              "path": "packages/graphrag/graphrag/config/models/graph_rag_config.py",
+              "line": 10,
+              "matched_terms": [
+                "cache"
+              ],
+              "snippet": "L9: from devtools import pformat | L10: from graphrag_cache import CacheConfig | L11: from graphrag_chunking.chunking_config import ChunkingConfig"
+            }
+          ]
+        },
+        "privacy_scope_isolation": {
+          "score": 1,
+          "evidence": [
+            {
+              "path": "packages/graphrag-llm/graphrag_llm/embedding/embedding_factory.py",
+              "line": 19,
+              "matched_terms": [
+                "scope"
+              ],
+              "snippet": "L18: from graphrag_cache import Cache, CacheKeyCreator | L19: from graphrag_common.factory import ServiceScope"
+            },
+            {
+              "path": "packages/graphrag-storage/COSMOS_TABLE_PROVIDER_DESIGN.md",
+              "line": 173,
+              "matched_terms": [
+                "scope"
+              ],
+              "snippet": "L172: - Working `child()` via namespace prefix (separator: `:` — see caveat below) | L173: - Scoped `clear()`: container drop-and-recreate for root, prefix-query-and-delete for children | L174: - `keys()` implementation (was `raise NotImplementedError`)"
+            },
+            {
+              "path": "docs/index/default_dataflow.md",
+              "line": 160,
+              "matched_terms": [
+                "scope"
+              ],
+              "snippet": "L160: In this step, we generate a summary of each community using the LLM. This will allow us to understand the distinct information contained within each community and provide a scoped understanding of the graph, from either "
+            }
+          ]
+        },
+        "realtime_suitability": {
+          "score": 0,
+          "evidence": []
+        },
+        "operational_fit": {
+          "score": 1,
+          "evidence": [
+            {
+              "path": "tests/unit/indexing/operations/embed_text/test_embed_text.py",
+              "line": 1,
+              "matched_terms": [
+                "indexing"
+              ],
+              "snippet": "L1: # Copyright (C) 2026 Microsoft | L2: # Licensed under the MIT License"
+            },
+            {
+              "path": "tests/unit/indexing/test_finalize_graph.py",
+              "line": 1,
+              "matched_terms": [
+                "indexing"
+              ],
+              "snippet": "L1: # Copyright (C) 2026 Microsoft | L2: # Licensed under the MIT License"
+            },
+            {
+              "path": "tests/unit/indexing/test_create_communities.py",
+              "line": 1,
+              "matched_terms": [
+                "indexing"
+              ],
+              "snippet": "L1: # Copyright (C) 2026 Microsoft"
+            }
+          ]
+        }
+      },
+      "nomi_fit": "Valuable for offline corpus graph construction and query composition; too batch-oriented for Nomi's hot chat path.",
+      "fixture_coverage": {
+        "strong": "offline graph summaries over documents/resumes/job corpora",
+        "weak": "not suitable for per-message realtime WhatsApp/Gmail ingestion"
+      }
+    },
+    {
+      "name": "qdrant-alloy",
+      "commit": "a5cad5c",
+      "remote": "https://github.com/qdrant/qdrant-alloy.git",
+      "total_score": 8,
+      "criteria": {
+        "memory_write_lifecycle": {
+          "score": 0,
+          "evidence": []
+        },
+        "temporal_correctness": {
+          "score": 0,
+          "evidence": []
+        },
+        "relationship_graph": {
+          "score": 0,
+          "evidence": []
+        },
+        "hybrid_retrieval": {
+          "score": 3,
+          "evidence": [
+            {
+              "path": "tests/test_alloy_config.py",
+              "line": 410,
+              "matched_terms": [
+                "embed",
+                "embedding",
+                "hybrid"
+              ],
+              "snippet": "L410: @patch(\"hybrid_search.hybrid_pipeline_config.TextEmbedding\") | L411: def test_invalid_text_embedding_type("
+            },
+            {
+              "path": "tests/test_alloy.py",
+              "line": 24,
+              "matched_terms": [
+                "embed",
+                "embedding"
+              ],
+              "snippet": "L23: @pytest.fixture | L24: def mock_text_embedding(): | L25: \"\"\""
+            },
+            {
+              "path": "src/alloy/alloy_config.py",
+              "line": 2,
+              "matched_terms": [
+                "embed",
+                "embedding",
+                "hybrid"
+              ],
+              "snippet": "L1: \"\"\" | L2: Configuration module for the hybrid search pipeline."
+            }
+          ]
+        },
+        "routing_planning": {
+          "score": 1,
+          "evidence": [
+            {
+              "path": "src/alloy/alloy.py",
+              "line": 311,
+              "matched_terms": [
+                "retrieval",
+                "retrieve"
+              ],
+              "snippet": "L310: This method implements a hybrid search that combines dense embeddings, | L311: sparse embeddings, and late interaction embeddings to retrieve the most | L312: relevant documents for the query."
+            },
+            {
+              "path": "README.md",
+              "line": 9,
+              "matched_terms": [
+                "retrieval",
+                "retrieve"
+              ],
+              "snippet": "L9: Built on [Qdrant](https://github.com/qdrant/qdrant) and [FastEmbed](https://github.com/qdrant/fastembed), Alloy implements a robust **\"Retrieve & Rerank\"** strategy in a single unified workflow: | L10: 1.  **Dense Embeddings:** Capture semantic meaning and broad conceptual matches."
+            }
+          ]
+        },
+        "caching": {
+          "score": 0,
+          "evidence": []
+        },
+        "privacy_scope_isolation": {
+          "score": 0,
+          "evidence": []
+        },
+        "realtime_suitability": {
+          "score": 2,
+          "evidence": [
+            {
+              "path": "tests/test_alloy_config.py",
+              "line": 410,
+              "matched_terms": [
+                "hybrid"
+              ],
+              "snippet": "L410: @patch(\"hybrid_search.hybrid_pipeline_config.TextEmbedding\") | L411: def test_invalid_text_embedding_type("
+            },
+            {
+              "path": "src/alloy/alloy_config.py",
+              "line": 2,
+              "matched_terms": [
+                "hybrid"
+              ],
+              "snippet": "L1: \"\"\" | L2: Configuration module for the hybrid search pipeline."
+            },
+            {
+              "path": "src/alloy/alloy.py",
+              "line": 311,
+              "matched_terms": [
+                "hybrid",
+                "retrieve"
+              ],
+              "snippet": "L310: This method implements a hybrid search that combines dense embeddings, | L311: sparse embeddings, and late interaction embeddings to retrieve the most | L312: relevant documents for the query."
+            }
+          ]
+        },
+        "operational_fit": {
+          "score": 2,
+          "evidence": [
+            {
+              "path": "tests/test_alloy_config.py",
+              "line": 1,
+              "matched_terms": [
+                "config"
+              ],
+              "snippet": "L1: \"\"\" | L2: Unit tests for the AlloyConfig class."
+            },
+            {
+              "path": "src/alloy/alloy_config.py",
+              "line": 1,
+              "matched_terms": [
+                "config"
+              ],
+              "snippet": "L1: \"\"\" | L2: Configuration module for the hybrid search pipeline."
+            },
+            {
+              "path": "src/alloy/config_yaml_loader.py",
+              "line": 1,
+              "matched_terms": [
+                "config"
+              ],
+              "snippet": "L1: from pathlib import Path | L2: from typing import Literal, Optional, Dict, Any, Union"
+            }
+          ]
+        }
+      },
+      "nomi_fit": "Useful as a retrieval substrate reference only; it does not solve memory lifecycle or graph semantics.",
+      "fixture_coverage": {
+        "strong": "single hybrid retrieval substrate for job_intent and semantic facts",
+        "weak": "does not decide memory lifecycle or relationship semantics"
+      }
+    }
+  ]
+}

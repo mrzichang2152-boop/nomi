@@ -34,6 +34,14 @@ public final class AccountChannelRouteTest {
     }
 
     @Test
+    public void routesLinkedInThroughRemoteBrowserWithConcreteSource() {
+        AccountChannelRoute route = AccountChannelRoute.forSource("linkedin");
+
+        assertEquals(AccountChannelRoute.Kind.REMOTE_BROWSER, route.kind());
+        assertEquals("linkedin", route.remoteBrowserSource());
+    }
+
+    @Test
     public void healthyComposioChannelDoesNotOpenAuthorizationAgain() {
         AccountChannelRoute route = AccountChannelRoute.forSource("gmail");
 
@@ -45,5 +53,58 @@ public final class AccountChannelRouteTest {
                 true,
                 route.shouldOpenForStatus(new CollectorStatus("gmail", true, false, "degraded"))
         );
+    }
+
+    @Test
+    public void connectedComposioAuthorizationDoesNotDependOnBrowserCollectorHealth() {
+        AccountChannelRoute route = AccountChannelRoute.forSource("gmail");
+        CollectorStatus status = new CollectorStatus(
+                "gmail",
+                true,
+                false,
+                "degraded",
+                "api_connected",
+                "logged_out",
+                "degraded",
+                "API 已连接",
+                "浏览器未登录，但 Gmail API 可用。"
+        );
+
+        assertEquals(false, route.shouldOpenForStatus(status));
+    }
+
+    @Test
+    public void loggedInRemoteBrowserChannelDoesNotOpenLoginAgainWhenCollectionIsDegraded() {
+        AccountChannelRoute route = AccountChannelRoute.forSource("telegram");
+        CollectorStatus status = new CollectorStatus(
+                "telegram",
+                true,
+                false,
+                "degraded",
+                "browser_required",
+                "logged_in",
+                "degraded",
+                "已登录 / 采集异常",
+                "Telegram Web 已登录，但当前可见页面解析异常。"
+        );
+
+        assertEquals(false, route.shouldOpenForStatus(status));
+    }
+
+    @Test
+    public void remoteBrowserDisplayLabelUsesLoginStateBeforeCollectionHealth() {
+        CollectorStatus status = new CollectorStatus(
+                "telegram",
+                true,
+                false,
+                "degraded",
+                "browser_required",
+                "logged_in",
+                "degraded",
+                "",
+                ""
+        );
+
+        assertEquals("已登录 / 采集异常", status.displayLabel(true));
     }
 }

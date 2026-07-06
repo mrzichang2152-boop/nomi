@@ -186,6 +186,7 @@ def run_registered_pipeline(pipeline_id: str, request: str, context: dict[str, A
         _optional_runner("app.pipelines.communication", "run_communication_pipeline"),
         _optional_runner("app.pipelines.agenda", "run_agenda_pipeline"),
         _optional_runner("app.pipelines.actions", "run_action_pipeline"),
+        _optional_runner("app.pipelines.career", "run_career_pipeline"),
     ]
     for runner in runners:
         if runner is None:

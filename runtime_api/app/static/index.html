@@ -18,6 +18,58 @@
       </section>
 
       <section id="appPanel" class="app-panel hidden">
+        <header class="assistant-topbar" aria-label="Nomi 悬浮对话框工具栏">
+          <div class="assistant-brand">
+            <span class="assistant-title">Nomi</span>
+            <span class="assistant-status" aria-label="已连接"></span>
+          </div>
+          <div class="assistant-topbar-actions">
+            <button id="assistantSettingsToggle" class="icon-button" type="button" aria-expanded="false" aria-controls="assistantSettingsPanel" title="设置">⚙</button>
+            <button id="assistantCloseButton" class="icon-button" type="button" title="关闭对话框" aria-label="关闭对话框">×</button>
+          </div>
+        </header>
+
+        <section id="assistantSettingsPanel" class="assistant-settings-panel hidden" aria-label="Nomi 设置">
+          <div class="assistant-settings-header">
+            <strong>设置</strong>
+            <button id="assistantSettingsClose" class="icon-button compact" type="button" title="关闭设置">×</button>
+          </div>
+          <div class="assistant-settings-grid">
+            <button class="assistant-settings-item" data-view="agendaView" type="button">
+              <strong>日程管理</strong>
+              <span>查看自动创建的约定、提醒和待补充事项</span>
+            </button>
+            <button class="assistant-settings-item" data-view="careerView" type="button">
+              <strong>求职助手</strong>
+              <span>岗位、简历、外联和面试进展</span>
+            </button>
+            <button class="assistant-settings-item" data-view="suggestionsView" type="button">
+              <strong>主动建议</strong>
+              <span>Nomi 认为值得关注的下一步</span>
+            </button>
+            <button class="assistant-settings-item" data-view="toolsView" type="button">
+              <strong>账号连接</strong>
+              <span>Gmail、WhatsApp、Telegram、工具授权</span>
+            </button>
+            <button class="assistant-settings-item" data-view="privacyView" type="button">
+              <strong>隐私管理</strong>
+              <span>敏感字段放行、使用用途和一次性授权上下文</span>
+            </button>
+            <button class="assistant-settings-item" data-view="governanceView" type="button">
+              <strong>记忆治理</strong>
+              <span>检查、筛选和管理本地长期记忆</span>
+            </button>
+            <button class="assistant-settings-item" data-view="collectorsView" type="button">
+              <strong>采集状态</strong>
+              <span>查看各私有数据源是否正常同步</span>
+            </button>
+            <button class="assistant-settings-item" data-view="searchView" type="button">
+              <strong>个人搜索</strong>
+              <span>搜索长期记忆、事件和关系</span>
+            </button>
+          </div>
+        </section>
+
         <aside class="sidebar">
           <div>
             <h1>Nomi</h1>
@@ -26,11 +78,12 @@
           <nav class="nav-actions" aria-label="工作台导航">
             <button class="nav-button active" data-view="chatView" type="button">对话</button>
             <button class="nav-button" data-view="agendaView" type="button">日程</button>
+            <button class="nav-button" data-view="careerView" type="button">求职</button>
             <button class="nav-button" data-view="searchView" type="button">搜索</button>
             <button class="nav-button" data-view="governanceView" type="button">治理</button>
             <button class="nav-button" data-view="suggestionsView" type="button">建议</button>
             <button class="nav-button" data-view="collectorsView" type="button">采集</button>
-            <button class="nav-button" data-view="toolsView" type="button">工具</button>
+            <button class="nav-button" data-view="toolsView" type="button">账号</button>
           </nav>
         </aside>
 
@@ -43,18 +96,50 @@
             </form>
           </section>
 
-          <section id="agendaView" class="view">
+          <section id="agendaView" class="view settings-child-view">
             <header class="view-header">
               <h2>日程管理</h2>
-              <button id="refreshAgenda" type="button">刷新</button>
+              <div class="header-actions">
+                <button class="secondary back-to-settings" data-action="back-to-settings" type="button">返回设置</button>
+                <button id="refreshAgenda" type="button">刷新</button>
+              </div>
             </header>
             <div id="agendaDayTabs" class="agenda-day-tabs" role="tablist" aria-label="按日期查看日程"></div>
             <div id="agendaContent" class="content-list"></div>
           </section>
 
-          <section id="searchView" class="view">
+          <section id="careerView" class="view settings-child-view">
+            <header class="view-header">
+              <h2>求职看板</h2>
+              <div class="header-actions">
+                <button class="secondary back-to-settings" data-action="back-to-settings" type="button">返回设置</button>
+                <button id="careerOffers" type="button">Offer 跟踪</button>
+                <button id="refreshCareer" type="button">刷新</button>
+              </div>
+            </header>
+            <form id="careerAtsPreviewForm" class="toolbar career-ats-preview-toolbar">
+              <input id="careerAtsPreviewUrl" type="url" placeholder="粘贴 Greenhouse / Lever / Ashby / Workable / SmartRecruiters 岗位链接" />
+              <button type="submit">预览岗位</button>
+              <button id="careerAtsListPreview" type="button">预览列表</button>
+            </form>
+            <form id="careerProfileIngestForm" class="toolbar career-profile-ingest-toolbar">
+              <textarea id="careerResumeText" rows="3" placeholder="粘贴简历文本，用来生成本地职业画像"></textarea>
+              <input id="careerTargetRoles" type="text" placeholder="目标岗位，逗号分隔" />
+              <input id="careerTargetLocations" type="text" placeholder="目标地点，逗号分隔" />
+              <button type="submit">生成画像</button>
+            </form>
+            <form id="careerResumeFileImportForm" class="toolbar career-resume-file-toolbar">
+              <input id="careerResumeFile" type="file" accept=".docx,.pdf,.txt,.md" />
+              <button type="submit">导入简历文件</button>
+            </form>
+            <div id="careerResumeLibrary" class="content-list career-resume-library"></div>
+            <div id="careerContent" class="content-list"></div>
+          </section>
+
+          <section id="searchView" class="view settings-child-view">
             <header class="view-header">
               <h2>个人搜索</h2>
+              <button class="secondary back-to-settings" data-action="back-to-settings" type="button">返回设置</button>
             </header>
             <form id="searchForm" class="toolbar">
               <input id="searchInput" type="search" placeholder="搜索长期记忆、事件、关系" />
@@ -63,10 +148,13 @@
             <div id="searchContent" class="content-list"></div>
           </section>
 
-          <section id="governanceView" class="view">
+          <section id="governanceView" class="view settings-child-view">
             <header class="view-header">
               <h2>记忆治理</h2>
-              <button id="refreshGovernance" type="button">刷新</button>
+              <div class="header-actions">
+                <button class="secondary back-to-settings" data-action="back-to-settings" type="button">返回设置</button>
+                <button id="refreshGovernance" type="button">刷新</button>
+              </div>
             </header>
             <form id="governanceFilters" class="toolbar">
               <input id="governanceQuery" type="search" placeholder="筛选关键词" />
@@ -89,31 +177,50 @@
             <div id="governanceContent" class="content-list"></div>
           </section>
 
-          <section id="suggestionsView" class="view">
+          <section id="suggestionsView" class="view settings-child-view">
             <header class="view-header">
               <h2>主动建议</h2>
-              <button id="refreshSuggestions" type="button">刷新</button>
+              <div class="header-actions">
+                <button class="secondary back-to-settings" data-action="back-to-settings" type="button">返回设置</button>
+                <button id="refreshSuggestions" type="button">刷新</button>
+              </div>
             </header>
             <div id="suggestionsContent" class="content-list"></div>
           </section>
 
-          <section id="collectorsView" class="view">
+          <section id="collectorsView" class="view settings-child-view">
             <header class="view-header">
               <h2>采集状态</h2>
-              <button id="refreshCollectors" type="button">刷新</button>
+              <div class="header-actions">
+                <button class="secondary back-to-settings" data-action="back-to-settings" type="button">返回设置</button>
+                <button id="refreshCollectors" type="button">刷新</button>
+              </div>
             </header>
             <div id="collectorsContent" class="content-list"></div>
           </section>
 
-          <section id="toolsView" class="view">
+          <section id="toolsView" class="view settings-child-view">
             <header class="view-header">
-              <h2>工具目录</h2>
-              <button id="refreshTools" type="button">刷新</button>
+              <h2>账号连接</h2>
+              <div class="header-actions">
+                <button class="secondary back-to-settings" data-action="back-to-settings" type="button">返回设置</button>
+                <button id="refreshTools" type="button">刷新</button>
+              </div>
             </header>
-            <form id="toolRouteForm" class="toolbar">
-              <input id="toolRouteInput" type="search" placeholder="输入一个任务，看看 Nomi 会走哪个 Pipeline 或工具" />
-              <button type="submit">路由</button>
-            </form>
+            <div id="toolsContent" class="content-list"></div>
+          </section>
+
+          <section id="privacyView" class="view settings-child-view">
+            <header class="view-header">
+              <h2>隐私管理</h2>
+              <button class="secondary back-to-settings" data-action="back-to-settings" type="button">返回设置</button>
+            </header>
+            <div class="privacy-explainer content-list">
+              <article class="card compact">
+                <strong>敏感字段放行</strong>
+                <p>这里用于把手机号、邮箱、地址等本地敏感字段临时放行给一次明确任务。它不是账号登录入口，账号登录请返回“账号连接”。</p>
+              </article>
+            </div>
             <form id="fieldReleaseForm" class="toolbar field-release-toolbar">
               <input id="fieldReleaseName" type="text" placeholder="字段，例如 phone" />
               <input id="fieldReleaseValue" type="text" placeholder="本地要使用的原值" />
@@ -121,8 +228,6 @@
               <button type="submit">放行字段</button>
             </form>
             <div id="fieldReleaseResult" class="content-list route-result"></div>
-            <div id="toolRouteResult" class="content-list route-result"></div>
-            <div id="toolsContent" class="content-list"></div>
           </section>
         </section>
       </section>

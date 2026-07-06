@@ -31,4 +31,25 @@ public final class AssistantSuggestion {
     public double priority() {
         return priority;
     }
+
+    public boolean isDisplayable() {
+        return isDisplayableText(title, body);
+    }
+
+    public static boolean isDisplayableText(String title, String body) {
+        String text = ((title == null ? "" : title) + "\n" + (body == null ? "" : body)).trim().toLowerCase();
+        if (text.isEmpty()) {
+            return false;
+        }
+        if (text.matches("(?s).*\\b\\d+\\s+notifications?\\s+total\\b.*")) {
+            return false;
+        }
+        if (text.contains("user said to nomi:") || text.contains("assistant said to nomi:")) {
+            return false;
+        }
+        if (text.matches("(?s).*可能需要跟进：\\(\\d+\\)\\s*(whatsapp|telegram)\\s*。?\\s*$")) {
+            return false;
+        }
+        return true;
+    }
 }

@@ -1,5 +1,6 @@
 package com.par.assistant.android;
 
+import com.par.assistant.core.AssistantSuggestion;
 import com.par.assistant.core.ServerConfig;
 
 import android.os.Handler;
@@ -7,8 +8,6 @@ import android.os.Looper;
 
 import org.json.JSONObject;
 
-import java.net.URLEncoder;
-import java.nio.charset.StandardCharsets;
 
 import okhttp3.OkHttpClient;
 import okhttp3.Request;
@@ -31,7 +30,8 @@ final class RealtimeClient {
     private final ServerConfig config;
     private final Callback callback;
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
-    private final OkHttpClient client = new OkHttpClient();
+    private final OkHttpClient client = NomiHttpClients.privateCloudBuilder().build();
+    private final RealtimeConnectionState connectionState = new RealtimeConnectionState();
     private WebSocket socket;
     private boolean stopped;
 
@@ -43,18 +43,38 @@ final class RealtimeClient {
     void start() {
         stopped = false;
         Request request = new Request.Builder().url(wsUrl()).build();
-        socket = client.newWebSocket(request, new WebSocketListener() {
+        WebSocket nextSocket = client.newWebSocket(request, new WebSocketListener() {
+            @Override
+            public void onOpen(WebSocket webSocket, Response response) {
+                connectionState.markOpen(webSocket);
+            }
+
             @Override
             public void onMessage(WebSocket webSocket, String text) {
                 handleMessage(text);
             }
 
             @Override
+            public void onClosing(WebSocket webSocket, int code, String reason) {
+                connectionState.markClosed(webSocket);
+                webSocket.close(code, reason);
+            }
+
+            @Override
+            public void onClosed(WebSocket webSocket, int code, String reason) {
+                connectionState.markClosed(webSocket);
+                scheduleReconnect();
+            }
+
+            @Override
             public void onFailure(WebSocket webSocket, Throwable t, Response response) {
+                connectionState.markClosed(webSocket);
                 callback.onError(t.getMessage() == null ? "实时连接失败" : t.getMessage());
                 scheduleReconnect();
             }
         });
+        socket = nextSocket;
+        connectionState.markConnecting(nextSocket);
     }
 
     void stop() {
@@ -62,15 +82,21 @@ final class RealtimeClient {
         mainHandler.removeCallbacksAndMessages(null);
         if (socket != null) {
             socket.close(1000, "service stopped");
+            connectionState.clear(socket);
             socket = null;
         }
     }
 
     boolean sendChatMessage(String message, String conversationId, int limit, String clientType) {
-        if (socket == null || message == null || message.trim().isEmpty()) {
+        return sendChatMessage(message, conversationId, limit, clientType, "");
+    }
+
+    boolean sendChatMessage(String message, String conversationId, int limit, String clientType, String clientRequestId) {
+        WebSocket currentSocket = socket;
+        if (!connectionState.isOpen(currentSocket) || message == null || message.trim().isEmpty()) {
             return false;
         }
-        return socket.send(chatMessagePayload(message, conversationId, limit, clientType));
+        return currentSocket.send(chatMessagePayload(message, conversationId, limit, clientType, clientRequestId));
     }
 
     private void scheduleReconnect() {
@@ -102,8 +128,9 @@ final class RealtimeClient {
         JSONObject json = new JSONObject(text);
         String type = json.optString("type");
         if ("proactive_message".equals(type)) {
+            String suggestionId = json.optString("suggestion_id", json.optString("id"));
             ProactiveMessage message = new ProactiveMessage(
-                    json.optString("id"),
+                    suggestionId,
                     json.optString("title"),
                     json.optString("body"),
                     json.optString("source"),
@@ -111,6 +138,7 @@ final class RealtimeClient {
                     json.optString("task_id"),
                     text
             );
+            if (!message.isDisplayable()) return null;
             return new ServerEvent(type, json.optString("task_id"), text, message);
         }
         if ("agent_task_delivery".equals(type)) {
@@ -146,7 +174,20 @@ final class RealtimeClient {
             return new ServerEvent(type, json.optString("task_id"), text, message);
         }
         if ("chat_delta".equals(type)) {
-            return new ServerEvent(type, "", text, null, "", json.optString("delta"), "", "");
+            return new ServerEvent(
+                    type,
+                    "",
+                    text,
+                    null,
+                    "",
+                    json.optString("delta"),
+                    "",
+                    "",
+                    json.optInt("elapsed_ms", -1),
+                    json.optBoolean("is_first_delta", false),
+                    json.optInt("stream_first_token_ms", -1),
+                    json.optInt("model_first_token_ms", -1)
+            );
         }
         if ("chat_done".equals(type)) {
             return new ServerEvent(
@@ -176,11 +217,15 @@ final class RealtimeClient {
         } else {
             wsBase = base;
         }
-        String password = URLEncoder.encode(config.password(), StandardCharsets.UTF_8);
+        String password = UrlEncoding.queryComponent(config.password());
         return wsBase + "/ws?password=" + password;
     }
 
     static String chatMessagePayload(String message, String conversationId, int limit, String clientType) {
+        return chatMessagePayload(message, conversationId, limit, clientType, "");
+    }
+
+    static String chatMessagePayload(String message, String conversationId, int limit, String clientType, String clientRequestId) {
         int boundedLimit = Math.max(1, Math.min(80, limit));
         String normalizedClient = clientType == null || clientType.trim().isEmpty()
                 ? "android"
@@ -193,6 +238,9 @@ final class RealtimeClient {
                     .put("client_type", normalizedClient);
             if (conversationId != null && !conversationId.trim().isEmpty()) {
                 json.put("conversation_id", conversationId.trim());
+            }
+            if (clientRequestId != null && !clientRequestId.trim().isEmpty()) {
+                json.put("client_request_id", clientRequestId.trim());
             }
             return json.toString();
         } catch (Exception error) {
@@ -209,6 +257,10 @@ final class RealtimeClient {
         final String chatDelta;
         final String chatAnswer;
         final String chatError;
+        final int elapsedMs;
+        final boolean isFirstDelta;
+        final int streamFirstTokenMs;
+        final int modelFirstTokenMs;
 
         ServerEvent(String type, String taskId, String rawJson, ProactiveMessage message) {
             this(type, taskId, rawJson, message, "", "", "", "");
@@ -224,6 +276,23 @@ final class RealtimeClient {
                 String chatAnswer,
                 String chatError
         ) {
+            this(type, taskId, rawJson, message, conversationId, chatDelta, chatAnswer, chatError, -1, false, -1, -1);
+        }
+
+        ServerEvent(
+                String type,
+                String taskId,
+                String rawJson,
+                ProactiveMessage message,
+                String conversationId,
+                String chatDelta,
+                String chatAnswer,
+                String chatError,
+                int elapsedMs,
+                boolean isFirstDelta,
+                int streamFirstTokenMs,
+                int modelFirstTokenMs
+        ) {
             this.type = type == null ? "" : type;
             this.taskId = taskId == null ? "" : taskId;
             this.rawJson = rawJson == null ? "" : rawJson;
@@ -232,6 +301,10 @@ final class RealtimeClient {
             this.chatDelta = chatDelta == null ? "" : chatDelta;
             this.chatAnswer = chatAnswer == null ? "" : chatAnswer;
             this.chatError = chatError == null ? "" : chatError;
+            this.elapsedMs = elapsedMs;
+            this.isFirstDelta = isFirstDelta;
+            this.streamFirstTokenMs = streamFirstTokenMs;
+            this.modelFirstTokenMs = modelFirstTokenMs;
         }
     }
 }
@@ -257,5 +330,9 @@ final class ProactiveMessage {
         this.type = type == null ? "" : type;
         this.taskId = taskId == null ? "" : taskId;
         this.rawJson = rawJson == null ? "" : rawJson;
+    }
+
+    boolean isDisplayable() {
+        return AssistantSuggestion.isDisplayableText(title, body);
     }
 }

@@ -37,11 +37,21 @@ def test_websocket_streams_chat_delta_and_done(monkeypatch):
         second = websocket.receive_json()
         done = websocket.receive_json()
 
-    assert first == {"type": "chat_delta", "delta": "需要"}
-    assert second == {"type": "chat_delta", "delta": "处理"}
+    assert first["type"] == "chat_delta"
+    assert first["delta"] == "需要"
+    assert first["is_first_delta"] is True
+    assert isinstance(first["elapsed_ms"], int)
+    assert isinstance(first["stream_first_token_ms"], int)
+    assert isinstance(first["model_first_token_ms"], int)
+    assert second["type"] == "chat_delta"
+    assert second["delta"] == "处理"
+    assert second.get("is_first_delta") is not True
+    assert isinstance(second["elapsed_ms"], int)
     assert done["type"] == "chat_done"
     assert done["answer"] == "需要处理"
     assert done["sources"][0]["layer"] == "semantic_memory"
+    assert isinstance(done["context_pack"]["latency_trace"]["stream_first_token_ms"], int)
+    assert isinstance(done["context_pack"]["latency_trace"]["model_ms"], int)
 
 
 def test_websocket_reports_chat_stream_failure(monkeypatch):
@@ -155,10 +165,21 @@ def test_stream_chat_to_websocket_uses_model_gateway(monkeypatch):
     websocket = FakeWebSocket()
     main.asyncio.run(main.stream_chat_to_websocket(websocket, "测试网关", 12))
 
-    assert websocket.events[0] == {"type": "chat_delta", "delta": "网关"}
-    assert websocket.events[1] == {"type": "chat_delta", "delta": "回复"}
+    assert websocket.events[0]["type"] == "chat_delta"
+    assert websocket.events[0]["delta"] == "网关"
+    assert websocket.events[0]["is_first_delta"] is True
+    assert websocket.events[0]["stream_first_token_ms"] >= 0
+    assert websocket.events[0]["model_first_token_ms"] >= 0
+    assert websocket.events[1]["type"] == "chat_delta"
+    assert websocket.events[1]["delta"] == "回复"
+    assert websocket.events[1].get("is_first_delta") is not True
     assert websocket.events[-1]["type"] == "chat_done"
     assert websocket.events[-1]["answer"] == "网关回复"
+    latency_trace = websocket.events[-1]["context_pack"]["latency_trace"]
+    assert latency_trace["stream_first_token_ms"] >= 0
+    assert latency_trace["model_first_token_ms"] >= 0
+    assert latency_trace["model_ms"] >= latency_trace["model_first_token_ms"]
+    assert latency_trace["total_ms"] >= latency_trace["stream_first_token_ms"]
 
 
 def test_websocket_rejects_wrong_password(monkeypatch):

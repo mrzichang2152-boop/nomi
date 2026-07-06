@@ -142,6 +142,157 @@ async def test_qwen_client_streams_openai_compatible_chunks(monkeypatch):
     assert calls[0][2]["stream"] is True
 
 
+@pytest.mark.asyncio
+async def test_chat_completion_client_calls_4sapi_openai_compatible_endpoint_with_user_key(monkeypatch):
+    from app.model_client import ChatCompletionClient, ModelClientConfig
+
+    calls = []
+
+    class Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"choices": [{"message": {"content": "pong"}}]}
+
+    class Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+        async def post(self, url, json, headers, timeout):
+            calls.append((url, json, headers, timeout))
+            return Response()
+
+    monkeypatch.setattr("app.model_client.httpx.AsyncClient", Client)
+
+    client = ChatCompletionClient(
+        ModelClientConfig(
+            provider_type="openai_compatible",
+            base_url="https://4sapi.com/v1",
+            model="gpt-5.4-mini",
+            api_key="sk-user-key",
+            auth_header_format="raw",
+        )
+    )
+    answer = await client.chat([{"role": "user", "content": "ping"}], temperature=0.2)
+
+    assert answer == "pong"
+    assert calls[0][0] == "https://4sapi.com/v1/chat/completions"
+    assert calls[0][1]["model"] == "gpt-5.4-mini"
+    assert calls[0][1]["messages"] == [{"role": "user", "content": "ping"}]
+    assert calls[0][1]["stream"] is False
+    assert calls[0][2]["Authorization"] == "sk-user-key"
+    assert calls[0][2]["Accept"] == "application/json"
+
+
+@pytest.mark.asyncio
+async def test_chat_completion_client_calls_anthropic_messages_api(monkeypatch):
+    from app.model_client import ChatCompletionClient, ModelClientConfig
+
+    calls = []
+
+    class Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"content": [{"type": "text", "text": "anthropic answer"}]}
+
+    class Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+        async def post(self, url, json, headers, timeout):
+            calls.append((url, json, headers, timeout))
+            return Response()
+
+    monkeypatch.setattr("app.model_client.httpx.AsyncClient", Client)
+
+    client = ChatCompletionClient(
+        ModelClientConfig(
+            provider_type="anthropic",
+            base_url="https://api.anthropic.com/v1",
+            model="claude-sonnet-4-5",
+            api_key="anthropic-key",
+        )
+    )
+    answer = await client.chat(
+        [
+            {"role": "system", "content": "你是 Nomi。"},
+            {"role": "user", "content": "你好"},
+        ],
+        temperature=0.3,
+    )
+
+    assert answer == "anthropic answer"
+    assert calls[0][0] == "https://api.anthropic.com/v1/messages"
+    assert calls[0][1]["model"] == "claude-sonnet-4-5"
+    assert calls[0][1]["system"] == "你是 Nomi。"
+    assert calls[0][1]["messages"] == [{"role": "user", "content": "你好"}]
+    assert calls[0][1]["max_tokens"] == 8192
+    assert calls[0][2]["x-api-key"] == "anthropic-key"
+    assert calls[0][2]["anthropic-version"] == "2023-06-01"
+
+
+@pytest.mark.asyncio
+async def test_chat_completion_client_calls_google_generate_content_api(monkeypatch):
+    from app.model_client import ChatCompletionClient, ModelClientConfig
+
+    calls = []
+
+    class Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "candidates": [
+                    {"content": {"parts": [{"text": "google answer"}]}}
+                ]
+            }
+
+    class Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+        async def post(self, url, json, headers, timeout):
+            calls.append((url, json, headers, timeout))
+            return Response()
+
+    monkeypatch.setattr("app.model_client.httpx.AsyncClient", Client)
+
+    client = ChatCompletionClient(
+        ModelClientConfig(
+            provider_type="google",
+            base_url="https://generativelanguage.googleapis.com/v1beta",
+            model="gemini-2.5-flash",
+            api_key="google-key",
+        )
+    )
+    answer = await client.chat(
+        [
+            {"role": "user", "content": "你好"},
+            {"role": "assistant", "content": "你好，我是 Nomi。"},
+            {"role": "user", "content": "继续"},
+        ]
+    )
+
+    assert answer == "google answer"
+    assert calls[0][0] == "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=google-key"
+    assert calls[0][1]["contents"][0]["role"] == "user"
+    assert calls[0][1]["contents"][1]["role"] == "model"
+    assert calls[0][1]["generationConfig"]["temperature"] == 0.4
+
+
 def test_memory_delete_requires_password(monkeypatch):
     monkeypatch.setenv("DATABASE_URL", "postgresql://test")
     monkeypatch.setenv("REDIS_URL", "redis://test")
@@ -426,6 +577,154 @@ def test_event_endpoint_protects_raw_payload_before_storage_and_queue(monkeypatc
     assert queued[0][0] == "events:raw"
 
 
+def test_event_endpoint_does_not_requeue_same_linkedin_profile_snapshot(monkeypatch):
+    monkeypatch.setenv("DATABASE_URL", "postgresql://test")
+    monkeypatch.setenv("REDIS_URL", "redis://test")
+    monkeypatch.setenv("APP_PASSWORD", "secret")
+
+    from app import main
+
+    inserted_event_ids = set()
+    queued = []
+
+    class Cursor:
+        def __init__(self, rows=None, rowcount=0):
+            self.rows = rows or []
+            self.rowcount = rowcount
+
+        def fetchone(self):
+            return self.rows[0] if self.rows else None
+
+    class Conn:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return None
+
+        def execute(self, sql, params=()):
+            normalized = " ".join(sql.split())
+            if "SELECT enabled, paused_until" in normalized:
+                return Cursor()
+            if "INSERT INTO events" in normalized:
+                event_id = str(params[0])
+                if event_id in inserted_event_ids:
+                    return Cursor(rowcount=0)
+                inserted_event_ids.add(event_id)
+                return Cursor(rowcount=1)
+            raise AssertionError(f"Unexpected SQL: {sql}")
+
+    class Redis:
+        def xadd(self, stream, fields):
+            queued.append((stream, fields))
+
+    monkeypatch.setattr(main, "db", lambda: Conn())
+    monkeypatch.setattr(main, "redis_client", lambda: Redis())
+
+    client = TestClient(main.app)
+    base_payload = {
+        "source": "linkedin",
+        "event_type": "linkedin_profile_snapshot",
+        "raw_data": {
+            "url": "https://www.linkedin.com/feed",
+            "title": "Feed | LinkedIn",
+            "profile_name": "张子长",
+            "headline": "Program Manager at Beijing Sankuai Technology Ltd.",
+            "location": "Beijing",
+            "company": "Beijing Sankuai Technology Ltd.",
+            "capture_scope": "visible_profile_snapshot",
+            "text": "张子长\nProgram Manager at Beijing Sankuai Technology Ltd.\nBeijing\nBeijing Sankuai Technology Ltd.",
+        },
+    }
+
+    first = client.post("/event", json=base_payload)
+    second = client.post(
+        "/event",
+        json={
+            **base_payload,
+            "raw_data": {
+                **base_payload["raw_data"],
+                "url": "https://www.linkedin.com/feed/",
+            },
+        },
+    )
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert first.json()["event_id"] == second.json()["event_id"]
+    assert first.json()["status"] == "queued"
+    assert second.json()["status"] == "duplicate"
+    assert len(inserted_event_ids) == 1
+    assert len(queued) == 1
+
+
+def test_stable_collector_event_key_dedupes_whatsapp_chat_list_message_across_relative_time_labels(monkeypatch):
+    monkeypatch.setenv("APP_PASSWORD", "secret")
+    from app import main
+
+    base = {
+        "url": "https://web.whatsapp.com/",
+        "title": "(1) WhatsApp",
+        "sender": "PHONE_1",
+        "message": "NOMI_REG_WA_0629 明天15:30人民广场见，带合同",
+        "chat_name": None,
+        "source_kind": "direct",
+        "capture_scope": "chat_list_preview",
+        "timestamp_label": "09:48",
+    }
+
+    first_key = main.stable_collector_event_key("whatsapp", "whatsapp_message", base)
+    second_key = main.stable_collector_event_key(
+        "whatsapp",
+        "whatsapp_message",
+        {
+            **base,
+            "title": "WhatsApp",
+            "timestamp_label": "昨天",
+            "line_count": 18,
+        },
+    )
+
+    assert first_key
+    assert first_key == second_key
+
+
+def test_stable_collector_event_key_dedupes_telegram_open_chat_rescans_but_keeps_chat_scope(monkeypatch):
+    monkeypatch.setenv("APP_PASSWORD", "secret")
+    from app import main
+
+    base = {
+        "url": "https://web.telegram.org/k/#@yshucheng",
+        "title": "Telegram Web",
+        "chat_name": "Ask",
+        "message": "NOMI_REG_TG_0629 周五10点静安寺地铁站见 Maya",
+        "capture_scope": "telegram_open_chat_message",
+    }
+
+    first_key = main.stable_collector_event_key("telegram", "telegram_message_preview", base)
+    second_key = main.stable_collector_event_key(
+        "telegram",
+        "telegram_message_preview",
+        {
+            **base,
+            "capture_scope": "telegram_visible_preview",
+            "timestamp_label": "June 29",
+        },
+    )
+    other_chat_key = main.stable_collector_event_key(
+        "telegram",
+        "telegram_message_preview",
+        {
+            **base,
+            "chat_name": "Maya",
+        },
+    )
+
+    assert first_key
+    assert first_key == second_key
+    assert other_chat_key != first_key
+
+
 def test_collect_sensitive_reasons_does_not_label_phone_as_amount(monkeypatch):
     monkeypatch.setenv("APP_PASSWORD", "secret")
     from app import main
@@ -441,6 +740,70 @@ def test_collect_sensitive_reasons_does_not_label_phone_as_amount(monkeypatch):
     assert "amount" not in technical_reasons
     assert "phone" not in technical_reasons
     assert "amount" in payment_reasons
+
+
+def test_private_payload_preserves_iso_deadline_time_while_redacting_phone(monkeypatch):
+    monkeypatch.setenv("APP_PASSWORD", "secret")
+    from app import main
+
+    protected = main.protect_private_payload(
+        {
+            "subject": "申请截止提醒",
+            "body": "Please submit before 2026-06-15 18:00. Call +1 415 555 2671 if questions.",
+        }
+    )
+
+    assert protected["body"] == "Please submit before 2026-06-15 18:00. Call PHONE_1 if questions."
+    assert "phone" in protected["sensitive_reasons"]
+
+
+def test_private_payload_preserves_iso_time_before_chinese_punctuation(monkeypatch):
+    monkeypatch.setenv("APP_PASSWORD", "secret")
+    from app import main
+
+    protected = main.protect_private_payload(
+        {
+            "text": "面试安排在2026-06-13 10:30，Zoom链接稍后发。联系电话 +86 138 0000 0000。",
+        }
+    )
+
+    assert protected["text"] == "面试安排在2026-06-13 10:30，Zoom链接稍后发。联系电话 PHONE_1。"
+    assert "phone" in protected["sensitive_reasons"]
+
+
+def test_private_payload_preserves_linkedin_job_detail_urls_while_redacting_phone(monkeypatch):
+    monkeypatch.setenv("APP_PASSWORD", "secret")
+    from app import main
+
+    protected = main.protect_private_payload(
+        {
+            "url": "https://www.linkedin.com/jobs/view/4404787524/",
+            "text": "岗位链接 https://www.linkedin.com/jobs/view/4378789245/，联系电话 +86 138 0000 0000。",
+        }
+    )
+
+    assert protected["url"] == "https://www.linkedin.com/jobs/view/4404787524/"
+    assert "https://www.linkedin.com/jobs/view/4378789245/" in protected["text"]
+    assert "PHONE_1" in protected["text"]
+    assert "phone" in protected["sensitive_reasons"]
+
+
+def test_collect_sensitive_reasons_does_not_label_linkedin_job_id_as_phone(monkeypatch):
+    monkeypatch.setenv("APP_PASSWORD", "secret")
+    from app import main
+
+    reasons = main.collect_sensitive_reasons({"url": "https://www.linkedin.com/jobs/view/4404787524/"})
+
+    assert "phone" not in reasons
+
+
+def test_collect_sensitive_reasons_does_not_label_iso_deadline_time_as_phone(monkeypatch):
+    monkeypatch.setenv("APP_PASSWORD", "secret")
+    from app import main
+
+    reasons = main.collect_sensitive_reasons({"body": "Please submit before 2026-06-15 18:00."})
+
+    assert "phone" not in reasons
 
 
 def test_event_endpoint_keeps_encrypted_private_raw_payload_for_authorized_read(monkeypatch):
@@ -533,6 +896,8 @@ def test_collector_status_merges_settings_and_health(monkeypatch):
                         ("whatsapp", "degraded", None, "2026-05-26T01:02:00+00:00", 1, {"message": "login needed"}, "2026-05-26T01:02:00+00:00"),
                     ]
                 )
+            if "FROM composio_toolkits" in normalized:
+                return Cursor([])
             raise AssertionError(f"Unexpected SQL: {sql}")
 
     monkeypatch.setattr(main, "db", lambda: Conn())
@@ -548,6 +913,55 @@ def test_collector_status_merges_settings_and_health(monkeypatch):
     assert gmail["details"] == {"preview_count": 10}
     assert whatsapp["enabled"] is False
     assert whatsapp["health_status"] == "degraded"
+
+
+def test_collector_status_label_explains_managed_browser_page_recovery(monkeypatch):
+    monkeypatch.setenv("DATABASE_URL", "postgresql://test")
+    monkeypatch.setenv("REDIS_URL", "redis://test")
+    monkeypatch.setenv("APP_PASSWORD", "secret")
+
+    from app.main import collector_status_labels
+
+    label, detail = collector_status_labels(
+        "whatsapp",
+        enabled=True,
+        paused=False,
+        auth_status="browser_required",
+        browser_login_status="unknown",
+        collection_status="degraded",
+        details={
+            "recovery": "page_reopened",
+            "message": "Managed page was missing and has been reopened for collector recovery.",
+        },
+    )
+
+    assert label == "页面恢复中"
+    assert "托管浏览器页面刚被重开" in detail
+    assert "下一轮" in detail
+
+
+def test_collector_status_label_explains_managed_browser_opened_waiting_for_detection(monkeypatch):
+    monkeypatch.setenv("DATABASE_URL", "postgresql://test")
+    monkeypatch.setenv("REDIS_URL", "redis://test")
+    monkeypatch.setenv("APP_PASSWORD", "secret")
+
+    from app.main import collector_status_labels
+
+    label, detail = collector_status_labels(
+        "whatsapp",
+        enabled=True,
+        paused=False,
+        auth_status="browser_required",
+        browser_login_status="unknown",
+        collection_status="healthy",
+        details={
+            "browser_command": "cmd-1",
+            "command_result": {"status": "focused", "url": "https://web.whatsapp.com/"},
+        },
+    )
+
+    assert label == "浏览器已打开"
+    assert "等待下一轮采集确认" in detail
 
 
 def test_collector_status_exposes_channel_capability_boundaries(monkeypatch):
@@ -577,6 +991,8 @@ def test_collector_status_exposes_channel_capability_boundaries(monkeypatch):
                 return Cursor([])
             if "FROM collector_health" in normalized:
                 return Cursor([])
+            if "FROM composio_toolkits" in normalized:
+                return Cursor([])
             raise AssertionError(f"Unexpected SQL: {sql}")
 
     monkeypatch.setattr(main, "db", lambda: Conn())
@@ -598,6 +1014,114 @@ def test_collector_status_exposes_channel_capability_boundaries(monkeypatch):
     assert "visible_chat_list" in whatsapp_capability["supported_operations"]
     assert telegram_capability["mode"] == "managed_browser_visible_dom"
     assert telegram_capability["full_history_guarantee"] is False
+
+
+def test_collector_status_exposes_auth_browser_and_collection_dimensions(monkeypatch):
+    monkeypatch.setenv("DATABASE_URL", "postgresql://test")
+    monkeypatch.setenv("REDIS_URL", "redis://test")
+    monkeypatch.setenv("APP_PASSWORD", "secret")
+
+    from app import main
+
+    now = "2026-06-25T08:00:00+00:00"
+
+    class Cursor:
+        def __init__(self, rows=None):
+            self.rows = rows or []
+
+        def fetchall(self):
+            return self.rows
+
+    class Conn:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return None
+
+        def execute(self, sql, params=()):
+            normalized = " ".join(sql.split())
+            if "FROM collector_settings" in normalized:
+                return Cursor(
+                    [
+                        ("gmail", True, None, "", {}, now),
+                        ("whatsapp", True, None, "", {}, now),
+                        ("telegram", True, None, "", {}, now),
+                        ("linkedin", True, None, "", {}, now),
+                    ]
+                )
+            if "FROM collector_health" in normalized:
+                return Cursor(
+                    [
+                        (
+                            "gmail",
+                            "degraded",
+                            None,
+                            now,
+                            1,
+                            {"runtime": "playwright", "login_state": "logged_out", "url": "https://accounts.google.com/v3/signin/accountchooser"},
+                            now,
+                        ),
+                        (
+                            "whatsapp",
+                            "degraded",
+                            None,
+                            now,
+                            1,
+                            {"failure_reason": "login_required", "login_state": "logged_out", "url": "https://web.whatsapp.com/"},
+                            now,
+                        ),
+                        (
+                            "telegram",
+                            "healthy",
+                            now,
+                            now,
+                            0,
+                            {"login_state": "logged_in", "preview_count": 9, "url": "https://web.telegram.org/k/"},
+                            now,
+                        ),
+                        (
+                            "linkedin",
+                            "degraded",
+                            now,
+                            now,
+                            1,
+                            {"login_state": "logged_in", "failure_reason": "no_linkedin_snapshot_match", "url": "https://www.linkedin.com/search/results/people/"},
+                            now,
+                        ),
+                    ]
+                )
+            if "FROM composio_toolkits" in normalized:
+                return Cursor([("gmail", True), ("googlecalendar", False)])
+            raise AssertionError(f"Unexpected SQL: {sql}")
+
+    monkeypatch.setattr(main, "db", lambda: Conn())
+
+    payload = TestClient(main.app).get(
+        "/api/collectors/status",
+        headers={"x-par-password": "secret"},
+    ).json()
+
+    by_source = {item["source"]: item for item in payload["collectors"]}
+    assert by_source["gmail"]["auth_status"] == "api_connected"
+    assert by_source["gmail"]["browser_login_status"] == "logged_out"
+    assert by_source["gmail"]["collection_status"] == "degraded"
+    assert by_source["gmail"]["status_label"] == "API 已连接"
+    assert "浏览器未登录" in by_source["gmail"]["status_detail"]
+
+    assert by_source["whatsapp"]["auth_status"] == "browser_required"
+    assert by_source["whatsapp"]["browser_login_status"] == "logged_out"
+    assert by_source["whatsapp"]["status_label"] == "未登录"
+    assert "扫码" in by_source["whatsapp"]["status_detail"]
+
+    assert by_source["telegram"]["auth_status"] == "browser_required"
+    assert by_source["telegram"]["browser_login_status"] == "logged_in"
+    assert by_source["telegram"]["status_label"] == "已登录"
+    assert by_source["telegram"]["collection_status"] == "healthy"
+
+    assert by_source["linkedin"]["browser_login_status"] == "logged_in"
+    assert by_source["linkedin"]["status_label"] == "已登录 / 采集异常"
+    assert "可见页面解析异常" in by_source["linkedin"]["status_detail"]
 
 
 def test_gmail_composio_fetch_persists_messages_as_collector_events(monkeypatch):
@@ -652,6 +1176,8 @@ def test_gmail_composio_fetch_persists_messages_as_collector_events(monkeypatch)
             normalized = " ".join(sql.split())
             if "SELECT enabled, paused_until" in normalized:
                 return Cursor()
+            if "SELECT event_id FROM events" in normalized:
+                return Cursor()
             if "INSERT INTO events" in normalized:
                 executed.append((normalized, params))
                 return Cursor()
@@ -690,6 +1216,484 @@ def test_gmail_composio_fetch_persists_messages_as_collector_events(monkeypatch)
     assert stored["subject"] == "报价截止提醒"
     assert stored["source_adapter"] == "composio:gmail"
     assert queued[0][0] == "events:raw"
+
+
+def test_gmail_composio_fetch_flattens_preview_objects_before_persisting(monkeypatch):
+    monkeypatch.setenv("DATABASE_URL", "postgresql://test")
+    monkeypatch.setenv("REDIS_URL", "redis://test")
+    monkeypatch.setenv("APP_PASSWORD", "secret")
+
+    from app import main
+
+    executed = []
+    queued = []
+
+    def fake_execute_composio_tool_call(body):
+        return {
+            "status": "completed",
+            "live_result": {
+                "result": {
+                    "messages": [
+                        {
+                            "messageId": "gmail-preview-dict",
+                            "threadId": "thread-preview-dict",
+                            "preview": {
+                                "body": "请明天下午4点在人民广场见面，带合同。",
+                                "subject": "明天下午4点人民广场见",
+                            },
+                            "sender": '"张子长" <sender@example.com>',
+                            "recipients": ["me@example.com"],
+                        }
+                    ]
+                }
+            },
+        }
+
+    class Cursor:
+        def __init__(self, rows=None):
+            self.rows = rows or []
+
+        def fetchone(self):
+            return self.rows[0] if self.rows else None
+
+    class Conn:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return None
+
+        def execute(self, sql, params=()):
+            normalized = " ".join(sql.split())
+            if "SELECT enabled, paused_until" in normalized:
+                return Cursor()
+            if "SELECT event_id FROM events" in normalized:
+                return Cursor()
+            if "INSERT INTO events" in normalized:
+                executed.append((normalized, params))
+                return Cursor()
+            raise AssertionError(f"Unexpected SQL: {sql}")
+
+    class Redis:
+        def xadd(self, stream, fields):
+            queued.append((stream, fields))
+
+    monkeypatch.setattr(main, "execute_composio_tool_call", fake_execute_composio_tool_call)
+    monkeypatch.setattr(main, "db", lambda: Conn())
+    monkeypatch.setattr(main, "redis_client", lambda: Redis())
+
+    response = TestClient(main.app).post(
+        "/api/collectors/gmail/composio/fetch",
+        headers={"x-par-password": "secret"},
+        json={"query": "newer_than:1d", "limit": 1},
+    )
+
+    assert response.status_code == 200
+    event_params = executed[0][1]
+    stored_public = json.loads(event_params[4])
+    stored_private = json.loads(event_params[5])
+    assert stored_public["subject"] == "明天下午4点人民广场见"
+    assert stored_private["format"] == "fernet-json-v1"
+    assert stored_public["body"] == "请明天下午4点在人民广场见面，带合同。"
+    assert stored_public["snippet"] == "请明天下午4点在人民广场见面，带合同。"
+    assert "{'body'" not in json.dumps(stored_public, ensure_ascii=False)
+    queued_payload = json.loads(queued[0][1]["raw_data"])
+    assert queued_payload["subject"] == "明天下午4点人民广场见"
+    assert queued_payload["body"] == "请明天下午4点在人民广场见面，带合同。"
+    assert "{'body'" not in json.dumps(queued_payload, ensure_ascii=False)
+    assert queued[0][0] == "events:raw"
+
+
+def test_gmail_composio_fetch_normalizes_large_html_and_uses_email_timestamp(monkeypatch):
+    monkeypatch.setenv("DATABASE_URL", "postgresql://test")
+    monkeypatch.setenv("REDIS_URL", "redis://test")
+    monkeypatch.setenv("APP_PASSWORD", "secret")
+
+    from app import main
+
+    executed = []
+    queued = []
+    large_html = "<html><body><style>.x{}</style><p>明天3点记得在腾讯会议上开线上会议</p>" + (" filler" * 6000) + "</body></html>"
+
+    def fake_execute_composio_tool_call(body):
+        return {
+            "status": "completed",
+            "live_result": {
+                "result": {
+                    "messages": [
+                        {
+                            "id": "gmail-large-html",
+                            "threadId": "thread-large-html",
+                            "subject": "会议提醒",
+                            "from": "sender@example.com",
+                            "to": ["me@example.com"],
+                            "date": "Wed, 24 Jun 2026 20:18:00 +0800",
+                            "body": large_html,
+                            "payload": {"body": {"data": "huge-html-should-not-be-copied"}},
+                        }
+                    ]
+                }
+            },
+        }
+
+    class Cursor:
+        def __init__(self, rows=None):
+            self.rows = rows or []
+
+        def fetchone(self):
+            return self.rows[0] if self.rows else None
+
+    class Conn:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return None
+
+        def execute(self, sql, params=()):
+            normalized = " ".join(sql.split())
+            if "SELECT enabled, paused_until" in normalized:
+                return Cursor()
+            if "SELECT event_id FROM events" in normalized:
+                return Cursor()
+            if "INSERT INTO events" in normalized:
+                executed.append((normalized, params))
+                return Cursor()
+            raise AssertionError(f"Unexpected SQL: {sql}")
+
+    class Redis:
+        def xadd(self, stream, fields):
+            queued.append((stream, fields))
+
+    monkeypatch.setattr(main, "execute_composio_tool_call", fake_execute_composio_tool_call)
+    monkeypatch.setattr(main, "db", lambda: Conn())
+    monkeypatch.setattr(main, "redis_client", lambda: Redis())
+
+    response = TestClient(main.app).post(
+        "/api/collectors/gmail/composio/fetch",
+        headers={"x-par-password": "secret"},
+        json={"query": "newer_than:1d", "limit": 1},
+    )
+
+    assert response.status_code == 200
+    event_params = executed[0][1]
+    assert event_params[1].isoformat() == "2026-06-24T12:18:00+00:00"
+    stored_public = json.loads(event_params[4])
+    stored_private = json.loads(event_params[5])
+    queued_payload = json.loads(queued[0][1]["raw_data"])
+    assert "<html" not in stored_public["body"].lower()
+    assert "明天3点记得在腾讯会议上开线上会议" in stored_public["body"]
+    assert len(stored_public["body"]) < len(large_html)
+    assert stored_public["raw"]["omitted"] is True
+    assert "payload" in stored_public["raw"]["source_keys"]
+    assert "huge-html-should-not-be-copied" not in json.dumps(stored_public, ensure_ascii=False)
+    assert "huge-html-should-not-be-copied" not in json.dumps(stored_private, ensure_ascii=False)
+    assert len(json.dumps(queued_payload, ensure_ascii=False)) < 18000
+
+
+def test_gmail_composio_fetch_uses_composio_message_timestamp_when_date_is_missing(monkeypatch):
+    monkeypatch.setenv("DATABASE_URL", "postgresql://test")
+    monkeypatch.setenv("REDIS_URL", "redis://test")
+    monkeypatch.setenv("APP_PASSWORD", "secret")
+
+    from app import main
+
+    executed = []
+    queued = []
+
+    def fake_execute_composio_tool_call(body):
+        return {
+            "status": "completed",
+            "live_result": {
+                "result": {
+                    "messages": [
+                        {
+                            "messageId": "gmail-message-ts",
+                            "threadId": "thread-message-ts",
+                            "subject": "明天3点会议",
+                            "messageText": "明天3点记得在腾讯会议上开线上会议",
+                            "messageTimestamp": "2026-06-24T12:17:41Z",
+                        }
+                    ]
+                }
+            },
+        }
+
+    class Cursor:
+        def __init__(self, rows=None):
+            self.rows = rows or []
+
+        def fetchone(self):
+            return self.rows[0] if self.rows else None
+
+    class Conn:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return None
+
+        def execute(self, sql, params=()):
+            normalized = " ".join(sql.split())
+            if "SELECT enabled, paused_until" in normalized:
+                return Cursor()
+            if "SELECT event_id FROM events" in normalized:
+                return Cursor()
+            if "INSERT INTO events" in normalized:
+                executed.append((normalized, params))
+                return Cursor()
+            raise AssertionError(f"Unexpected SQL: {sql}")
+
+    class Redis:
+        def xadd(self, stream, fields):
+            queued.append((stream, fields))
+
+    monkeypatch.setattr(main, "execute_composio_tool_call", fake_execute_composio_tool_call)
+    monkeypatch.setattr(main, "db", lambda: Conn())
+    monkeypatch.setattr(main, "redis_client", lambda: Redis())
+
+    response = TestClient(main.app).post(
+        "/api/collectors/gmail/composio/fetch",
+        headers={"x-par-password": "secret"},
+        json={"query": "newer_than:1d", "limit": 1},
+    )
+
+    assert response.status_code == 200
+    event_params = executed[0][1]
+    stored_public = json.loads(event_params[4])
+    assert event_params[1].isoformat() == "2026-06-24T12:17:41+00:00"
+    assert stored_public["date"] == "2026-06-24T12:17:41+00:00"
+    assert queued
+
+
+def test_gmail_composio_fetch_skips_duplicate_message_ids(monkeypatch):
+    monkeypatch.setenv("DATABASE_URL", "postgresql://test")
+    monkeypatch.setenv("REDIS_URL", "redis://test")
+    monkeypatch.setenv("APP_PASSWORD", "secret")
+
+    from app import main
+
+    executed = []
+    queued = []
+
+    def fake_execute_composio_tool_call(body):
+        return {
+            "status": "completed",
+            "live_result": {
+                "result": {
+                    "messages": [
+                        {
+                            "id": "gmail-duplicate",
+                            "threadId": "thread-duplicate",
+                            "subject": "重复邮件",
+                            "body": "已经入库过的邮件不应该再次入队。",
+                        }
+                    ]
+                }
+            },
+        }
+
+    class Cursor:
+        def __init__(self, rows=None):
+            self.rows = rows or []
+
+        def fetchone(self):
+            return self.rows[0] if self.rows else None
+
+    class Conn:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return None
+
+        def execute(self, sql, params=()):
+            normalized = " ".join(sql.split())
+            if "SELECT enabled, paused_until" in normalized:
+                return Cursor()
+            if "SELECT event_id FROM events" in normalized:
+                return Cursor([("existing-event-id",)])
+            if "INSERT INTO events" in normalized:
+                executed.append((normalized, params))
+                return Cursor()
+            raise AssertionError(f"Unexpected SQL: {sql}")
+
+    class Redis:
+        def xadd(self, stream, fields):
+            queued.append((stream, fields))
+
+    monkeypatch.setattr(main, "execute_composio_tool_call", fake_execute_composio_tool_call)
+    monkeypatch.setattr(main, "db", lambda: Conn())
+    monkeypatch.setattr(main, "redis_client", lambda: Redis())
+
+    response = TestClient(main.app).post(
+        "/api/collectors/gmail/composio/fetch",
+        headers={"x-par-password": "secret"},
+        json={"query": "newer_than:1d", "limit": 1},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["events"] == [{"event_id": "existing-event-id", "message_id": "gmail-duplicate", "status": "duplicate"}]
+    assert payload["persisted_count"] == 0
+    assert payload["created_count"] == 0
+    assert payload["duplicate_count"] == 1
+    assert payload["seen_count"] == 1
+    assert executed == []
+    assert queued == []
+
+
+def test_gmail_composio_fetch_enqueues_after_database_context_commits(monkeypatch):
+    monkeypatch.setenv("DATABASE_URL", "postgresql://test")
+    monkeypatch.setenv("REDIS_URL", "redis://test")
+    monkeypatch.setenv("APP_PASSWORD", "secret")
+
+    from app import main
+
+    queued = []
+    lifecycle = []
+
+    def fake_execute_composio_tool_call(body):
+        return {
+            "status": "completed",
+            "live_result": {
+                "result": {
+                    "messages": [
+                        {
+                            "id": "gmail-commit-race",
+                            "threadId": "thread-commit-race",
+                            "subject": "明天3点会议",
+                            "body": "明天3点记得在腾讯会议上开线上会议",
+                        }
+                    ]
+                }
+            },
+        }
+
+    class Cursor:
+        def fetchone(self):
+            return None
+
+    class Conn:
+        committed = False
+
+        def __enter__(self):
+            lifecycle.append("enter")
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            lifecycle.append("commit")
+            Conn.committed = True
+            return None
+
+        def execute(self, sql, params=()):
+            normalized = " ".join(sql.split())
+            if "SELECT enabled, paused_until" in normalized:
+                return Cursor()
+            if "SELECT event_id FROM events" in normalized:
+                return Cursor()
+            if "INSERT INTO events" in normalized:
+                lifecycle.append("insert_event")
+                return Cursor()
+            raise AssertionError(f"Unexpected SQL: {sql}")
+
+    class Redis:
+        def xadd(self, stream, fields):
+            lifecycle.append("enqueue")
+            queued.append((stream, fields, Conn.committed))
+
+    monkeypatch.setattr(main, "execute_composio_tool_call", fake_execute_composio_tool_call)
+    monkeypatch.setattr(main, "db", lambda: Conn())
+    monkeypatch.setattr(main, "redis_client", lambda: Redis())
+
+    response = TestClient(main.app).post(
+        "/api/collectors/gmail/composio/fetch",
+        headers={"x-par-password": "secret"},
+        json={"query": "newer_than:1d", "limit": 1},
+    )
+
+    assert response.status_code == 200
+    assert queued
+    assert queued[0][2] is True
+    assert lifecycle.index("commit") < lifecycle.index("enqueue")
+
+
+def test_gmail_composio_sync_once_fetches_when_readonly_gmail_is_connected(monkeypatch):
+    monkeypatch.setenv("DATABASE_URL", "postgresql://test")
+    monkeypatch.setenv("REDIS_URL", "redis://test")
+    monkeypatch.setenv("APP_PASSWORD", "secret")
+
+    from app import main
+
+    calls = []
+
+    class Cursor:
+        def fetchone(self):
+            return (True,)
+
+    class Conn:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return None
+
+        def execute(self, sql, params=()):
+            normalized = " ".join(sql.split())
+            if "FROM composio_toolkits" in normalized:
+                assert params == ("gmail", "readonly")
+                return Cursor()
+            raise AssertionError(f"Unexpected SQL: {sql}")
+
+    def fake_run_gmail_composio_fetch(*, query, limit):
+        calls.append({"query": query, "limit": limit})
+        return {"status": "completed", "persisted_count": 1}
+
+    monkeypatch.setattr(main, "COMPOSIO_API_KEY", "ak_test")
+    monkeypatch.setattr(main, "db", lambda: Conn())
+    monkeypatch.setattr(main, "run_gmail_composio_fetch", fake_run_gmail_composio_fetch)
+
+    result = main.gmail_composio_sync_once(query="newer_than:1d", limit=3)
+
+    assert result["status"] == "synced"
+    assert result["fetch"]["persisted_count"] == 1
+    assert calls == [{"query": "newer_than:1d", "limit": 3}]
+
+
+def test_gmail_composio_sync_once_skips_when_readonly_gmail_is_not_connected(monkeypatch):
+    monkeypatch.setenv("DATABASE_URL", "postgresql://test")
+    monkeypatch.setenv("REDIS_URL", "redis://test")
+    monkeypatch.setenv("APP_PASSWORD", "secret")
+
+    from app import main
+
+    class Cursor:
+        def fetchone(self):
+            return None
+
+    class Conn:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return None
+
+        def execute(self, sql, params=()):
+            normalized = " ".join(sql.split())
+            if "FROM composio_toolkits" in normalized:
+                return Cursor()
+            raise AssertionError(f"Unexpected SQL: {sql}")
+
+    def fail_fetch(*, query, limit):
+        raise AssertionError("fetch should not run when Gmail is not connected")
+
+    monkeypatch.setattr(main, "COMPOSIO_API_KEY", "ak_test")
+    monkeypatch.setattr(main, "db", lambda: Conn())
+    monkeypatch.setattr(main, "run_gmail_composio_fetch", fail_fetch)
+
+    result = main.gmail_composio_sync_once(query="newer_than:1d", limit=3)
+
+    assert result == {"status": "skipped", "reason": "gmail_not_connected"}
 
 
 def test_memory_governance_filters_events_and_exposes_sensitive_flag(monkeypatch):
@@ -804,7 +1808,7 @@ def test_tool_catalog_requires_password(monkeypatch):
     assert response.status_code == 401
 
 
-def test_tool_catalog_returns_twenty_high_frequency_tools_with_permission_levels(monkeypatch):
+def test_tool_catalog_returns_high_frequency_tools_with_permission_levels(monkeypatch):
     monkeypatch.setenv("APP_PASSWORD", "secret")
     from fastapi.testclient import TestClient
     from app import main
@@ -816,9 +1820,11 @@ def test_tool_catalog_returns_twenty_high_frequency_tools_with_permission_levels
     assert response.status_code == 200
     payload = response.json()
     tools = payload["tools"]
-    assert len(tools) == 20
+    assert len(tools) >= 21
     by_id = {tool["id"]: tool for tool in tools}
     assert by_id["gmail"]["phase"] == "core"
+    assert by_id["telegram"]["phase"] == "core"
+    assert by_id["telegram"]["recommended_adapter"] == "managed_browser_first"
     assert by_id["browser_automation"]["recommended_adapter"] == "playwright_mcp"
     assert by_id["uber"]["risk_level"] == "high"
     assert "external_execution" in by_id["uber"]["permission_levels"]

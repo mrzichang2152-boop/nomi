@@ -753,6 +753,9 @@ def _extract_account_provider(request: str) -> str | None:
     known = {
         "google": "Google",
         "gmail": "Google",
+        "whatsapp": "WhatsApp",
+        "telegram": "Telegram",
+        "linkedin": "LinkedIn",
         "github": "GitHub",
         "notion": "Notion",
         "slack": "Slack",
@@ -773,6 +776,9 @@ def _default_login_url(account_provider: str | None) -> str | None:
         return None
     mapping = {
         "google": "https://accounts.google.com/",
+        "whatsapp": "https://web.whatsapp.com/",
+        "telegram": "https://web.telegram.org/",
+        "linkedin": "https://www.linkedin.com/login",
         "github": "https://github.com/login",
         "notion": "https://www.notion.so/login",
         "slack": "https://slack.com/signin",

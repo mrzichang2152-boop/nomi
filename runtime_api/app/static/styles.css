@@ -6,6 +6,7 @@
   --app-height: 100dvh;
   --keyboard-bottom: 0px;
   --mobile-sidebar-height: 154px;
+  --assistant-topbar-height: 64px;
 }
 
 * {
@@ -37,6 +38,15 @@ button:hover {
   background: #dbe4ee;
 }
 
+button.secondary {
+  background: #eef2f7;
+  color: #344054;
+}
+
+button.secondary:hover {
+  background: #e2e8f0;
+}
+
 .shell,
 .app-panel {
   min-height: var(--app-height, 100dvh);
@@ -45,6 +55,64 @@ button:hover {
 .app-panel {
   display: grid;
   grid-template-columns: 220px minmax(0, 1fr);
+}
+
+.assistant-topbar,
+.assistant-settings-panel {
+  display: none;
+}
+
+.assistant-brand {
+  display: inline-flex;
+  align-items: center;
+  min-width: 0;
+  gap: 10px;
+}
+
+.assistant-title {
+  color: #f8fafc;
+  font-size: 20px;
+  font-weight: 750;
+  letter-spacing: 0;
+}
+
+.assistant-status {
+  width: 9px;
+  height: 9px;
+  border-radius: 999px;
+  background: #22c55e;
+  box-shadow: 0 0 0 3px rgba(34, 197, 94, 0.14);
+}
+
+.assistant-topbar-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.icon-button {
+  display: inline-grid;
+  place-items: center;
+  width: 40px;
+  height: 40px;
+  padding: 0;
+  border: 1px solid rgba(215, 222, 232, 0.12);
+  border-radius: 10px;
+  background: rgba(232, 237, 243, 0.1);
+  color: #e5edf7;
+  line-height: 1;
+}
+
+.icon-button:hover {
+  background: rgba(232, 237, 243, 0.18);
+}
+
+.icon-button.compact {
+  width: 34px;
+  height: 34px;
+  border-color: #d7dee8;
+  background: #eef2f7;
+  color: #172033;
 }
 
 .sidebar {
@@ -103,6 +171,7 @@ button:hover {
 
 .login-box input,
 .toolbar input,
+.toolbar textarea,
 .toolbar select,
 .composer textarea {
   width: 100%;
@@ -145,6 +214,10 @@ button:hover {
   grid-template-rows: auto auto minmax(0, 1fr);
 }
 
+#careerView.active {
+  grid-template-rows: auto auto auto minmax(0, 1fr);
+}
+
 .view-header {
   display: flex;
   align-items: center;
@@ -156,6 +229,18 @@ button:hover {
 .view-header h2 {
   margin: 0;
   font-size: 20px;
+}
+
+.header-actions {
+  display: inline-flex;
+  align-items: center;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.back-to-settings {
+  border: 1px solid #d7dee8;
 }
 
 .toolbar {
@@ -171,6 +256,10 @@ button:hover {
 
 .field-release-toolbar {
   grid-template-columns: 160px minmax(180px, 1fr) minmax(220px, 1fr) auto;
+}
+
+.career-profile-ingest-toolbar {
+  grid-template-columns: minmax(260px, 1fr) minmax(150px, 220px) minmax(150px, 220px) auto;
 }
 
 .messages,
@@ -193,10 +282,19 @@ button:hover {
 }
 
 .message {
+  min-width: 0;
   max-width: min(760px, 88%);
   padding: 12px 14px;
   line-height: 1.5;
   white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.message a {
+  max-width: 100%;
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 .message.user {
@@ -261,6 +359,108 @@ button:hover {
   word-break: break-word;
 }
 
+.suggestion-card {
+  border-left: 4px solid #1f8a70;
+}
+
+.suggestion-inline-card {
+  width: min(100%, 560px);
+  max-width: min(560px, 92%);
+  border-color: #99f6e4;
+  border-left: 4px solid #1f8a70;
+  background: #f8fffd;
+}
+
+.suggestion-inline-card time {
+  color: #1f8a70;
+  font-weight: 650;
+}
+
+.suggestion-inline-card .actions {
+  justify-content: flex-start;
+}
+
+.suggestion-inline-card button {
+  background: #e6f7f3;
+  color: #0f766e;
+}
+
+.job-recommendation-card {
+  display: grid;
+  gap: 12px;
+  min-width: 0;
+}
+
+.job-recommendation-intro,
+.job-recommendation-meta,
+.job-recommendation-summary,
+.job-recommendation-label,
+.job-recommendation-gap,
+.job-recommendation-url-row {
+  max-width: 100%;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.job-recommendation-item {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+  padding: 10px;
+  border: 1px solid #d7f3ec;
+  border-radius: 8px;
+  background: rgba(240, 253, 250, 0.7);
+}
+
+.job-recommendation-item strong {
+  margin: 0;
+}
+
+.job-recommendation-label {
+  margin-top: 2px;
+  color: #667085;
+  font-size: 12px;
+}
+
+.job-recommendation-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.job-recommendation-chips span {
+  max-width: 100%;
+  border-radius: 999px;
+  padding: 4px 8px;
+  background: #d9fbe8;
+  color: #067647;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.job-recommendation-link {
+  display: inline-flex;
+  max-width: 100%;
+  color: #0f766e;
+  font-weight: 650;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.suggestion-card.focused-suggestion {
+  border-color: #1f8a70;
+  background: #f0fdfa;
+  box-shadow: 0 0 0 3px rgba(31, 138, 112, 0.14);
+}
+
+.suggestion-card .small {
+  margin-top: 10px;
+  font-size: 12px;
+}
+
 .tool-card p,
 .pill-row {
   display: flex;
@@ -301,6 +501,12 @@ button:hover {
   font-size: 12px;
 }
 
+.connection-row button {
+  min-width: 104px;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
 .tool-card p span,
 .pill-row span,
 .tool-note {
@@ -335,6 +541,14 @@ button:hover {
   padding-bottom: 0;
 }
 
+#privacyView.active {
+  grid-template-rows: auto auto auto minmax(0, 1fr);
+}
+
+.privacy-explainer {
+  padding-bottom: 0;
+}
+
 .route-card {
   border-color: #99f6e4;
   background: #f0fdfa;
@@ -363,6 +577,24 @@ button:hover {
 
 .agenda-card {
   border-left: 4px solid #14b8a6;
+}
+
+.career-card,
+.career-detail-card {
+  border-left: 4px solid #2563eb;
+}
+
+.career-detail-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.career-detail-header h3 {
+  margin: 0;
+  color: #172033;
+  font-size: 18px;
 }
 
 .agenda-day-tabs {
@@ -449,26 +681,152 @@ button:hover {
 }
 
 @media (max-width: 860px) {
+  body {
+    background: #eef2f7;
+  }
+
   .app-panel {
     grid-template-columns: 1fr;
+    grid-template-rows: var(--assistant-topbar-height) minmax(0, 1fr);
+    min-height: var(--app-height, 100dvh);
+    background: #eef2f7;
+  }
+
+  .assistant-topbar {
+    display: flex;
+    position: relative;
+    z-index: 20;
+    align-items: center;
+    justify-content: space-between;
+    height: var(--assistant-topbar-height);
+    padding: 10px 14px 10px 18px;
+    background: #0b1220;
+    border-bottom: 1px solid rgba(215, 222, 232, 0.1);
   }
 
   .sidebar {
-    min-height: auto;
-    gap: 14px;
+    display: none;
   }
 
-  .nav-actions {
-    grid-template-columns: repeat(7, minmax(0, 1fr));
+  .assistant-settings-panel {
+    position: fixed;
+    top: calc(var(--assistant-topbar-height) + env(safe-area-inset-top, 0px));
+    right: 12px;
+    left: 12px;
+    z-index: 30;
+    display: grid;
+    gap: 12px;
+    max-height: min(620px, calc(var(--app-height, 100dvh) - var(--assistant-topbar-height) - 24px));
+    overflow-y: auto;
+    padding: 14px;
+    border: 1px solid #d7dee8;
+    border-radius: 14px;
+    background: rgba(255, 255, 255, 0.96);
+    box-shadow: 0 18px 45px rgba(15, 23, 42, 0.18);
+    backdrop-filter: blur(14px);
   }
 
-  .nav-button {
-    text-align: center;
-    padding: 8px 6px;
+  .assistant-settings-panel.hidden {
+    display: none;
+  }
+
+  .assistant-settings-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    color: #172033;
+  }
+
+  .assistant-settings-grid {
+    display: grid;
+    gap: 8px;
+  }
+
+  .assistant-settings-item {
+    display: grid;
+    gap: 4px;
+    width: 100%;
+    padding: 12px;
+    text-align: left;
+    border: 1px solid #d7dee8;
+    border-radius: 10px;
+    background: #f8fafc;
+    color: #172033;
+  }
+
+  .assistant-settings-item strong,
+  .assistant-settings-item span {
+    display: block;
+  }
+
+  .assistant-settings-item span {
+    color: #667085;
+    font-size: 12px;
+    line-height: 1.35;
+  }
+
+  .view-header {
+    align-items: flex-start;
+    padding: 16px 14px 8px;
+  }
+
+  .header-actions {
+    gap: 6px;
+  }
+
+  .back-to-settings {
+    padding: 8px 10px;
   }
 
   .workspace {
-    height: calc(var(--app-height, 100dvh) - var(--mobile-sidebar-height, 154px));
+    height: calc(var(--app-height, 100dvh) - var(--assistant-topbar-height));
+    background: #eef2f7;
+  }
+
+  #chatView.active {
+    background: #eef2f7;
+  }
+
+  .messages {
+    gap: 10px;
+    padding: 14px 14px 18px;
+  }
+
+  .message,
+  .card {
+    border-radius: 10px;
+  }
+
+  .message {
+    max-width: min(680px, 86%);
+    padding: 11px 13px;
+    border-color: #d7dee8;
+    box-shadow: 0 1px 0 rgba(15, 23, 42, 0.03);
+  }
+
+  .message.user {
+    background: #0f766e;
+  }
+
+  .composer {
+    gap: 10px;
+    padding: 12px 14px max(12px, env(safe-area-inset-bottom));
+    background: rgba(255, 255, 255, 0.96);
+    border-top-color: #d7dee8;
+    box-shadow: 0 -8px 24px rgba(15, 23, 42, 0.08);
+  }
+
+  .composer textarea {
+    min-height: 54px;
+    max-height: 120px;
+    border-radius: 10px;
+    background: #fbfdff;
+  }
+
+  .composer button {
+    min-width: 76px;
+    border-radius: 10px;
+    background: #0f766e;
   }
 
   #governanceFilters,

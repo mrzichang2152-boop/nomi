@@ -8,11 +8,17 @@ import os
 import re
 import uuid
 import asyncio
+import time
+import threading
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta, timezone
 from dataclasses import dataclass
+from email.utils import parsedate_to_datetime
+from io import BytesIO
 from typing import Any, Optional
-from urllib.parse import urlencode
+from pathlib import Path
+from urllib.parse import parse_qs, urlencode, urlparse
+from zoneinfo import ZoneInfo
 
 import psycopg
 import redis
@@ -29,14 +35,17 @@ from app.assistant_identity.api import router as assistant_identity_router
 from app.assistant_identity.contact_resolver import ContactResolver
 from app.assistant_identity.inbox_gateway import AssistantInboxGateway
 from app.assistant_identity.outbound import OutboundMessagePipeline
-from app.assistant_identity.phone_adapter import PhoneCallInstructionBuilder, PhoneWebhookVerifier
+from app.assistant_identity.phone_adapter import PhoneCallInstructionBuilder, PhoneDuplexTurnHandler, PhoneWebhookVerifier
 from app.assistant_identity.registry import AssistantIdentityRegistry
 from app.assistant_identity.schema import assistant_identity_schema_sql
 from app.assistant_memory import assistant_memory_schema_sql, build_session_search_context
 from app.auth import is_authorized
+from app.chat_router import ChatContextRoute, context_fetch_limits, route_chat_context
+from app.context_parallel import retrieve_chat_context_parallel
 from app.delegated_automation.models import (
     AutomationDecision,
     DelegationGrant,
+    ManifestTarget,
     TargetManifest,
     parse_datetime,
 )
@@ -44,7 +53,7 @@ from app.delegated_automation.policy import build_execution_trace, evaluate_dele
 from app.delegated_automation.schema import delegated_automation_schema_sql
 from app.delegated_automation.store import InMemoryDelegatedAutomationStore
 from app.model_gateway import ModelGatewayError, default_model_gateway
-from app.model_client import QwenClient
+from app.model_client import QwenClient, qwen_non_thinking_options
 from app.long_tail_agent import (
     ExecutorAdapterRegistry,
     ExternalEffectController,
@@ -64,6 +73,14 @@ from app.tool_registry import default_tool_registry, tool_registry_schema_sql
 from app.vector import embedding_status, text_embedding, text_embedding_with_provider, vector_literal
 from app.voice import handle_voice_websocket
 from app.workflow_distillation import workflow_distillation_schema_sql
+from app.ios_apns import APNsLiveActivityClient
+from app.ios_live_activity import (
+    active_ios_live_activities,
+    build_live_activity_content_state,
+    ios_live_activity_schema_sql,
+    normalize_ios_live_activity_settings,
+    record_ios_live_activity_delivery,
+)
 
 
 DATABASE_URL = os.environ["DATABASE_URL"]
@@ -84,6 +101,13 @@ ENABLE_OPENCLAW_JOB_RUNNER = os.getenv("ENABLE_OPENCLAW_JOB_RUNNER", "true").low
 OPENCLAW_JOB_RUNNER_INTERVAL_SECONDS = float(os.getenv("OPENCLAW_JOB_RUNNER_INTERVAL_SECONDS", "5"))
 OPENCLAW_JOB_RUNNER_BATCH_SIZE = int(os.getenv("OPENCLAW_JOB_RUNNER_BATCH_SIZE", "2"))
 ENABLE_LONG_TAIL_RECOVERY_RUNNER = os.getenv("ENABLE_LONG_TAIL_RECOVERY_RUNNER", "true").lower() == "true"
+ENABLE_IOS_LIVE_ACTIVITY_BRIDGE = os.getenv("ENABLE_IOS_LIVE_ACTIVITY_BRIDGE", "false").lower() == "true"
+ENABLE_GMAIL_COMPOSIO_SYNC = os.getenv("ENABLE_GMAIL_COMPOSIO_SYNC", "true").lower() == "true"
+GMAIL_COMPOSIO_SYNC_INTERVAL_SECONDS = float(os.getenv("GMAIL_COMPOSIO_SYNC_INTERVAL_SECONDS", "90"))
+GMAIL_COMPOSIO_SYNC_QUERY = os.getenv("GMAIL_COMPOSIO_SYNC_QUERY", "newer_than:1d").strip() or "newer_than:1d"
+GMAIL_COMPOSIO_SYNC_LIMIT = int(os.getenv("GMAIL_COMPOSIO_SYNC_LIMIT", "10"))
+GMAIL_BODY_CHAR_LIMIT = int(os.getenv("GMAIL_BODY_CHAR_LIMIT", "12000"))
+GMAIL_SNIPPET_CHAR_LIMIT = int(os.getenv("GMAIL_SNIPPET_CHAR_LIMIT", "1800"))
 LONG_TAIL_RECOVERY_INTERVAL_SECONDS = float(os.getenv("LONG_TAIL_RECOVERY_INTERVAL_SECONDS", "10"))
 LONG_TAIL_RECOVERY_BATCH_SIZE = int(os.getenv("LONG_TAIL_RECOVERY_BATCH_SIZE", "10"))
 LONG_TAIL_RECOVERY_LEASE_SECONDS = int(os.getenv("LONG_TAIL_RECOVERY_LEASE_SECONDS", "30"))
@@ -98,6 +122,10 @@ CONTEXT_TOKENIZER_BACKEND = os.getenv("CONTEXT_TOKENIZER_BACKEND", "auto").strip
 _CONTEXT_TOKENIZER: Any = None
 _CONTEXT_TOKENIZER_BACKEND = "conservative_char_estimator"
 _CONTEXT_TOKENIZER_LOAD_ATTEMPTED = False
+SEMANTIC_CONTEXT_ROUTER_TRIGGER_RE = re.compile(
+    r"(有消息了吗|有回复吗|有进展吗|怎么样了|什么情况|那边|对方|客户|HR|recruiter|面试官|邮件|消息|回复|进展|结果)",
+    re.IGNORECASE,
+)
 
 DEFAULT_COMPOSIO_READONLY_TOOLKITS = [
     "gmail",
@@ -128,12 +156,19 @@ DEFAULT_COMPOSIO_WRITE_TOOLKITS = [
 
 EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+")
 PHONE_RE = re.compile(r"(?<![\dA-Za-z-])(?:\+?\d[\d -]{7,}\d)(?![\dA-Za-z-])")
+PRESERVED_DATE_TIME_RE = re.compile(
+    r"(?<!\d)\d{4}-\d{2}-\d{2}(?:[T\s]\d{1,2}:\d{2}(?::\d{2})?(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?)?(?!\d)"
+)
 URL_QUERY_RE = re.compile(r"([?&])([^=#&]+)=([^&#]+)")
+LINKEDIN_JOB_URL_RE = re.compile(
+    r"https?://(?:[\w-]+\.)?linkedin\.com/jobs/(?:view/\d{6,}/?|search/\?[^\\s\"'<>，。；、]*currentJobId=\d{6,}[^\\s\"'<>，。；、]*)",
+    re.I,
+)
 SENSITIVE_KEY_RE = re.compile(r"(token|secret|cookie|session|password|passwd|auth|code|验证码|校验码|verification)", re.I)
 INLINE_SECRET_RE = re.compile(r"\b(token|secret|sessionid|session|password|passwd|auth|code)=([^,\s&;]+)", re.I)
 OAUTH_FRAGMENT_RE = re.compile(r"([#&])(access_token|id_token|refresh_token|state|token|code)=([^&#]+)", re.I)
 BEARER_RE = re.compile(r"\bBearer\s+[A-Za-z0-9._~+/=-]+", re.I)
-VERIFICATION_CODE_RE = re.compile(r"((?:验证码|校验码|verification code|code)[^\dA-Za-z]{0,8})([A-Za-z0-9-]{4,12})", re.I)
+VERIFICATION_CODE_RE = re.compile(r"((?:验证码|校验码|verification code)[^\dA-Za-z]{0,8})([A-Za-z0-9-]{4,12})", re.I)
 ORDER_ID_RE = re.compile(r"((?:订单号|订单|order(?: id)?)[^\dA-Za-z]{0,8})([A-Za-z0-9-]{5,24})", re.I)
 ID_CARD_RE = re.compile(r"((?:身份证号?|id card)[^\dA-Za-z]{0,8})(\d{17}[\dXx])", re.I)
 PASSPORT_RE = re.compile(r"((?:护照|passport)[^\dA-Za-z]{0,8})([A-Z]{1,2}\d{6,9})", re.I)
@@ -146,6 +181,64 @@ BILL_ID_RE = re.compile(r"\b(?:INV|INVOICE|BILL)[-_A-Z0-9]+\b", re.I)
 CHINESE_ADDRESS_RE = re.compile(
     r"((?:收货地址|地址)[：:\s]*)([^，。；;\\n]{6,80}(?:号|室|楼|层|单元|弄|路|街|大道|巷|村|县|区|市))"
 )
+EXPLICIT_DATE_RE = re.compile(r"(20\d{2})[-年/](\d{1,2})[-月/](\d{1,2})日?")
+WEEKDAY_RE = re.compile(r"(下周)?(?:周|星期|礼拜)([一二三四五六日天])")
+EN_WEEKDAY_RE = re.compile(r"\b(next\s+)?(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b", re.I)
+WEEKDAY_LABELS = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
+CHINESE_WEEKDAYS = {"一": 0, "二": 1, "三": 2, "四": 3, "五": 4, "六": 5, "日": 6, "天": 6}
+ENGLISH_WEEKDAYS = {
+    "monday": 0,
+    "tuesday": 1,
+    "wednesday": 2,
+    "thursday": 3,
+    "friday": 4,
+    "saturday": 5,
+    "sunday": 6,
+}
+USER_TIMEZONE_NAME = os.getenv("USER_TIMEZONE", "Asia/Shanghai")
+try:
+    USER_TIMEZONE = ZoneInfo(USER_TIMEZONE_NAME)
+except Exception:
+    USER_TIMEZONE = timezone(timedelta(hours=8))
+
+
+def replace_phone_preserving_date_times(value: str, replacement: str = "PHONE_1") -> str:
+    preserved: list[str] = []
+
+    def hold(match: re.Match[str]) -> str:
+        preserved.append(match.group(0))
+        return f"__NOMI_DATE_TIME_{len(preserved) - 1}__"
+
+    protected = PRESERVED_DATE_TIME_RE.sub(hold, value)
+    protected = LINKEDIN_JOB_URL_RE.sub(hold, protected)
+    protected = PHONE_RE.sub(replacement, protected)
+    for index, original in enumerate(preserved):
+        protected = protected.replace(f"__NOMI_DATE_TIME_{index}__", original)
+    return protected
+
+
+def remove_preserved_date_times(value: str) -> str:
+    return PRESERVED_DATE_TIME_RE.sub("", value)
+
+
+def phone_spans_excluding_date_times(value: str) -> list[tuple[int, int]]:
+    date_time_spans = [match.span() for match in PRESERVED_DATE_TIME_RE.finditer(value)]
+    platform_id_spans = [match.span() for match in LINKEDIN_JOB_URL_RE.finditer(value)]
+
+    def overlaps_non_phone_span(span: tuple[int, int]) -> bool:
+        return any(
+            span[0] < protected_span[1] and span[1] > protected_span[0]
+            for protected_span in [*date_time_spans, *platform_id_spans]
+        )
+
+    return [match.span() for match in PHONE_RE.finditer(value) if not overlaps_non_phone_span(match.span())]
+
+
+async def warm_start_embedding_provider() -> None:
+    try:
+        await asyncio.to_thread(text_embedding_with_provider, "startup embedding warmup")
+    except Exception as exc:
+        print(f"embedding warmup skipped: {exc}", flush=True)
 
 
 @asynccontextmanager
@@ -166,14 +259,18 @@ async def lifespan(app: FastAPI):
     ensure_openclaw_execution_schema()
     ensure_delegated_automation_schema()
     ensure_model_gateway_schema()
-    text_embedding_with_provider("startup embedding warmup")
-    tasks: list[asyncio.Task] = []
+    ensure_ios_live_activity_schema()
+    tasks: list[asyncio.Task] = [asyncio.create_task(warm_start_embedding_provider())]
     if ENABLE_DAILY_MAINTENANCE:
         tasks.append(asyncio.create_task(daily_maintenance_loop()))
     if ENABLE_OPENCLAW_JOB_RUNNER:
         tasks.append(asyncio.create_task(openclaw_execution_job_runner_loop()))
     if ENABLE_LONG_TAIL_RECOVERY_RUNNER and DATABASE_URL != "postgresql://test":
         tasks.append(asyncio.create_task(long_tail_recovery_runner_loop()))
+    if ENABLE_GMAIL_COMPOSIO_SYNC and DATABASE_URL != "postgresql://test":
+        tasks.append(asyncio.create_task(gmail_composio_sync_loop()))
+    if ENABLE_IOS_LIVE_ACTIVITY_BRIDGE:
+        tasks.append(asyncio.create_task(ios_live_activity_realtime_bridge_loop()))
     yield
     for task in tasks:
         task.cancel()
@@ -240,9 +337,44 @@ class ChatIn(BaseModel):
     limit: int = Field(default=12, ge=1, le=50)
     conversation_id: Optional[str] = None
     client_type: str = Field(default="web", max_length=40)
+    client_request_id: Optional[str] = Field(default=None, max_length=160)
     client_context: list[dict[str, Any]] = Field(default_factory=list)
     client_context_delta: list[dict[str, Any]] = Field(default_factory=list)
     ui_state: dict[str, Any] = Field(default_factory=dict)
+
+
+def chat_context_candidate_limit(requested_limit: int) -> int:
+    return min(max(int(requested_limit), 12), 50)
+
+
+def monotonic_ms() -> float:
+    return time.perf_counter() * 1000.0
+
+
+def elapsed_ms(start_ms: float) -> int:
+    return max(0, int(monotonic_ms() - start_ms))
+
+
+def normalize_client_request_id(value: Optional[str]) -> str:
+    normalized = re.sub(r"[^A-Za-z0-9_.:-]", "_", str(value or "").strip())
+    return normalized[:120]
+
+
+def assistant_turn_idempotency_key(client_request_id: Optional[str], role: str) -> Optional[str]:
+    normalized = normalize_client_request_id(client_request_id)
+    if not normalized:
+        return None
+    return f"client_request:{normalized}:{role}"
+
+
+class UserModelConfigIn(BaseModel):
+    provider_type: str = Field(default="openai_compatible", max_length=80)
+    base_url: str = Field(default="https://4sapi.com/v1", max_length=500)
+    model: str = Field(default="gpt-5.4-mini", max_length=200)
+    api_key: str = Field(default="", max_length=4000)
+    auth_header_format: str = Field(default="raw", max_length=40)
+    display_name: str = Field(default="", max_length=200)
+    max_output_tokens: int = Field(default=8192, ge=1, le=262144)
 
 
 class ToolRouteIn(BaseModel):
@@ -276,6 +408,17 @@ class DelegatedAutomationTraceIn(BaseModel):
 
 class DelegatedAutomationPauseIn(BaseModel):
     reason: str = Field(default="", max_length=500)
+
+
+class DelegatedAutomationExecuteIn(BaseModel):
+    grant_id: str = Field(min_length=1, max_length=160)
+    manifest_id: str = Field(min_length=1, max_length=160)
+    target_id: str = Field(min_length=1, max_length=240)
+    content_evidence_ids: list[str] = Field(default_factory=list)
+    page_state: dict[str, Any] = Field(default_factory=dict)
+    user_paused: bool = False
+    now: Optional[str] = None
+    request: dict[str, Any] = Field(default_factory=dict)
 
 
 class ComposioToolExecuteIn(BaseModel):
@@ -327,6 +470,19 @@ class AssistantPhoneCallWebhookIn(BaseModel):
     direction: str = Field(default="inbound", max_length=40)
     status: str = Field(default="received", max_length=80)
     timestamp: Optional[str] = Field(default=None, max_length=120)
+    known_contacts: dict[str, str] = Field(default_factory=dict)
+    user_keys: list[str] = Field(default_factory=list)
+
+
+class AssistantPhoneDuplexTurnWebhookIn(BaseModel):
+    identity_id: str = Field(default="nomi_phone_primary", max_length=120)
+    provider_call_id: Optional[str] = Field(default=None, max_length=200)
+    from_number: str = Field(default="", max_length=80)
+    to_number: str = Field(default="", max_length=80)
+    transcript: str = Field(default="", max_length=10000)
+    turn_index: int = Field(default=0, ge=0, le=1000)
+    timestamp: Optional[str] = Field(default=None, max_length=120)
+    voice: str = Field(default="default", max_length=80)
     known_contacts: dict[str, str] = Field(default_factory=dict)
     user_keys: list[str] = Field(default_factory=list)
 
@@ -404,6 +560,41 @@ class BrowserOpenIn(BaseModel):
     source: str = Field(min_length=1, max_length=80)
 
 
+class BrowserOpenLinkedInProfileIn(BaseModel):
+    profile_url: str = Field(min_length=1, max_length=500)
+    reason: str = Field(default="", max_length=500)
+
+
+class BrowserOpenLinkedInJobIn(BaseModel):
+    job_url: str = Field(min_length=1, max_length=500)
+    reason: str = Field(default="", max_length=500)
+
+
+class BrowserSearchLinkedInContactsIn(BaseModel):
+    company: str = Field(default="", max_length=200)
+    job_title: str = Field(default="", max_length=200)
+    location: str = Field(default="", max_length=160)
+    reason: str = Field(default="", max_length=500)
+
+
+class BrowserSearchLinkedInJobsIn(BaseModel):
+    query: str = Field(default="", max_length=240)
+    location: str = Field(default="", max_length=160)
+    reason: str = Field(default="", max_length=500)
+
+
+class BrowserTypeIn(BaseModel):
+    text: str = Field(min_length=1, max_length=2048)
+    submit: bool = False
+
+
+class BrowserCommandResultIn(BaseModel):
+    status: str = Field(min_length=1, max_length=80)
+    source: str = Field(default="", max_length=80)
+    expected_event_type: str = Field(default="", max_length=160)
+    details: dict[str, Any] = Field(default_factory=dict)
+
+
 class OpenClawExecuteIn(BaseModel):
     packet: dict[str, Any]
     execution_guard: dict[str, Any] = Field(default_factory=dict)
@@ -452,6 +643,69 @@ class AgendaPatchIn(BaseModel):
     reason: str = ""
 
 
+class CareerApplicationPatchIn(BaseModel):
+    status: Optional[str] = None
+    stage: Optional[str] = None
+    next_step: Optional[str] = None
+    user_note: Optional[str] = None
+
+
+class CareerAtsPreviewIn(BaseModel):
+    url: str = Field(min_length=8, max_length=2000)
+    title: Optional[str] = Field(default=None, max_length=500)
+    text: Optional[str] = Field(default=None, max_length=120000)
+    html_text: Optional[str] = Field(default=None, max_length=300000)
+
+
+class CareerAtsListPreviewIn(BaseModel):
+    url: str = Field(min_length=8, max_length=2000)
+    limit: int = Field(default=25, ge=1, le=100)
+
+
+class CareerProfileIngestIn(BaseModel):
+    resume_text: str = Field(min_length=20, max_length=200000)
+    target_roles: Optional[list[str]] = None
+    target_locations: Optional[list[str]] = None
+    profile_name: Optional[str] = Field(default=None, max_length=160)
+    source_event_id: Optional[str] = Field(default="career_resume_text_default", max_length=160)
+
+
+class CareerResumeFileImportIn(BaseModel):
+    filename: str = Field(min_length=1, max_length=240)
+    content_base64: str = Field(min_length=4, max_length=8_000_000)
+    target_roles: Optional[list[str]] = None
+    target_locations: Optional[list[str]] = None
+    profile_name: Optional[str] = Field(default=None, max_length=160)
+
+
+class CareerResumePatchIn(BaseModel):
+    make_default: Optional[bool] = None
+    status: Optional[str] = Field(default=None, pattern="^(active|archived)$")
+
+
+class ResumeExportSection(BaseModel):
+    title: str = Field(min_length=1, max_length=160)
+    body: str = Field(min_length=1, max_length=8000)
+
+
+class CareerResumeExportIn(BaseModel):
+    filename: str = Field(min_length=1, max_length=200)
+    headline: str = Field(min_length=1, max_length=300)
+    sections: list[ResumeExportSection] = Field(min_length=1, max_length=20)
+    format: str = Field(pattern="^(docx|pdf)$")
+    source_event_ids: Optional[list[str]] = None
+
+
+def text_list(value: Any) -> list[str]:
+    if not value:
+        return []
+    if isinstance(value, list):
+        return [str(item) for item in value if str(item)]
+    if isinstance(value, tuple):
+        return [str(item) for item in value if str(item)]
+    return [str(value)]
+
+
 class AgendaSnoozeIn(BaseModel):
     snoozed_until: str = Field(min_length=1, max_length=80)
     reason: str = ""
@@ -463,6 +717,7 @@ class SuggestionActionIn(BaseModel):
     rating: Optional[float] = None
     metadata: dict[str, Any] = Field(default_factory=dict)
     snoozed_until: Optional[str] = None
+    conversation_id: Optional[str] = None
 
 
 class ConsolidateIn(BaseModel):
@@ -474,6 +729,26 @@ class CollectorSettingsUpdateIn(BaseModel):
     paused_until: Optional[datetime] = None
     reason: str = ""
     metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class IOSDeviceRegisterIn(BaseModel):
+    device_id: str = Field(min_length=1, max_length=160)
+    display_name: str = ""
+    apns_environment: str = Field(default="sandbox", pattern="^(sandbox|production)$")
+    apns_device_token: str = ""
+    live_activity_push_to_start_token: str = ""
+    settings: dict[str, Any] = Field(default_factory=dict)
+
+
+class IOSDeviceSettingsIn(BaseModel):
+    settings: dict[str, Any] = Field(default_factory=dict)
+
+
+class IOSLiveActivityRegisterIn(BaseModel):
+    device_id: str = Field(min_length=1, max_length=160)
+    activity_id: str = Field(min_length=1, max_length=180)
+    activity_kind: str = "nomi_status"
+    update_token: str = Field(min_length=1)
 
 
 class MaintenanceIn(BaseModel):
@@ -502,6 +777,243 @@ def model_gateway():
     if _MODEL_GATEWAY is None:
         _MODEL_GATEWAY = default_model_gateway()
     return _MODEL_GATEWAY
+
+
+def reset_model_gateway() -> None:
+    global _MODEL_GATEWAY
+    _MODEL_GATEWAY = None
+
+
+def semantic_context_router_enabled() -> bool:
+    return os.getenv("CONTEXT_SEMANTIC_ROUTER_ENABLED", "true").strip().lower() not in {"0", "false", "no", "off"}
+
+
+def should_run_semantic_context_router(message: str, deterministic_route: ChatContextRoute) -> bool:
+    mode = os.getenv("CONTEXT_SEMANTIC_ROUTER_MODE", "ambiguous_only").strip().lower()
+    if not semantic_context_router_enabled():
+        return False
+    if mode == "always":
+        return True
+    if deterministic_route.intent != "simple_chat":
+        return False
+    if deterministic_route.reason not in {"default_simple", "informational_request"}:
+        return False
+    return bool(SEMANTIC_CONTEXT_ROUTER_TRIGGER_RE.search(message or ""))
+
+
+def parse_semantic_context_router_response(text: str) -> Optional[dict[str, Any]]:
+    value = str(text or "").strip()
+    if not value:
+        return None
+    if value.startswith("```"):
+        value = re.sub(r"^```(?:json)?\s*", "", value, flags=re.I).strip()
+        value = re.sub(r"\s*```$", "", value).strip()
+    if not value.startswith("{"):
+        start = value.find("{")
+        end = value.rfind("}")
+        if start < 0 or end <= start:
+            return None
+        value = value[start : end + 1]
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError:
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def semantic_context_router_messages(message: str, ui_state: Optional[dict[str, Any]], deterministic_route: ChatContextRoute) -> list[dict[str, str]]:
+    payload = {
+        "message": message,
+        "ui_state_hint": {
+            "source_type": (ui_state or {}).get("source_type"),
+            "has_current_source": bool((ui_state or {}).get("current_source")),
+            "pending_action": bool((ui_state or {}).get("pending_action") or (ui_state or {}).get("pending_confirmation")),
+        },
+        "deterministic_route": deterministic_route.to_decision(),
+    }
+    return [
+        {
+            "role": "system",
+            "content": (
+                "你是 Nomi 的上下文召回路由器，只决定回答当前用户问题需要哪些上下文层。"
+                "只能返回 JSON，不要解释。"
+                "允许 intent: simple_chat, memory_query, agenda_query, task_request, relationship_query, job_query, source_question, action_confirmation。"
+                "needs 必须包含 dialogue/source/memory_kv/memory_graph/memory_rag/timeline/agenda/tasks/external_tool_state 布尔值。"
+                "如果问题依赖私有聊天、邮件、联系人、关系、历史事件或模糊指代，应打开相应 memory 层；如果只是常识闲聊则保持 simple_chat。"
+            ),
+        },
+        {"role": "user", "content": json.dumps(payload, ensure_ascii=False, default=str)},
+    ]
+
+
+async def apply_semantic_context_router(
+    message: str,
+    ui_state: Optional[dict[str, Any]],
+    deterministic_route: ChatContextRoute,
+) -> ChatContextRoute:
+    if not should_run_semantic_context_router(message, deterministic_route):
+        return deterministic_route
+    try:
+        timeout_seconds = max(0.2, float(os.getenv("CONTEXT_SEMANTIC_ROUTER_TIMEOUT_SECONDS", "3.0")))
+        result = await asyncio.wait_for(
+            model_gateway().chat(semantic_context_router_messages(message, ui_state, deterministic_route), temperature=0.0),
+            timeout=timeout_seconds,
+        )
+    except Exception:
+        return deterministic_route
+    decision = parse_semantic_context_router_response(result.text)
+    if not decision:
+        return deterministic_route
+    return route_chat_context(message, ui_state, semantic_router=lambda *_args: decision)
+
+
+def model_api_key_fernet() -> Fernet:
+    secret = os.getenv("MODEL_CONFIG_ENCRYPTION_SECRET") or os.getenv("APP_PASSWORD") or "par-dev"
+    digest = hashlib.sha256(f"nomi:model-api-key:{secret}".encode("utf-8")).digest()
+    return Fernet(base64.urlsafe_b64encode(digest))
+
+
+def encrypt_model_api_key(api_key: str) -> dict[str, Any]:
+    value = (api_key or "").strip()
+    if not value:
+        return {"version": 1, "algorithm": "fernet-sha256-local", "ciphertext": ""}
+    token = model_api_key_fernet().encrypt(value.encode("utf-8")).decode("utf-8")
+    return {"version": 1, "algorithm": "fernet-sha256-local", "ciphertext": token}
+
+
+def decrypt_model_api_key(envelope: dict[str, Any] | None) -> str:
+    if not envelope:
+        return ""
+    ciphertext = str(envelope.get("ciphertext") or "")
+    if not ciphertext:
+        return ""
+    try:
+        return model_api_key_fernet().decrypt(ciphertext.encode("utf-8")).decode("utf-8")
+    except InvalidToken:
+        return ""
+
+
+def model_api_key_hint(api_key: str) -> str:
+    value = (api_key or "").strip()
+    if not value:
+        return ""
+    return "****" + value[-4:]
+
+
+def public_model_config_payload(
+    *,
+    provider_id: str,
+    display_name: str,
+    provider_type: str,
+    base_url: str,
+    model: str,
+    api_key: str,
+    auth_header_format: str,
+    max_output_tokens: int,
+) -> dict[str, Any]:
+    return {
+        "provider_id": provider_id,
+        "display_name": display_name,
+        "provider_type": provider_type,
+        "base_url": base_url,
+        "model": model,
+        "api_key_configured": bool((api_key or "").strip()),
+        "api_key_hint": model_api_key_hint(api_key),
+        "auth_header_format": auth_header_format,
+        "max_output_tokens": max_output_tokens,
+    }
+
+
+def save_user_model_config(body: UserModelConfigIn) -> dict[str, Any]:
+    provider_id = "user_primary"
+    provider_type = (body.provider_type or "openai_compatible").strip()
+    auth_header_format = (body.auth_header_format or "raw").strip()
+    display_name = body.display_name.strip() or f"{body.model} ({provider_type})"
+    api_key = body.api_key.strip()
+    metadata = {
+        "provider_type": provider_type,
+        "auth_header_format": auth_header_format,
+        "api_key_envelope": encrypt_model_api_key(api_key),
+        "api_key_hint": model_api_key_hint(api_key),
+        "api_key_configured": bool(api_key),
+        "max_output_tokens": body.max_output_tokens,
+    }
+    with db() as conn:
+        conn.execute(
+            """
+            INSERT INTO model_providers (
+              provider_id, display_name, base_url, model, priority, enabled,
+              supports_streaming, supports_tool_calling, context_window_tokens,
+              privacy_tier, task_classes, metadata, updated_at
+            )
+            VALUES (%s, %s, %s, %s, 10, TRUE, TRUE, FALSE, 0, 'private_api', ARRAY['general']::TEXT[], %s::jsonb, now())
+            ON CONFLICT (provider_id) DO UPDATE
+            SET display_name = EXCLUDED.display_name,
+                base_url = EXCLUDED.base_url,
+                model = EXCLUDED.model,
+                priority = EXCLUDED.priority,
+                enabled = TRUE,
+                supports_streaming = TRUE,
+                metadata = EXCLUDED.metadata,
+                updated_at = now()
+            """,
+            (
+                provider_id,
+                display_name,
+                body.base_url.strip().rstrip("/"),
+                body.model.strip(),
+                json.dumps(metadata, ensure_ascii=False),
+            ),
+        )
+    return public_model_config_payload(
+        provider_id=provider_id,
+        display_name=display_name,
+        provider_type=provider_type,
+        base_url=body.base_url.strip().rstrip("/"),
+        model=body.model.strip(),
+        api_key=api_key,
+        auth_header_format=auth_header_format,
+        max_output_tokens=body.max_output_tokens,
+    )
+
+
+def load_user_model_config() -> dict[str, Any]:
+    with db() as conn:
+        row = conn.execute(
+            """
+            SELECT provider_id, display_name, base_url, model, metadata
+            FROM model_providers
+            WHERE provider_id = 'user_primary'
+            """,
+        ).fetchone()
+    if not row:
+        return public_model_config_payload(
+            provider_id="user_primary",
+            display_name="4sapi GPT-5.4 mini",
+            provider_type=os.getenv("MODEL_PROVIDER_TYPE", "openai_compatible"),
+            base_url=os.getenv("MODEL_BASE_URL", "https://4sapi.com/v1").rstrip("/"),
+            model=os.getenv("MODEL_NAME", "gpt-5.4-mini"),
+            api_key=os.getenv("MODEL_API_KEY", ""),
+            auth_header_format=os.getenv("MODEL_AUTH_HEADER_FORMAT", "raw"),
+            max_output_tokens=int(os.getenv("MODEL_MAX_OUTPUT_TOKENS", "8192")),
+        )
+    metadata = row[4] or {}
+    if isinstance(metadata, str):
+        try:
+            metadata = json.loads(metadata)
+        except json.JSONDecodeError:
+            metadata = {}
+    api_key = decrypt_model_api_key(metadata.get("api_key_envelope") or {})
+    return public_model_config_payload(
+        provider_id=row[0],
+        display_name=row[1] or "",
+        provider_type=str(metadata.get("provider_type") or "openai_compatible"),
+        base_url=row[2] or "",
+        model=row[3] or "",
+        api_key=api_key,
+        auth_header_format=str(metadata.get("auth_header_format") or "raw"),
+        max_output_tokens=int(metadata.get("max_output_tokens") or 8192),
+    )
 
 
 def jsonb_param(value: Any) -> Jsonb | None:
@@ -616,7 +1128,7 @@ def protect_private_value(value: Any) -> Any:
         value = PASSPORT_RE.sub(r"\1PASSPORT_1", value)
         value = BANK_CARD_RE.sub(r"\1BANK_CARD_1", value)
         value = CHINESE_ADDRESS_RE.sub(r"\1ADDRESS_1", value)
-        value = PHONE_RE.sub("PHONE_1", value)
+        value = replace_phone_preserving_date_times(value)
         value = AMOUNT_RE.sub("AMOUNT_1", value)
         return value
     if isinstance(value, dict):
@@ -657,9 +1169,13 @@ def collect_sensitive_reasons(value: Any) -> list[str]:
                 ("phone", PHONE_RE),
                 ("amount", AMOUNT_RE),
             ]
-            phone_spans = [match.span() for match in PHONE_RE.finditer(item)]
+            phone_spans = phone_spans_excluding_date_times(item)
             for name, pattern in checks:
                 if is_timestamp_like and name in {"phone", "amount"}:
+                    continue
+                if name == "phone":
+                    if phone_spans:
+                        reasons.add(name)
                     continue
                 if name == "amount":
                     for amount_match in AMOUNT_RE.finditer(item):
@@ -727,6 +1243,9 @@ def require_long_tail_task(task_id: str) -> dict[str, Any]:
 
 
 BROWSER_COMMAND_QUEUE_KEY = "browser:commands"
+BROWSER_COMMAND_STATUS_KEY_PREFIX = "browser:commands:status:"
+BROWSER_COMMAND_STATUS_TTL_SECONDS = 60 * 60 * 24
+LINKEDIN_JOB_SEARCH_DEDUPE_TTL_SECONDS = 60 * 10
 BROWSER_OPEN_TARGETS: dict[str, dict[str, str]] = {
     "whatsapp": {
         "host_fragment": "web.whatsapp.com",
@@ -744,7 +1263,82 @@ BROWSER_OPEN_TARGETS: dict[str, dict[str, str]] = {
         "host_fragment": "amazon.",
         "url": "https://www.amazon.com/",
     },
+    "linkedin": {
+        "host_fragment": "linkedin.com",
+        "url": "https://www.linkedin.com/login",
+    },
 }
+
+
+def browser_command_status_key(command_id: str) -> str:
+    return BROWSER_COMMAND_STATUS_KEY_PREFIX + str(command_id or "").strip()
+
+
+def browser_command_status_payload(
+    command: dict[str, Any],
+    status: str,
+    *,
+    details: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    return {
+        "command_id": str(command.get("command_id") or ""),
+        "status": str(status or "").strip() or "unknown",
+        "action": str(command.get("action") or ""),
+        "source": str(command.get("source") or ""),
+        "target_url": str(command.get("url") or command.get("target_url") or ""),
+        "host_fragment": str(command.get("host_fragment") or ""),
+        "expected_event_type": str(command.get("expected_event_type") or ""),
+        "created_at": str(command.get("created_at") or ""),
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "details": details or {},
+    }
+
+
+def write_browser_command_status(
+    redis_obj: Any,
+    command: dict[str, Any],
+    status: str,
+    *,
+    details: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    payload = browser_command_status_payload(command, status, details=details)
+    command_id = payload["command_id"]
+    if not command_id:
+        return payload
+    value = json.dumps(payload, ensure_ascii=False, default=str)
+    try:
+        if hasattr(redis_obj, "setex"):
+            redis_obj.setex(browser_command_status_key(command_id), BROWSER_COMMAND_STATUS_TTL_SECONDS, value)
+        elif hasattr(redis_obj, "set"):
+            redis_obj.set(browser_command_status_key(command_id), value)
+    except Exception:
+        pass
+    return payload
+
+
+def read_browser_command_status(redis_obj: Any, command_id: str) -> Optional[dict[str, Any]]:
+    clean_id = str(command_id or "").strip()
+    if not clean_id:
+        return None
+    try:
+        value = redis_obj.get(browser_command_status_key(clean_id))
+    except Exception:
+        return None
+    if isinstance(value, bytes):
+        value = value.decode("utf-8", errors="replace")
+    if not value:
+        return None
+    try:
+        parsed = json.loads(value)
+    except (TypeError, json.JSONDecodeError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def enqueue_browser_command(command: dict[str, Any]) -> None:
+    redis_obj = redis_client()
+    redis_obj.rpush(BROWSER_COMMAND_QUEUE_KEY, json.dumps(command, ensure_ascii=False))
+    write_browser_command_status(redis_obj, command, "queued")
 
 
 def browser_open_target(source: str) -> dict[str, str]:
@@ -762,6 +1356,136 @@ def browser_open_target(source: str) -> dict[str, str]:
     return {"source": normalized, **target}
 
 
+def normalize_linkedin_profile_url(value: str) -> str:
+    parsed = urlparse(str(value or "").strip())
+    host = parsed.netloc.lower()
+    path = re.sub(r"/+", "/", parsed.path or "/")
+    if parsed.scheme not in {"http", "https"}:
+        raise HTTPException(status_code=400, detail={"code": "unsupported_linkedin_profile_url"})
+    if host not in {"linkedin.com", "www.linkedin.com"}:
+        raise HTTPException(status_code=400, detail={"code": "unsupported_linkedin_profile_url"})
+    if not re.fullmatch(r"/in/[A-Za-z0-9._%-]+/?", path):
+        raise HTTPException(status_code=400, detail={"code": "unsupported_linkedin_profile_url"})
+    if not path.endswith("/"):
+        path += "/"
+    return f"https://www.linkedin.com{path}"
+
+
+def linkedin_profile_slug(profile_url: str) -> str:
+    path = urlparse(profile_url).path.strip("/")
+    parts = path.split("/")
+    return parts[1] if len(parts) >= 2 and parts[0] == "in" else "profile"
+
+
+def normalize_linkedin_job_url(value: str) -> str:
+    parsed = urlparse(str(value or "").strip())
+    host = parsed.netloc.lower()
+    path = re.sub(r"/+", "/", parsed.path or "/")
+    if parsed.scheme not in {"http", "https"}:
+        raise HTTPException(status_code=400, detail={"code": "unsupported_linkedin_job_url"})
+    if host not in {"linkedin.com", "www.linkedin.com"}:
+        raise HTTPException(status_code=400, detail={"code": "unsupported_linkedin_job_url"})
+    if not re.fullmatch(r"/jobs/view/[0-9]+/?", path):
+        raise HTTPException(status_code=400, detail={"code": "unsupported_linkedin_job_url"})
+    if not path.endswith("/"):
+        path += "/"
+    return f"https://www.linkedin.com{path}"
+
+
+def linkedin_job_slug(job_url: str) -> str:
+    match = re.search(r"/jobs/view/([0-9]+)/?", urlparse(job_url).path)
+    return match.group(1) if match else "job"
+
+
+def clean_linkedin_search_term(value: str, max_length: int = 160) -> str:
+    cleaned = re.sub(r"\s+", " ", str(value or "").strip())
+    cleaned = re.sub(r"[<>\"`{}\\]", "", cleaned)
+    return cleaned[:max_length].strip()
+
+
+def linkedin_contact_search_slug(company: str, job_title: str, location: str = "") -> str:
+    source = " ".join(item for item in [company, job_title, location] if item).strip() or "contacts"
+    slug = re.sub(r"[^a-z0-9]+", "-", source.lower()).strip("-")
+    return (slug or "contacts")[:80]
+
+
+def build_linkedin_contact_search_url(company: str, job_title: str, location: str = "") -> tuple[str, dict[str, str]]:
+    clean_company = clean_linkedin_search_term(company)
+    clean_job_title = clean_linkedin_search_term(job_title)
+    clean_location = clean_linkedin_search_term(location, max_length=120)
+    if not any([clean_company, clean_job_title, clean_location]):
+        raise HTTPException(status_code=400, detail={"code": "empty_linkedin_contact_search"})
+    keywords = " ".join(
+        item
+        for item in [
+            clean_company,
+            clean_job_title,
+            clean_location,
+            "recruiter",
+            "talent acquisition",
+            "hiring manager",
+            "HR",
+        ]
+        if item
+    )
+    url = "https://www.linkedin.com/search/results/people/?" + urlencode({"keywords": keywords[:500]})
+    return url, {"company": clean_company, "job_title": clean_job_title, "location": clean_location}
+
+
+def linkedin_job_search_slug(query: str, location: str = "") -> str:
+    source = " ".join(item for item in [query, location] if item).strip() or "jobs"
+    slug = re.sub(r"[^a-z0-9]+", "-", source.lower()).strip("-")
+    return (slug or "jobs")[:80]
+
+
+def build_linkedin_job_search_url(query: str, location: str = "") -> tuple[str, dict[str, str]]:
+    clean_query = clean_linkedin_search_term(query, max_length=220)
+    clean_location = clean_linkedin_search_term(location, max_length=120)
+    if not clean_query:
+        raise HTTPException(status_code=400, detail={"code": "empty_linkedin_job_search"})
+    params = {"keywords": clean_query}
+    if clean_location:
+        params["location"] = clean_location
+    url = "https://www.linkedin.com/jobs/search/?" + urlencode(params)
+    return url, {"query": clean_query, "location": clean_location}
+
+
+def normalize_linkedin_contact_search_url(value: str) -> str:
+    parsed = urlparse(str(value or "").strip())
+    host = parsed.netloc.lower()
+    path = re.sub(r"/+", "/", parsed.path or "/")
+    if parsed.scheme not in {"http", "https"}:
+        raise HTTPException(status_code=400, detail={"code": "unsupported_linkedin_contact_search_url"})
+    if host not in {"linkedin.com", "www.linkedin.com"}:
+        raise HTTPException(status_code=400, detail={"code": "unsupported_linkedin_contact_search_url"})
+    if path.rstrip("/") != "/search/results/people":
+        raise HTTPException(status_code=400, detail={"code": "unsupported_linkedin_contact_search_url"})
+    keywords = (parse_qs(parsed.query).get("keywords") or [""])[0].strip()
+    if not keywords:
+        raise HTTPException(status_code=400, detail={"code": "unsupported_linkedin_contact_search_url"})
+    return "https://www.linkedin.com/search/results/people/?" + urlencode({"keywords": keywords[:500]})
+
+
+def normalize_linkedin_job_search_url(value: str) -> str:
+    parsed = urlparse(str(value or "").strip())
+    host = parsed.netloc.lower()
+    path = re.sub(r"/+", "/", parsed.path or "/")
+    if parsed.scheme not in {"http", "https"}:
+        raise HTTPException(status_code=400, detail={"code": "unsupported_linkedin_job_search_url"})
+    if host not in {"linkedin.com", "www.linkedin.com"}:
+        raise HTTPException(status_code=400, detail={"code": "unsupported_linkedin_job_search_url"})
+    if path.rstrip("/") != "/jobs/search":
+        raise HTTPException(status_code=400, detail={"code": "unsupported_linkedin_job_search_url"})
+    query = (parse_qs(parsed.query).get("keywords") or [""])[0].strip()
+    location = (parse_qs(parsed.query).get("location") or [""])[0].strip()
+    if not query:
+        raise HTTPException(status_code=400, detail={"code": "unsupported_linkedin_job_search_url"})
+    params = {"keywords": query[:500]}
+    if location:
+        params["location"] = location[:180]
+    return "https://www.linkedin.com/jobs/search/?" + urlencode(params)
+
+
 def normalize_browser_command_payload(value: Any) -> Optional[dict[str, Any]]:
     if value is None:
         return None
@@ -775,6 +1499,78 @@ def normalize_browser_command_payload(value: Any) -> Optional[dict[str, Any]]:
     if not isinstance(value, dict):
         return None
     action = str(value.get("action") or "")
+    if action == "type_text":
+        text = str(value.get("text") or "")
+        if not text:
+            return None
+        return {
+            "command_id": str(value.get("command_id") or ""),
+            "action": "type_text",
+            "text": text[:2048],
+            "submit": bool(value.get("submit", False)),
+            "created_at": str(value.get("created_at") or ""),
+        }
+    if action == "open_url_direct":
+        try:
+            profile_url = normalize_linkedin_profile_url(str(value.get("url") or ""))
+        except HTTPException:
+            return None
+        return {
+            "command_id": str(value.get("command_id") or ""),
+            "action": "open_url_direct",
+            "source": "linkedin",
+            "url": profile_url,
+            "host_fragment": "linkedin.com",
+            "expected_event_type": str(value.get("expected_event_type") or "linkedin_contact_snapshot"),
+            "created_at": str(value.get("created_at") or ""),
+        }
+    if action == "open_linkedin_job_detail":
+        try:
+            job_url = normalize_linkedin_job_url(str(value.get("url") or ""))
+        except HTTPException:
+            return None
+        return {
+            "command_id": str(value.get("command_id") or ""),
+            "action": "open_linkedin_job_detail",
+            "source": "linkedin",
+            "url": job_url,
+            "host_fragment": "linkedin.com",
+            "expected_event_type": str(value.get("expected_event_type") or "linkedin_job_description_snapshot"),
+            "created_at": str(value.get("created_at") or ""),
+        }
+    if action == "open_linkedin_contact_search":
+        try:
+            search_url = normalize_linkedin_contact_search_url(str(value.get("url") or ""))
+        except HTTPException:
+            return None
+        return {
+            "command_id": str(value.get("command_id") or ""),
+            "action": "open_linkedin_contact_search",
+            "source": "linkedin",
+            "url": search_url,
+            "host_fragment": "linkedin.com",
+            "company": clean_linkedin_search_term(str(value.get("company") or "")),
+            "job_title": clean_linkedin_search_term(str(value.get("job_title") or "")),
+            "location": clean_linkedin_search_term(str(value.get("location") or ""), max_length=120),
+            "expected_event_type": str(value.get("expected_event_type") or "linkedin_contact_snapshot"),
+            "created_at": str(value.get("created_at") or ""),
+        }
+    if action == "open_linkedin_job_search":
+        try:
+            search_url = normalize_linkedin_job_search_url(str(value.get("url") or ""))
+        except HTTPException:
+            return None
+        return {
+            "command_id": str(value.get("command_id") or ""),
+            "action": "open_linkedin_job_search",
+            "source": "linkedin",
+            "url": search_url,
+            "host_fragment": "linkedin.com",
+            "query": clean_linkedin_search_term(str(value.get("query") or ""), max_length=220),
+            "location": clean_linkedin_search_term(str(value.get("location") or ""), max_length=120),
+            "expected_event_type": str(value.get("expected_event_type") or "linkedin_job_search_results"),
+            "created_at": str(value.get("created_at") or ""),
+        }
     source = str(value.get("source") or "")
     target = BROWSER_OPEN_TARGETS.get(source)
     if action != "open_url" or not target:
@@ -869,6 +1665,17 @@ def default_tool_catalog() -> list[dict[str, Any]]:
             "user_jobs": ["搜聊天", "总结对话", "识别约定", "起草回复"],
         },
         {
+            "id": "telegram",
+            "name": "Telegram",
+            "category": "communication",
+            "phase": "core",
+            "recommended_adapter": "managed_browser_first",
+            "permission_levels": ["read_only", "draft", "external_message"],
+            "risk_level": "high",
+            "confirmation_required": True,
+            "user_jobs": ["搜聊天", "总结对话", "识别约定", "起草回复"],
+        },
+        {
             "id": "outlook_graph",
             "name": "Outlook / Microsoft Graph",
             "category": "communication",
@@ -902,17 +1709,6 @@ def default_tool_catalog() -> list[dict[str, Any]]:
             "user_jobs": ["创建待办", "同步提醒", "任务复盘", "跟进承诺"],
         },
         {
-            "id": "apple_reminders_calendar",
-            "name": "Apple Reminders / Calendar",
-            "category": "task",
-            "phase": "recommended",
-            "recommended_adapter": "apple_shortcuts_or_local_bridge",
-            "permission_levels": ["read_only", "write"],
-            "risk_level": "medium",
-            "confirmation_required": True,
-            "user_jobs": ["同步提醒事项", "创建日历", "读取本机任务"],
-        },
-        {
             "id": "github",
             "name": "GitHub",
             "category": "developer",
@@ -933,17 +1729,6 @@ def default_tool_catalog() -> list[dict[str, Any]]:
             "risk_level": "medium",
             "confirmation_required": True,
             "user_jobs": ["查任务", "更新状态", "创建 issue", "整理 sprint"],
-        },
-        {
-            "id": "jira_confluence",
-            "name": "Jira / Confluence",
-            "category": "project",
-            "phase": "recommended",
-            "recommended_adapter": "atlassian_mcp_or_zapier",
-            "permission_levels": ["read_only", "draft", "write"],
-            "risk_level": "medium",
-            "confirmation_required": True,
-            "user_jobs": ["查需求", "更新任务", "总结知识库", "生成文档"],
         },
         {
             "id": "crm",
@@ -1010,6 +1795,28 @@ def default_tool_catalog() -> list[dict[str, Any]]:
             "risk_level": "low",
             "confirmation_required": False,
             "user_jobs": ["查地点", "查路线", "估算通勤", "附近服务"],
+        },
+        {
+            "id": "linkedin_browser",
+            "name": "LinkedIn Browser Workspace",
+            "category": "career",
+            "phase": "core",
+            "recommended_adapter": "managed_browser_with_delegated_automation",
+            "permission_levels": ["read_only", "draft", "external_message", "external_execution"],
+            "risk_level": "high",
+            "confirmation_required": True,
+            "user_jobs": ["发现岗位", "读取 JD", "起草私信", "授权后加人或申请"],
+        },
+        {
+            "id": "ats_job_board",
+            "name": "ATS Job Boards",
+            "category": "career",
+            "phase": "core",
+            "recommended_adapter": "greenhouse_lever_ashby_workable_smartrecruiters",
+            "permission_levels": ["read_only", "draft", "external_execution"],
+            "risk_level": "medium",
+            "confirmation_required": True,
+            "user_jobs": ["读取岗位", "匹配简历", "准备投递", "授权后提交"],
         },
         {
             "id": "browser_automation",
@@ -1145,6 +1952,115 @@ def capability_taxonomy() -> list[dict[str, Any]]:
             "keywords": ["登录账号", "连接账号", "授权", "登录gmail", "登录 whatsapp", "登录 amazon"],
         },
         {
+            "id": "career.job.discover",
+            "domain": "career",
+            "category": "job_search",
+            "action": "discover_jobs",
+            "risk_permission": "read_only",
+            "tool_ids": ["ats_job_board", "linkedin_browser", "gmail", "browser_automation"],
+            "keywords": ["找工作", "求职", "岗位", "职位", "招聘", "job", "jobs", "career", "linkedin"],
+        },
+        {
+            "id": "career.job.recommend",
+            "domain": "career",
+            "category": "job_recommendation",
+            "action": "recommend_jobs",
+            "risk_permission": "read_only",
+            "tool_ids": ["ats_job_board", "linkedin_browser", "gmail", "browser_automation"],
+            "keywords": ["推荐岗位", "推荐职位", "筛选岗位", "筛选 JD", "适合我的岗位", "高匹配岗位", "岗位推荐", "jd推荐"],
+        },
+        {
+            "id": "career.linkedin.contact_search",
+            "domain": "career",
+            "category": "contact_search",
+            "action": "find_recruiter_or_hiring_manager",
+            "risk_permission": "read_only",
+            "tool_ids": ["linkedin_browser", "browser_automation"],
+            "keywords": [
+                "linkedin 搜索",
+                "领英搜索",
+                "搜索 recruiter",
+                "找 recruiter",
+                "hiring manager",
+                "talent acquisition",
+                "招聘负责人",
+                "找 hr",
+                "找HR",
+            ],
+        },
+        {
+            "id": "career.profile.build",
+            "domain": "career",
+            "category": "profile",
+            "action": "build_profile",
+            "risk_permission": "read_only",
+            "tool_ids": ["google_drive_docs", "linkedin_browser"],
+            "keywords": ["职业画像", "职业资料", "我的简历", "career profile"],
+        },
+        {
+            "id": "career.job.fit_score",
+            "domain": "career",
+            "category": "job_match",
+            "action": "score_fit",
+            "risk_permission": "read_only",
+            "tool_ids": ["ats_job_board", "linkedin_browser"],
+            "keywords": ["匹配简历", "岗位匹配", "JD 匹配", "jd匹配", "适合我", "fit score"],
+        },
+        {
+            "id": "career.resume.tailor",
+            "domain": "career",
+            "category": "resume",
+            "action": "tailor_resume",
+            "risk_permission": "draft",
+            "tool_ids": ["google_drive_docs"],
+            "keywords": ["改简历", "优化简历", "定制简历", "tailor resume"],
+        },
+        {
+            "id": "career.cover_letter.draft",
+            "domain": "career",
+            "category": "cover_letter",
+            "action": "draft_cover_letter",
+            "risk_permission": "draft",
+            "tool_ids": ["gmail", "google_drive_docs"],
+            "keywords": ["cover letter", "求职信", "自我介绍", "申请信"],
+        },
+        {
+            "id": "career.outreach.draft",
+            "domain": "career",
+            "category": "outreach",
+            "action": "draft_outreach",
+            "risk_permission": "external_message",
+            "tool_ids": ["linkedin_browser", "gmail", "whatsapp"],
+            "keywords": ["联系 HR", "联系hr", "招聘负责人", "面试官", "内推", "私信", "LinkedIn 发", "linkedin 给"],
+        },
+        {
+            "id": "career.application.prepare_or_submit",
+            "domain": "career",
+            "category": "application",
+            "action": "prepare_or_submit",
+            "risk_permission": "external_execution",
+            "tool_ids": ["ats_job_board", "linkedin_browser", "browser_automation"],
+            "keywords": ["投递", "申请岗位", "Apply", "Submit", "提交申请", "批量投递"],
+        },
+        {
+            "id": "career.application.track",
+            "domain": "career",
+            "category": "tracking",
+            "action": "track_application",
+            "risk_permission": "write",
+            "tool_ids": ["gmail", "google_calendar", "tasks"],
+            "keywords": ["申请记录", "求职看板", "机会阶段", "offer", "面试跟进"],
+        },
+        {
+            "id": "career.interview.prepare",
+            "domain": "career",
+            "category": "interview",
+            "action": "prepare_interview",
+            "risk_permission": "read_only",
+            "tool_ids": ["gmail", "google_calendar", "google_drive_docs"],
+            "keywords": ["准备面试", "面试准备", "interview prep", "面试问题"],
+        },
+        {
             "id": "business.crm.contact.upsert",
             "domain": "business",
             "category": "crm",
@@ -1190,24 +2106,52 @@ def pipeline_definition(
     capability_id: str,
     steps: list[str],
     permission: str,
+    description: Optional[str] = None,
     required_slots: Optional[list[str]] = None,
     allowed_tools: Optional[list[str]] = None,
     forbidden_tools: Optional[list[str]] = None,
     writeback_targets: Optional[list[str]] = None,
     external_effects: Optional[list[str]] = None,
 ) -> dict[str, Any]:
+    effects = external_effects or []
     return {
         "id": pipeline_id,
         "version": "2026-05-28",
         "name": name,
+        "description": description or pipeline_description(name, steps, permission, effects),
         "capability_id": capability_id,
         "steps": steps,
         "permission": permission,
+        "risk": pipeline_risk_metadata(permission, effects),
         "required_slots": required_slots or [],
         "allowed_tools": allowed_tools or [],
         "forbidden_tools": forbidden_tools or [],
         "writeback_targets": writeback_targets or ["task_trace"],
-        "external_effects": external_effects or [],
+        "external_effects": effects,
+    }
+
+
+def pipeline_description(name: str, steps: list[str], permission: str, external_effects: list[str]) -> str:
+    first_steps = "、".join(str(step) for step in steps[:3])
+    effect_text = "；可能产生外部效果：" + "、".join(external_effects) if external_effects else "；不直接执行外部副作用"
+    return f"{name}用于{first_steps}等步骤，权限级别为 {permission}{effect_text}。"
+
+
+def pipeline_risk_metadata(permission: str, external_effects: list[str]) -> dict[str, Any]:
+    confirmation_required = permission in {"write", "external_message", "external_execution", "payment_or_purchase"} or bool(external_effects)
+    return {
+        "permission": permission,
+        "confirmation_required": confirmation_required,
+        "final_user_confirmation": permission in {"external_message", "external_execution", "payment_or_purchase"},
+        "external_side_effects": list(external_effects),
+        "risk_summary": {
+            "read_only": "只读取或整理本地/已授权上下文。",
+            "draft": "只生成草稿或建议，不直接发送或写入外部系统。",
+            "write": "会写入本地或已授权任务/日程系统，需要用户确认。",
+            "external_message": "可能向外部联系人发送消息，必须二次确认。",
+            "external_execution": "可能点击网页或执行外部操作，必须二次确认并受授权额度限制。",
+            "payment_or_purchase": "涉及付款、购买或打车等高风险动作，必须最终确认。",
+        }.get(permission, "未知权限级别，默认要求确认。"),
     }
 
 
@@ -1381,6 +2325,121 @@ def core_pipeline_registry() -> list[dict[str, Any]]:
             external_effects=["write_document", "share_file"],
         ),
         pipeline_definition(
+            pipeline_id="career_profile_pipeline",
+            name="职业画像 Pipeline",
+            capability_id="career.profile.build",
+            steps=["读取简历和求职上下文", "抽取技能和目标", "生成职业画像", "记录证据"],
+            permission="read_only",
+            required_slots=["profile_source"],
+            allowed_tools=["google_drive_docs", "linkedin_browser", "gmail"],
+            writeback_targets=["memory_items", "knowledge_entities", "task_trace"],
+        ),
+        pipeline_definition(
+            pipeline_id="job_discovery_pipeline",
+            name="岗位发现 Pipeline",
+            capability_id="career.job.discover",
+            steps=["解析求职目标", "读取候选来源", "规范化岗位", "输出机会列表"],
+            permission="read_only",
+            required_slots=["query"],
+            allowed_tools=["ats_job_board", "linkedin_browser", "gmail", "browser_automation"],
+            writeback_targets=["job_opportunities", "memory_items", "task_trace"],
+        ),
+        pipeline_definition(
+            pipeline_id="job_recommendation_pipeline",
+            name="岗位推荐 Pipeline",
+            capability_id="career.job.recommend",
+            steps=["读取简历和职业画像", "汇总候选 JD", "批量匹配评分", "生成对话推荐卡"],
+            permission="read_only",
+            required_slots=["resume_id"],
+            allowed_tools=["ats_job_board", "linkedin_browser", "gmail", "browser_automation"],
+            writeback_targets=["job_opportunities", "proactive_suggestions", "assistant_turns", "task_trace"],
+        ),
+        pipeline_definition(
+            pipeline_id="linkedin_contact_search_pipeline",
+            name="LinkedIn 招聘联系人搜索 Pipeline",
+            capability_id="career.linkedin.contact_search",
+            steps=["解析公司和岗位", "生成 LinkedIn people search", "打开候选搜索页", "采样 recruiter / hiring manager 主页"],
+            permission="read_only",
+            required_slots=["company", "job_title"],
+            allowed_tools=["linkedin_browser", "browser_automation"],
+            forbidden_tools=["connect_without_confirmation", "message_without_confirmation", "apply_without_confirmation"],
+            writeback_targets=["task_trace", "collector_health", "memory_items"],
+        ),
+        pipeline_definition(
+            pipeline_id="job_fit_scoring_pipeline",
+            name="岗位匹配评分 Pipeline",
+            capability_id="career.job.fit_score",
+            steps=["读取 JD", "读取简历", "匹配要求", "输出评分"],
+            permission="read_only",
+            required_slots=["job_id", "resume_id"],
+            allowed_tools=["ats_job_board", "linkedin_browser"],
+            writeback_targets=["job_opportunities", "memory_items", "task_trace"],
+        ),
+        pipeline_definition(
+            pipeline_id="resume_tailoring_pipeline",
+            name="简历定制 Pipeline",
+            capability_id="career.resume.tailor",
+            steps=["读取 JD", "读取基础简历", "生成修改草案", "检查无证据声明"],
+            permission="draft",
+            required_slots=["job_id", "resume_id"],
+            allowed_tools=["google_drive_docs"],
+            writeback_targets=["resume_versions", "task_trace"],
+        ),
+        pipeline_definition(
+            pipeline_id="cover_letter_pipeline",
+            name="Cover Letter Pipeline",
+            capability_id="career.cover_letter.draft",
+            steps=["读取 JD", "读取简历", "生成草稿", "检查证据"],
+            permission="draft",
+            required_slots=["job_id", "resume_id"],
+            allowed_tools=["gmail", "google_drive_docs"],
+            writeback_targets=["assistant_turns", "task_trace"],
+        ),
+        pipeline_definition(
+            pipeline_id="outreach_message_pipeline",
+            name="求职外联 Pipeline",
+            capability_id="career.outreach.draft",
+            steps=["识别联系人", "读取 JD 与简历", "生成外联草稿", "阻断直接发送"],
+            permission="external_message",
+            required_slots=["job_id", "resume_id", "recipient", "channel"],
+            allowed_tools=["linkedin_browser", "gmail", "whatsapp"],
+            forbidden_tools=["direct_provider_send_without_confirmation"],
+            writeback_targets=["assistant_turns", "task_trace", "memory_items"],
+            external_effects=["send_message"],
+        ),
+        pipeline_definition(
+            pipeline_id="job_application_pipeline",
+            name="求职申请 Pipeline",
+            capability_id="career.application.prepare_or_submit",
+            steps=["准备申请材料", "检查授权", "生成目标清单", "阻断未授权提交"],
+            permission="external_execution",
+            required_slots=["job_id", "resume_id", "application_action"],
+            allowed_tools=["ats_job_board", "linkedin_browser", "browser_automation"],
+            forbidden_tools=["submit_without_delegated_grant", "challenge_bypass"],
+            writeback_targets=["job_applications", "delegated_automation_grants", "delegated_automation_manifests", "task_trace"],
+            external_effects=["click_apply", "submit_application"],
+        ),
+        pipeline_definition(
+            pipeline_id="application_tracking_pipeline",
+            name="求职机会跟踪 Pipeline",
+            capability_id="career.application.track",
+            steps=["读取机会", "更新阶段", "记录下一步", "安排跟进"],
+            permission="write",
+            required_slots=["job_id", "stage"],
+            allowed_tools=["gmail", "google_calendar", "tasks"],
+            writeback_targets=["job_applications", "agenda_items", "task_trace"],
+        ),
+        pipeline_definition(
+            pipeline_id="interview_prep_pipeline",
+            name="面试准备 Pipeline",
+            capability_id="career.interview.prepare",
+            steps=["读取 JD", "读取简历", "生成问题", "生成回答素材"],
+            permission="read_only",
+            required_slots=["job_id", "resume_id"],
+            allowed_tools=["gmail", "google_calendar", "google_drive_docs"],
+            writeback_targets=["assistant_turns", "task_trace"],
+        ),
+        pipeline_definition(
             pipeline_id="account_login_pipeline",
             name="账号登录 Pipeline",
             capability_id="account.login.manage",
@@ -1518,6 +2577,7 @@ def model_context_necessity_delta(
                 ],
                 "temperature": 0,
                 "stream": False,
+                **qwen_non_thinking_options(MODEL_NAME),
             },
             timeout=20,
         )
@@ -2345,8 +3405,62 @@ def match_capability(request: str) -> dict[str, Any]:
 
 def explicit_capability_id_for_request(request: str) -> Optional[str]:
     lowered = request.lower()
+    has_reply_intent = any(
+        term in lowered
+        for term in [
+            "回复",
+            "回消息",
+            "reply",
+            "respond",
+            "邮件回复",
+            "回这封邮件",
+            "回复这封邮件",
+            "回复这条消息",
+        ]
+    )
+    has_career_discovery_intent = any(
+        term in lowered
+        for term in [
+            "找工作",
+            "求职",
+            "找岗位",
+            "找职位",
+            "找机会",
+            "找工作机会",
+            "工作机会",
+            "招聘信息",
+            "job search",
+            "remote job",
+            "远程工作",
+        ]
+    )
+    has_career_fit_intent = any(
+        term in lowered for term in ["岗位匹配", "jd 匹配", "jd匹配", "适合我", "匹配简历", "fit score"]
+    )
+    has_career_recommendation_intent = (
+        any(term in lowered for term in ["推荐", "筛选", "高匹配", "适合我的", "适合我"])
+        and any(term in lowered for term in ["岗位", "职位", "工作机会", "招聘信息", "工作", "jd", "job", "jobs"])
+    )
+    has_resume_tailor_intent = any(term in lowered for term in ["改简历", "优化简历", "定制简历", "tailor resume"])
+    has_cover_letter_intent = any(term in lowered for term in ["cover letter", "求职信", "申请信"])
+    has_career_outreach_intent = any(
+        term in lowered for term in ["招聘负责人", "联系 hr", "联系hr", "面试官", "内推", "linkedin 给", "linkedin 发", "私信"]
+    )
+    has_linkedin_contact_search_intent = (
+        any(term in lowered for term in ["linkedin", "领英"])
+        and any(term in lowered for term in ["搜索", "找", "查找", "recruiter", "hiring manager", "talent acquisition", "招聘负责人", "hr"])
+        and not any(term in lowered for term in ["linkedin 给", "linkedin 发", "私信", "发消息", "发送"])
+    )
+    has_application_intent = any(
+        term in lowered for term in ["投递", "申请岗位", "apply", "submit", "提交申请", "批量投递"]
+    )
+    has_interview_intent = any(term in lowered for term in ["准备面试", "面试准备", "interview prep", "面试问题"])
     has_ride_intent = any(term in lowered for term in ["打车", "叫车", "uber", "book a ride", "ride"])
     has_route_intent = any(term in lowered for term in ["查路线", "路线", "怎么去", "导航", "多久到", "要多久", "地图", "route", "directions"])
+    has_explicit_route_action = any(
+        term in lowered
+        for term in ["查路线", "查一下路线", "怎么去", "导航", "多久到", "要多久", "地图", "route", "directions"]
+    )
     has_payment_intent = bool(BILL_ID_RE.search(request)) or any(
         term in lowered for term in ["invoice", "bill", "付款", "支付", "账单", "发票", "报销", "转账", "还款", "欠款"]
     )
@@ -2366,12 +3480,34 @@ def explicit_capability_id_for_request(request: str) -> Optional[str]:
             "总结这个文档",
         ]
     )
+    if has_application_intent:
+        return "career.application.prepare_or_submit"
+    if has_linkedin_contact_search_intent:
+        return "career.linkedin.contact_search"
+    if has_career_outreach_intent:
+        return "career.outreach.draft"
+    if has_cover_letter_intent:
+        return "career.cover_letter.draft"
+    if has_resume_tailor_intent:
+        return "career.resume.tailor"
+    if has_career_recommendation_intent:
+        return "career.job.recommend"
+    if has_career_fit_intent:
+        return "career.job.fit_score"
+    if has_interview_intent:
+        return "career.interview.prepare"
+    if has_career_discovery_intent:
+        return "career.job.discover"
+    if has_reply_intent:
+        return "communication.message.draft_reply"
     if has_payment_intent:
         return "finance.payment_bill.manage"
-    if has_document_intent:
-        return "files.document.process"
     if has_ride_intent:
         return "local_service.ride.estimate_or_book"
+    if has_explicit_route_action:
+        return "local_service.route.lookup"
+    if has_document_intent:
+        return "files.document.process"
     if has_route_intent:
         return "local_service.route.lookup"
     return None
@@ -2479,6 +3615,7 @@ def extract_after_marker(text: str, markers: list[str]) -> Optional[str]:
 def strip_travel_suffix(value: str) -> str:
     cleaned = value.strip(" ：:，,。.!！?？")
     cleaned = re.sub(r"(要多久|多久到|怎么去|路线|导航|打车|叫车|uber|eta).*$", "", cleaned, flags=re.I)
+    cleaned = re.sub(r"(见面|碰面|集合|会合|汇合|见|等)$", "", cleaned.strip())
     cleaned = re.sub(r"(?:的|地)$", "", cleaned.strip())
     return cleaned.strip(" ：:，,。.!！?？")
 
@@ -2487,10 +3624,18 @@ def extract_destination_slot(request: str, context: dict[str, Any]) -> Optional[
     explicit = context.get("destination") or context.get("place")
     if explicit:
         return str(explicit)
+    meeting_match = re.search(
+        r"(?:在|约在)([A-Za-z0-9\u4e00-\u9fff ._-]{2,80}?)(?:见|见面|碰面|集合|会合|等|汇合)",
+        request,
+    )
+    if meeting_match:
+        destination = strip_travel_suffix(meeting_match.group(1))
+        if destination:
+            return destination
     match = re.search(r"(?:去|到|至|前往)([A-Za-z0-9\u4e00-\u9fff ._-]{2,80})", request)
     if match:
         destination = strip_travel_suffix(match.group(1))
-        if destination:
+        if destination and destination not in {"前", "之前", "时候"} and not destination.startswith("前请"):
             return destination
     return None
 
@@ -2502,6 +3647,11 @@ def recipient_from_active_scope(context: dict[str, Any]) -> Optional[str]:
         scope.get("contact_name"),
         scope.get("counterparty_name"),
         scope.get("chat_name"),
+        scope.get("sender_name"),
+        scope.get("sender"),
+        scope.get("from"),
+        scope.get("email"),
+        scope.get("contact_email"),
     ]
     counterparty_ids = scope.get("counterparty_ids")
     if isinstance(counterparty_ids, list):
@@ -2520,6 +3670,8 @@ def extract_recipient_slot(request: str, context: dict[str, Any]) -> Optional[st
     match = re.search(r"(?:回复|回消息给?|给)\s*([A-Za-z][\w .'-]{1,60}|[\u4e00-\u9fff]{2,12})", request, flags=re.I)
     if match:
         recipient = re.split(r"[,，。.!！?？；;]|说|告诉|发", match.group(1).strip(), 1)[0]
+        if recipient in {"这封邮件", "这条消息", "这个消息", "这段话", "对方", "那边"} or recipient.startswith(("这封", "这条", "这个")):
+            return recipient_from_active_scope(context)
         return recipient.strip()
     if any(token in request for token in ["她", "他", "对方", "ta", "TA", "那边"]):
         return recipient_from_active_scope(context)
@@ -2624,6 +3776,7 @@ def call_pipeline_slot_model(
                 ],
                 "temperature": 0,
                 "stream": False,
+                **qwen_non_thinking_options(MODEL_NAME),
             },
             timeout=20,
         )
@@ -3392,6 +4545,22 @@ def stable_uuid_from_value(value: Any) -> uuid.UUID:
     return uuid.uuid4()
 
 
+def is_uuid_text(value: Any) -> bool:
+    if not value:
+        return False
+    try:
+        uuid.UUID(str(value))
+        return True
+    except (TypeError, ValueError):
+        return False
+
+
+def uuid_texts_only(values: Any) -> list[str]:
+    if not isinstance(values, list):
+        values = list(values or [])
+    return [str(value) for value in values if is_uuid_text(value)]
+
+
 def stable_uuid_text(value: Any) -> str:
     return str(stable_uuid_from_value(value))
 
@@ -3746,17 +4915,217 @@ def apply_pipeline_writeback_target(conn: psycopg.Connection, result: dict[str, 
             ),
         )
     elif target == "proactive_suggestions":
+        suggestion_id = str(uuid.uuid4())
+        metadata_payload = data.get("metadata") if isinstance(data.get("metadata"), dict) else {}
+        metadata_payload = dict(metadata_payload)
+        if data.get("source_event_id") and "source_event_id" not in metadata_payload:
+            metadata_payload["source_event_id"] = data.get("source_event_id")
+        if data.get("expires_at") and "expires_at" not in metadata_payload:
+            metadata_payload["expires_at"] = data.get("expires_at")
+        if data.get("dedupe_key") and "dedupe_key" not in metadata_payload:
+            metadata_payload["dedupe_key"] = data.get("dedupe_key")
+        dedupe_key = str(metadata_payload.get("dedupe_key") or "").strip()
+        if dedupe_key:
+            existing = conn.execute(
+                """
+                SELECT id
+                FROM proactive_suggestions
+                WHERE metadata->>'dedupe_key' = %s
+                  AND status IN ('open', 'snoozed', 'dismissed', 'done')
+                ORDER BY updated_at DESC
+                LIMIT 1
+                """,
+                (dedupe_key,),
+            ).fetchone()
+            if existing:
+                return
         conn.execute(
             """
-            INSERT INTO proactive_suggestions (id, title, body, priority, status, metadata, created_at, updated_at)
-            VALUES (%s, %s, %s, %s, %s, %s::jsonb, now(), now())
+            INSERT INTO proactive_suggestions (id, source_event_id, title, body, priority, status, metadata, created_at, updated_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb, now(), now())
             """,
             (
-                str(uuid.uuid4()),
+                suggestion_id,
+                None,
                 str(data.get("title") or ""),
                 str(data.get("body") or ""),
                 float(data.get("priority") or 0),
                 str(data.get("status") or "open"),
+                json.dumps(metadata_payload, ensure_ascii=False, default=str),
+            ),
+        )
+        data["id"] = suggestion_id
+        publish_realtime_message_safely(
+            suggestion_to_realtime_message(
+                {
+                    "id": suggestion_id,
+                    "source_event_id": None,
+                    "title": data.get("title") or "",
+                    "body": data.get("body") or "",
+                    "priority": data.get("priority") or 0,
+                    "status": data.get("status") or "open",
+                    "metadata": metadata_payload,
+                    "created_at": datetime.now(timezone.utc).isoformat(),
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                }
+            )
+        )
+    elif target == "career_profiles":
+        profile_id = str(data.get("career_profile_id") or data.get("profile_id") or "career_profile_default")
+        conn.execute(
+            """
+            INSERT INTO career_profiles (id, headline, target_roles, target_locations, skills, source_event_ids, payload, updated_at)
+            VALUES (%s, %s, %s::TEXT[], %s::TEXT[], %s::TEXT[], %s::TEXT[], %s::jsonb, now())
+            ON CONFLICT (id) DO UPDATE SET
+              headline = COALESCE(NULLIF(EXCLUDED.headline, ''), career_profiles.headline),
+              target_roles = CASE WHEN cardinality(EXCLUDED.target_roles) > 0 THEN EXCLUDED.target_roles ELSE career_profiles.target_roles END,
+              target_locations = CASE WHEN cardinality(EXCLUDED.target_locations) > 0 THEN EXCLUDED.target_locations ELSE career_profiles.target_locations END,
+              skills = CASE WHEN cardinality(EXCLUDED.skills) > 0 THEN EXCLUDED.skills ELSE career_profiles.skills END,
+              source_event_ids = CASE WHEN cardinality(EXCLUDED.source_event_ids) > 0 THEN EXCLUDED.source_event_ids ELSE career_profiles.source_event_ids END,
+              payload = career_profiles.payload || EXCLUDED.payload,
+              updated_at = now()
+            """,
+            (
+                profile_id,
+                str(data.get("headline") or ""),
+                [str(item) for item in data.get("target_roles") or []],
+                [str(item) for item in data.get("target_locations") or []],
+                [str(item) for item in data.get("skills") or []],
+                [str(item) for item in data.get("source_event_ids") or result.get("source_event_ids") or []],
+                json.dumps(data, ensure_ascii=False, default=str),
+            ),
+        )
+    elif target == "career_resumes":
+        resume_id = str(data.get("resume_id") or data.get("id") or stable_uuid_text(data.get("filename") or result.get("task_trace_id")))
+        conn.execute(
+            """
+            INSERT INTO career_resumes (
+              id, filename, file_type, status, source_event_ids, parsed_text, payload, created_at, updated_at
+            )
+            VALUES (%s, %s, %s, %s, %s::TEXT[], %s, %s::jsonb, now(), now())
+            ON CONFLICT (id) DO UPDATE SET
+              filename = COALESCE(NULLIF(EXCLUDED.filename, ''), career_resumes.filename),
+              file_type = COALESCE(NULLIF(EXCLUDED.file_type, ''), career_resumes.file_type),
+              status = COALESCE(NULLIF(EXCLUDED.status, ''), career_resumes.status),
+              source_event_ids = CASE WHEN cardinality(EXCLUDED.source_event_ids) > 0 THEN EXCLUDED.source_event_ids ELSE career_resumes.source_event_ids END,
+              parsed_text = COALESCE(NULLIF(EXCLUDED.parsed_text, ''), career_resumes.parsed_text),
+              payload = career_resumes.payload || EXCLUDED.payload,
+              updated_at = now()
+            """,
+            (
+                resume_id,
+                str(data.get("filename") or ""),
+                str(data.get("file_type") or ""),
+                str(data.get("status") or "active"),
+                [str(item) for item in data.get("source_event_ids") or result.get("source_event_ids") or []],
+                str(data.get("parsed_text") or ""),
+                json.dumps(data, ensure_ascii=False, default=str),
+            ),
+        )
+    elif target == "job_opportunities":
+        source_event_ids = data.get("source_event_ids") or result.get("source_event_ids") or (result.get("input") or {}).get("source_event_ids") or []
+        if is_low_value_career_opportunity(data):
+            return
+        job_id = str(
+            data.get("job_id")
+            or data.get("id")
+            or (result.get("resolved_slots") or {}).get("job_id")
+            or stable_uuid_text(data.get("url") or data.get("title") or result.get("task_trace_id"))
+        )
+        conn.execute(
+            """
+            INSERT INTO job_opportunities (
+              id, source, title, company, location, url, status, fit_score,
+              requirements, source_event_ids, payload, created_at, updated_at
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s::TEXT[], %s::jsonb, now(), now())
+            ON CONFLICT (id) DO UPDATE SET
+              source = COALESCE(NULLIF(EXCLUDED.source, ''), job_opportunities.source),
+              title = COALESCE(NULLIF(EXCLUDED.title, ''), job_opportunities.title),
+              company = COALESCE(NULLIF(EXCLUDED.company, ''), job_opportunities.company),
+              location = COALESCE(NULLIF(EXCLUDED.location, ''), job_opportunities.location),
+              url = COALESCE(NULLIF(EXCLUDED.url, ''), job_opportunities.url),
+              status = COALESCE(NULLIF(EXCLUDED.status, ''), job_opportunities.status),
+              fit_score = COALESCE(EXCLUDED.fit_score, job_opportunities.fit_score),
+              requirements = CASE WHEN EXCLUDED.requirements <> '[]'::jsonb THEN EXCLUDED.requirements ELSE job_opportunities.requirements END,
+              source_event_ids = CASE WHEN cardinality(EXCLUDED.source_event_ids) > 0 THEN EXCLUDED.source_event_ids ELSE job_opportunities.source_event_ids END,
+              payload = job_opportunities.payload || EXCLUDED.payload,
+              updated_at = now()
+            """,
+            (
+                job_id,
+                str(data.get("source") or ""),
+                str(data.get("title") or ""),
+                str(data.get("company") or ""),
+                str(data.get("location") or ""),
+                str(data.get("url") or data.get("profile_url") or ""),
+                str(data.get("status") or data.get("stage") or plan.get("operation") or "tracked"),
+                data.get("fit_score"),
+                json.dumps(data.get("requirements") or [], ensure_ascii=False, default=str),
+                [str(item) for item in source_event_ids],
+                json.dumps(data, ensure_ascii=False, default=str),
+            ),
+        )
+    elif target == "resume_versions":
+        base_resume_id = str(data.get("base_resume_id") or data.get("resume_id") or (result.get("resolved_slots") or {}).get("resume_id") or "")
+        target_job_id = str(data.get("target_job_id") or data.get("job_id") or (result.get("resolved_slots") or {}).get("job_id") or "")
+        version_id = str(data.get("resume_version_id") or data.get("version_id") or f"resume_version_{base_resume_id or 'unknown'}_{target_job_id or 'unknown'}")
+        source_event_ids = data.get("source_event_ids") or result.get("source_event_ids") or (result.get("input") or {}).get("source_event_ids") or []
+        conn.execute(
+            """
+            INSERT INTO resume_versions (
+              id, base_resume_id, target_job_id, status, source_event_ids, payload, created_at, updated_at
+            )
+            VALUES (%s, %s, %s, %s, %s::TEXT[], %s::jsonb, now(), now())
+            ON CONFLICT (id) DO UPDATE SET
+              base_resume_id = COALESCE(NULLIF(EXCLUDED.base_resume_id, ''), resume_versions.base_resume_id),
+              target_job_id = COALESCE(NULLIF(EXCLUDED.target_job_id, ''), resume_versions.target_job_id),
+              status = EXCLUDED.status,
+              source_event_ids = CASE WHEN cardinality(EXCLUDED.source_event_ids) > 0 THEN EXCLUDED.source_event_ids ELSE resume_versions.source_event_ids END,
+              payload = resume_versions.payload || EXCLUDED.payload,
+              updated_at = now()
+            """,
+            (
+                version_id,
+                base_resume_id,
+                target_job_id,
+                str(data.get("status") or plan.get("operation") or result.get("status") or "draft"),
+                [str(item) for item in source_event_ids],
+                json.dumps(data, ensure_ascii=False, default=str),
+            ),
+        )
+    elif target == "job_applications":
+        job_id = str(data.get("job_id") or (result.get("resolved_slots") or {}).get("job_id") or "")
+        action = str(data.get("application_action") or data.get("action") or plan.get("operation") or "")
+        application_id = str(data.get("application_id") or data.get("id") or f"application_{job_id or 'unknown'}_{action or data.get('stage') or 'track'}")
+        source_event_ids = data.get("source_event_ids") or result.get("source_event_ids") or (result.get("input") or {}).get("source_event_ids") or []
+        conn.execute(
+            """
+            INSERT INTO job_applications (
+              id, job_id, status, stage, next_step, application_action,
+              platform, source_event_ids, payload, created_at, updated_at
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s::TEXT[], %s::jsonb, now(), now())
+            ON CONFLICT (id) DO UPDATE SET
+              job_id = COALESCE(NULLIF(EXCLUDED.job_id, ''), job_applications.job_id),
+              status = EXCLUDED.status,
+              stage = COALESCE(NULLIF(EXCLUDED.stage, ''), job_applications.stage),
+              next_step = COALESCE(NULLIF(EXCLUDED.next_step, ''), job_applications.next_step),
+              application_action = COALESCE(NULLIF(EXCLUDED.application_action, ''), job_applications.application_action),
+              platform = COALESCE(NULLIF(EXCLUDED.platform, ''), job_applications.platform),
+              source_event_ids = CASE WHEN cardinality(EXCLUDED.source_event_ids) > 0 THEN EXCLUDED.source_event_ids ELSE job_applications.source_event_ids END,
+              payload = job_applications.payload || EXCLUDED.payload,
+              updated_at = now()
+            """,
+            (
+                application_id,
+                job_id,
+                str(data.get("status") or data.get("stage") or result.get("status") or "tracked"),
+                str(data.get("stage") or data.get("status") or ""),
+                str(data.get("next_step") or ""),
+                action,
+                str(data.get("platform") or ""),
+                [str(item) for item in source_event_ids],
                 json.dumps(data, ensure_ascii=False, default=str),
             ),
         )
@@ -3967,6 +5336,34 @@ def isoformat_or_value(value: Any) -> Any:
     return value.isoformat() if hasattr(value, "isoformat") else value
 
 
+AGENDA_WEEKDAY_LABELS = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
+RELATIVE_TIME_MARKERS = ("今天", "明天", "后天", "今晚", "明早", "明晚")
+
+
+def canonical_agenda_time_window(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    time_window = dict(value)
+    raw_start = time_window.get("start") or time_window.get("at") or time_window.get("start_at")
+    if not raw_start:
+        return time_window
+    try:
+        start = datetime.fromisoformat(str(raw_start).replace("Z", "+00:00"))
+    except ValueError:
+        return time_window
+    display = f"{start.date().isoformat()} {AGENDA_WEEKDAY_LABELS[start.weekday()]} {start:%H:%M}"
+    current_text = str(time_window.get("text") or "").strip()
+    if not time_window.get("display") or any(marker in current_text for marker in RELATIVE_TIME_MARKERS):
+        time_window["display"] = display
+    if not current_text or any(marker in current_text for marker in RELATIVE_TIME_MARKERS):
+        time_window["text"] = display
+    time_window.setdefault("date", start.date().isoformat())
+    time_window.setdefault("weekday", AGENDA_WEEKDAY_LABELS[start.weekday()])
+    time_window.setdefault("display_date", start.date().isoformat())
+    time_window.setdefault("display_time", f"{start:%H:%M}")
+    return time_window
+
+
 def agenda_item_from_row(row: Any) -> dict[str, Any]:
     source_event_ids = [str(item) for item in (row[11] or [])]
     metadata = row[12] or {}
@@ -3976,7 +5373,7 @@ def agenda_item_from_row(row: Any) -> dict[str, Any]:
         "title": row[2],
         "status": row[3],
         "certainty": row[4],
-        "time_window": row[5] or {},
+        "time_window": canonical_agenda_time_window(row[5] or {}),
         "place": row[6] or "",
         "participants": row[7] or [],
         "missing_fields": row[8] or [],
@@ -4017,9 +5414,12 @@ def agenda_snapshot(item: dict[str, Any]) -> dict[str, Any]:
 def fetch_agenda_item(conn: psycopg.Connection, agenda_id: str) -> Optional[dict[str, Any]]:
     row = conn.execute(
         """
-        SELECT id, type, title, status, certainty, time_window, place, participants,
-               missing_fields, needs_clarification, confidence, source_event_ids,
-               metadata, created_at, updated_at,
+        SELECT agenda_items.id, agenda_items.type, agenda_items.title, agenda_items.status,
+               agenda_items.certainty, agenda_items.time_window, agenda_items.place,
+               agenda_items.participants, agenda_items.missing_fields,
+               agenda_items.needs_clarification, agenda_items.confidence,
+               agenda_items.source_event_ids, agenda_items.metadata,
+               agenda_items.created_at, agenda_items.updated_at,
                latest.operation, latest.reason, latest.created_at
         FROM agenda_items
         LEFT JOIN LATERAL (
@@ -4707,6 +6107,62 @@ def composio_link_request_fields(connection_request: Any) -> dict[str, Any]:
     }
 
 
+def persist_already_connected_composio_state(
+    *,
+    user_id: str,
+    toolkit_slug: str,
+    session_kind: str,
+    session_id: str,
+    connected_account_id: str,
+) -> bool:
+    try:
+        with db() as conn:
+            conn.execute(
+                """
+                INSERT INTO composio_connect_requests (
+                  id, user_id, toolkit_slug, session_kind, session_id, connection_request_id,
+                  redirect_url, connected_account_id, status, expires_at, metadata, updated_at
+                )
+                VALUES (%s, %s, %s, %s, %s, '', '', %s, 'already_connected', NULL, %s::jsonb, now())
+                """,
+                (
+                    uuid.uuid4(),
+                    user_id,
+                    toolkit_slug,
+                    session_kind,
+                    session_id,
+                    connected_account_id,
+                    json.dumps({"source": "composio", "connection_checked": True}, ensure_ascii=False),
+                ),
+            )
+            conn.execute(
+                """
+                INSERT INTO account_connections (provider, status, metadata, updated_at)
+                VALUES (%s, 'connected', %s::jsonb, now())
+                ON CONFLICT (provider) DO UPDATE
+                SET status = EXCLUDED.status,
+                    metadata = EXCLUDED.metadata,
+                    updated_at = now()
+                """,
+                (
+                    toolkit_slug,
+                    json.dumps(
+                        {
+                            "source": "composio",
+                            "session_kind": session_kind,
+                            "session_id": session_id,
+                            "connected_account_id": connected_account_id,
+                            "connection_checked": True,
+                        },
+                        ensure_ascii=False,
+                    ),
+                ),
+            )
+        return True
+    except Exception:
+        return False
+
+
 def create_composio_connect_link(toolkit_slug: str, requested_kind: str = "", force: bool = False) -> dict[str, Any]:
     slug = toolkit_slug.lower().strip()
     session_kind = choose_composio_session_kind(slug, requested_kind)
@@ -4715,6 +6171,14 @@ def create_composio_connect_link(toolkit_slug: str, requested_kind: str = "", fo
     connected_toolkit = None if force else composio_session_connected_toolkit(session, slug)
     if connected_toolkit:
         session_payload = public_composio_session_payload(session, policy)
+        connected_account_id = connected_toolkit.get("connected_account_id", "")
+        local_audit_persisted = persist_already_connected_composio_state(
+            user_id=user_id,
+            toolkit_slug=slug,
+            session_kind=session_kind,
+            session_id=session_payload["session_id"],
+            connected_account_id=connected_account_id,
+        )
         return {
             "status": "already_connected",
             "toolkit_slug": slug,
@@ -4722,8 +6186,9 @@ def create_composio_connect_link(toolkit_slug: str, requested_kind: str = "", fo
             "user_id": user_id,
             "redirect_url": "",
             "connection_request_id": "",
-            "connected_account_id": connected_toolkit.get("connected_account_id", ""),
+            "connected_account_id": connected_account_id,
             "expires_at": None,
+            "local_audit_persisted": local_audit_persisted,
             "session": session_payload,
         }
     callback_url = composio_callback_for_toolkit(slug, session_kind)
@@ -5062,6 +6527,163 @@ def composio_tool_execution_policy(tool_slug: str) -> dict[str, Any]:
         "risk_level": "external_write",
         "action_type": "composio.execute_tool",
         "expected_effect": "Unknown Composio tool risk; require explicit confirmation before live execution.",
+    }
+
+
+def delegated_provider_url_for_grant(grant: DelegationGrant) -> tuple[str, str]:
+    platform = grant.platform.lower().strip()
+    action = grant.action.lower().strip()
+    if platform in {"linkedin", "ats", "greenhouse", "lever", "ashby", "workable", "smartrecruiters"}:
+        return os.getenv("NOMI_BROWSER_EXECUTOR_URL", "").strip(), "NOMI_BROWSER_EXECUTOR_URL"
+    if platform in {"google_docs", "google_drive_docs"} or action in {"write_document", "update_document"}:
+        return os.getenv("NOMI_GOOGLE_DOCS_PROVIDER_URL", "").strip(), "NOMI_GOOGLE_DOCS_PROVIDER_URL"
+    return os.getenv("NOMI_EXTERNAL_EXECUTOR_URL", "").strip(), "NOMI_EXTERNAL_EXECUTOR_URL"
+
+
+def delegated_provider_headers(required_env: str) -> dict[str, str]:
+    headers = {"Content-Type": "application/json"}
+    token_env = {
+        "NOMI_BROWSER_EXECUTOR_URL": "NOMI_BROWSER_EXECUTOR_TOKEN",
+        "NOMI_GOOGLE_DOCS_PROVIDER_URL": "NOMI_GOOGLE_DOCS_PROVIDER_TOKEN",
+        "NOMI_EXTERNAL_EXECUTOR_URL": "NOMI_EXTERNAL_EXECUTOR_TOKEN",
+    }.get(required_env, "NOMI_EXTERNAL_EXECUTOR_TOKEN")
+    token = os.getenv(token_env, "").strip()
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    return headers
+
+
+def normalize_delegated_provider_result(raw: Any, *, provider: str) -> dict[str, Any]:
+    payload = raw if isinstance(raw, dict) else {"raw": raw}
+    status = str(payload.get("status") or "completed")
+    evidence_ids = text_list(payload.get("evidence_ids") or payload.get("evidence") or [])
+    return {
+        "status": status,
+        "provider": str(payload.get("provider") or provider),
+        "result_summary": str(payload.get("result_summary") or payload.get("summary") or status),
+        "evidence_ids": evidence_ids,
+        "metadata": payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {},
+    }
+
+
+def run_delegated_automation_provider(
+    *,
+    grant: DelegationGrant,
+    manifest: TargetManifest,
+    target: ManifestTarget,
+    decision: AutomationDecision,
+    request: dict[str, Any],
+) -> dict[str, Any]:
+    url, required_env = delegated_provider_url_for_grant(grant)
+    if not url:
+        return {
+            "status": "misconfigured",
+            "provider": "delegated_external_executor",
+            "required_env": required_env,
+            "result_summary": f"Provider is not configured: set {required_env}.",
+            "evidence_ids": [],
+            "metadata": {"platform": grant.platform, "action": grant.action},
+        }
+    provider_payload = {
+        "grant": grant.to_dict(),
+        "manifest": manifest.to_dict(),
+        "target": target.to_dict(),
+        "decision": decision.to_dict(),
+        "request": dict(request or {}),
+    }
+    try:
+        response = httpx.post(
+            url,
+            json=provider_payload,
+            headers=delegated_provider_headers(required_env),
+            timeout=60,
+        )
+        response.raise_for_status()
+        return normalize_delegated_provider_result(response.json(), provider=required_env)
+    except httpx.HTTPError as exc:
+        return {
+            "status": "failed",
+            "provider": required_env,
+            "result_summary": f"Provider request failed: {str(exc)[:300]}",
+            "evidence_ids": [],
+            "metadata": {"platform": grant.platform, "action": grant.action},
+        }
+
+
+def delegated_automation_dry_run_steps(grant: DelegationGrant, target: ManifestTarget) -> list[dict[str, Any]]:
+    action = grant.action.lower().strip()
+    target_url = target.profile_url or str(target.metadata.get("url") or "")
+    steps: list[dict[str, Any]] = [
+        {
+            "id": "open_target",
+            "label": "Open target page",
+            "expected_result": target_url or target.name or target.target_id,
+        },
+        {
+            "id": "verify_target",
+            "label": "Verify target identity and page state",
+            "expected_result": {
+                "target_id": target.target_id,
+                "name": target.name,
+                "company": target.company,
+                "risk": target.risk,
+            },
+        },
+        {
+            "id": "load_grounded_content",
+            "label": "Load grounded JD/resume/draft evidence",
+            "expected_result": "Only use approved evidence ids from the decision.",
+        },
+    ]
+    action_step = {
+        "send_message": ("prepare_message_click_path", "Would open message composer and paste the grounded draft."),
+        "request_connection": ("prepare_connect_click_path", "Would open connection dialog and attach the grounded note if allowed."),
+        "submit_application": ("prepare_apply_submit_path", "Would click Apply/Submit only after target, form, and confirmation checks pass."),
+        "write_document": ("prepare_document_write", "Would write the approved document content to the configured document provider."),
+    }.get(action, ("prepare_external_action", f"Would execute delegated action {grant.action}."))
+    steps.append({"id": action_step[0], "label": action_step[1], "expected_result": "side effect is not performed during dry-run"})
+    steps.append(
+        {
+            "id": "capture_audit_evidence",
+            "label": "Capture screenshots/DOM evidence before any real side effect",
+            "expected_result": "audit evidence would be attached to a completed trace during real execution",
+        }
+    )
+    return steps
+
+
+def run_delegated_automation_dry_run(
+    *,
+    grant: DelegationGrant,
+    manifest: TargetManifest,
+    target: ManifestTarget,
+    decision: AutomationDecision,
+    request: dict[str, Any],
+) -> dict[str, Any]:
+    plan = {
+        "would_execute": True,
+        "dry_run": True,
+        "scenario": grant.scenario,
+        "platform": grant.platform,
+        "surface": grant.surface,
+        "action": grant.action,
+        "automation_level": grant.automation_level,
+        "grant_id": grant.grant_id,
+        "manifest_id": manifest.manifest_id,
+        "target": target.to_dict(),
+        "evidence_ids": list(decision.evidence_ids),
+        "request": dict(request or {}),
+        "steps": delegated_automation_dry_run_steps(grant, target),
+    }
+    return {
+        "status": "dry_run_ready",
+        "provider": "delegated_dry_run_executor",
+        "result_summary": (
+            f"Dry-run ready for {grant.platform}.{grant.action} on {target.target_id}; "
+            "no external side effect was performed."
+        ),
+        "evidence_ids": list(decision.evidence_ids),
+        "metadata": {"dry_run": True, "execution_plan": plan},
     }
 
 
@@ -5515,6 +7137,12 @@ def ensure_model_gateway_schema() -> None:
         )
 
 
+def ensure_ios_live_activity_schema() -> None:
+    with db() as conn:
+        for sql in ios_live_activity_schema_sql():
+            conn.execute(sql)
+
+
 def ensure_assistant_context_schema() -> None:
     with db() as conn:
         conn.execute(
@@ -5545,6 +7173,28 @@ def ensure_assistant_context_schema() -> None:
             )
             """
         )
+        conn.execute("ALTER TABLE assistant_turns ADD COLUMN IF NOT EXISTS memory_batch_id UUID")
+        conn.execute("ALTER TABLE assistant_turns ADD COLUMN IF NOT EXISTS memory_enqueue_policy TEXT NOT NULL DEFAULT 'auto'")
+        conn.execute("ALTER TABLE assistant_turns ADD COLUMN IF NOT EXISTS memory_enqueued_at TIMESTAMPTZ")
+        conn.execute("ALTER TABLE assistant_turns ADD COLUMN IF NOT EXISTS memory_pending BOOLEAN NOT NULL DEFAULT TRUE")
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS conversation_memory_batches (
+              id UUID PRIMARY KEY,
+              conversation_id UUID NOT NULL REFERENCES assistant_conversations(id) ON DELETE CASCADE,
+              start_turn_id UUID NOT NULL,
+              end_turn_id UUID NOT NULL,
+              round_count INTEGER NOT NULL,
+              turn_count INTEGER NOT NULL,
+              event_id UUID NOT NULL,
+              status TEXT NOT NULL DEFAULT 'queued',
+              created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+              enqueued_at TIMESTAMPTZ,
+              processed_at TIMESTAMPTZ,
+              payload JSONB NOT NULL DEFAULT '{}'::jsonb
+            )
+            """
+        )
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS context_snapshots (
@@ -5556,6 +7206,24 @@ def ensure_assistant_context_schema() -> None:
               included_agenda_ids TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[],
               reason TEXT NOT NULL DEFAULT '',
               payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+              created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS context_route_traces (
+              id UUID PRIMARY KEY,
+              event_id UUID REFERENCES events(event_id) ON DELETE CASCADE,
+              conversation_id UUID REFERENCES assistant_conversations(id) ON DELETE CASCADE,
+              intent TEXT NOT NULL,
+              reason TEXT NOT NULL DEFAULT '',
+              route_decision JSONB NOT NULL DEFAULT '{}'::jsonb,
+              fetch_limits JSONB NOT NULL DEFAULT '{}'::jsonb,
+              fetch_latency JSONB NOT NULL DEFAULT '{}'::jsonb,
+              layer_counts JSONB NOT NULL DEFAULT '{}'::jsonb,
+              fusion_summary JSONB NOT NULL DEFAULT '{}'::jsonb,
+              token_budget JSONB NOT NULL DEFAULT '{}'::jsonb,
               created_at TIMESTAMPTZ NOT NULL DEFAULT now()
             )
             """
@@ -5574,8 +7242,46 @@ def ensure_assistant_context_schema() -> None:
         )
         conn.execute(
             """
+            CREATE INDEX IF NOT EXISTS assistant_turns_memory_pending_idx
+            ON assistant_turns(conversation_id, created_at ASC)
+            WHERE memory_pending = TRUE
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS conversation_memory_batches_conversation_idx
+            ON conversation_memory_batches(conversation_id, created_at DESC)
+            """
+        )
+        conn.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS conversation_memory_batches_event_idx
+            ON conversation_memory_batches(event_id)
+            """
+        )
+        conn.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS assistant_turns_tool_call_id_role_idx
+            ON assistant_turns(tool_call_id, role)
+            WHERE tool_call_id IS NOT NULL
+            """
+        )
+        conn.execute(
+            """
             CREATE INDEX IF NOT EXISTS context_snapshots_event_idx
             ON context_snapshots(event_id, created_at DESC)
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS context_route_traces_conversation_idx
+            ON context_route_traces(conversation_id, created_at DESC)
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS context_route_traces_event_idx
+            ON context_route_traces(event_id, created_at DESC)
             """
         )
 
@@ -5620,6 +7326,12 @@ def ensure_proactive_feedback_schema() -> None:
             """
             CREATE INDEX IF NOT EXISTS proactive_candidates_decision_idx
             ON proactive_candidates(decision, created_at DESC)
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS proactive_suggestions_dedupe_idx
+            ON proactive_suggestions ((metadata->>'dedupe_key'), status, updated_at DESC)
             """
         )
         conn.execute(
@@ -6044,6 +7756,85 @@ def ensure_pipeline_local_state_schema() -> None:
         )
         conn.execute(
             """
+            CREATE TABLE IF NOT EXISTS career_profiles (
+              id TEXT PRIMARY KEY,
+              headline TEXT NOT NULL DEFAULT '',
+              target_roles TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[],
+              target_locations TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[],
+              skills TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[],
+              source_event_ids TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[],
+              payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+              updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS career_resumes (
+              id TEXT PRIMARY KEY,
+              filename TEXT NOT NULL DEFAULT '',
+              file_type TEXT NOT NULL DEFAULT '',
+              status TEXT NOT NULL DEFAULT 'active',
+              source_event_ids TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[],
+              parsed_text TEXT NOT NULL DEFAULT '',
+              payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+              created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+              updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS job_opportunities (
+              id TEXT PRIMARY KEY,
+              source TEXT NOT NULL DEFAULT '',
+              title TEXT NOT NULL DEFAULT '',
+              company TEXT NOT NULL DEFAULT '',
+              location TEXT NOT NULL DEFAULT '',
+              url TEXT NOT NULL DEFAULT '',
+              status TEXT NOT NULL DEFAULT 'tracked',
+              fit_score DOUBLE PRECISION,
+              requirements JSONB NOT NULL DEFAULT '[]'::jsonb,
+              source_event_ids TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[],
+              payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+              created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+              updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS resume_versions (
+              id TEXT PRIMARY KEY,
+              base_resume_id TEXT NOT NULL DEFAULT '',
+              target_job_id TEXT NOT NULL DEFAULT '',
+              status TEXT NOT NULL DEFAULT 'draft',
+              source_event_ids TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[],
+              payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+              created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+              updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS job_applications (
+              id TEXT PRIMARY KEY,
+              job_id TEXT NOT NULL DEFAULT '',
+              status TEXT NOT NULL DEFAULT 'tracked',
+              stage TEXT NOT NULL DEFAULT '',
+              next_step TEXT NOT NULL DEFAULT '',
+              application_action TEXT NOT NULL DEFAULT '',
+              platform TEXT NOT NULL DEFAULT '',
+              source_event_ids TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[],
+              payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+              created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+              updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            )
+            """
+        )
+        conn.execute(
+            """
             CREATE TABLE IF NOT EXISTS account_connections (
               provider TEXT PRIMARY KEY,
               status TEXT NOT NULL DEFAULT 'not_connected',
@@ -6160,6 +7951,13 @@ def ensure_pipeline_local_state_schema() -> None:
         conn.execute("CREATE INDEX IF NOT EXISTS confirmation_ledger_task_idx ON confirmation_ledger(task_id, created_at DESC)")
         conn.execute("CREATE INDEX IF NOT EXISTS pipeline_health_metrics_pipeline_idx ON pipeline_health_metrics(pipeline_id, created_at DESC)")
         conn.execute("CREATE INDEX IF NOT EXISTS search_audit_query_idx ON search_audit(query, created_at DESC)")
+        conn.execute("CREATE INDEX IF NOT EXISTS career_profiles_updated_idx ON career_profiles(updated_at DESC)")
+        conn.execute("CREATE INDEX IF NOT EXISTS career_resumes_updated_idx ON career_resumes(updated_at DESC)")
+        conn.execute("CREATE INDEX IF NOT EXISTS job_opportunities_status_idx ON job_opportunities(status, updated_at DESC)")
+        conn.execute("CREATE INDEX IF NOT EXISTS job_opportunities_fit_idx ON job_opportunities(fit_score DESC)")
+        conn.execute("CREATE INDEX IF NOT EXISTS resume_versions_job_idx ON resume_versions(target_job_id, updated_at DESC)")
+        conn.execute("CREATE INDEX IF NOT EXISTS job_applications_stage_idx ON job_applications(stage, updated_at DESC)")
+        conn.execute("CREATE INDEX IF NOT EXISTS job_applications_job_idx ON job_applications(job_id, updated_at DESC)")
         conn.execute("CREATE INDEX IF NOT EXISTS route_cache_destination_idx ON route_cache(destination, updated_at DESC)")
         conn.execute("CREATE INDEX IF NOT EXISTS composio_sessions_user_kind_idx ON composio_sessions(user_id, session_kind, updated_at DESC)")
         conn.execute("CREATE INDEX IF NOT EXISTS composio_connect_requests_toolkit_idx ON composio_connect_requests(toolkit_slug, status, created_at DESC)")
@@ -6222,7 +8020,7 @@ def ensure_delegated_automation_schema() -> None:
 
 
 def default_collector_settings() -> list[str]:
-    return ["bookmark", "calendar", "focus", "gmail", "search", "telegram", "whatsapp"]
+    return ["bookmark", "calendar", "focus", "gmail", "linkedin", "search", "telegram", "whatsapp"]
 
 
 def collector_capability_profile(source: str) -> dict[str, Any]:
@@ -6268,6 +8066,23 @@ def collector_capability_profile(source: str) -> dict[str, Any]:
                 "Only logged-in, visible, or explicitly opened Telegram Web content can be collected.",
             ],
         },
+        "linkedin": {
+            "mode": "managed_browser_visible_dom",
+            "adapters": ["server_chromium_dom", "career_pipeline"],
+            "supported_operations": [
+                "visible_profile_snapshot",
+                "visible_job_search_results",
+                "opened_job_description",
+                "visible_recruiter_or_company_page",
+                "outreach_or_apply_draft_only",
+            ],
+            "full_history_guarantee": False,
+            "limitations": [
+                "No bulk scraping or official LinkedIn account export is used in this version.",
+                "Only logged-in, visible, or explicitly opened LinkedIn pages can be collected.",
+                "Outbound connection requests, messages, and Apply/Submit actions must remain behind confirmation and dry-run gates during acceptance.",
+            ],
+        },
         "search": {
             "mode": "managed_browser_visible_dom",
             "adapters": ["server_chromium_dom"],
@@ -6301,6 +8116,163 @@ def collector_capability_profile(source: str) -> dict[str, Any]:
     return json.loads(json.dumps(profile, ensure_ascii=False))
 
 
+COMPOSIO_TOOLKIT_SOURCE_MAP = {
+    "gmail": "gmail",
+    "googlecalendar": "calendar",
+}
+
+
+def source_for_composio_toolkit(slug: str) -> str:
+    return COMPOSIO_TOOLKIT_SOURCE_MAP.get((slug or "").strip().lower(), "")
+
+
+def composio_connections_by_source(conn: psycopg.Connection) -> dict[str, bool]:
+    rows = conn.execute(
+        """
+        SELECT slug, bool_or(is_connected)
+        FROM composio_toolkits
+        WHERE slug IN ('gmail', 'googlecalendar')
+        GROUP BY slug
+        """
+    ).fetchall()
+    connections: dict[str, bool] = {}
+    for slug, is_connected in rows:
+        source = source_for_composio_toolkit(str(slug or ""))
+        if source:
+            connections[source] = bool(is_connected)
+    return connections
+
+
+def browser_login_status_from_details(details: dict[str, Any]) -> str:
+    login_state = str(details.get("login_state") or details.get("browser_login_status") or "").strip().lower()
+    if login_state in {"logged_in", "logged_out", "unknown"}:
+        return login_state
+    message = str(details.get("message") or "")
+    failure_reason = str(details.get("failure_reason") or "")
+    if "Chromium unavailable" in message:
+        return "unavailable"
+    if failure_reason == "login_required":
+        return "logged_out"
+    return "unknown"
+
+
+def collection_status_from_health(health_status: str) -> str:
+    normalized = (health_status or "").strip().lower()
+    if normalized in {"healthy", "degraded", "failed", "unknown"}:
+        return normalized
+    return "unknown"
+
+
+def collector_auth_status(source: str, composio_connections: dict[str, bool]) -> str:
+    normalized = (source or "").strip().lower()
+    if normalized in {"gmail", "calendar"}:
+        return "api_connected" if composio_connections.get(normalized) else "api_not_connected"
+    capability = collector_capability_profile(normalized)
+    if "server_chromium_dom" in capability.get("adapters", []):
+        return "browser_required"
+    return "local"
+
+
+def collector_status_labels(
+    source: str,
+    *,
+    enabled: bool,
+    paused: bool,
+    auth_status: str,
+    browser_login_status: str,
+    collection_status: str,
+    details: dict[str, Any],
+) -> tuple[str, str]:
+    if not enabled:
+        return "已停用", "该采集器已被用户停用。"
+    if paused:
+        return "暂停", "该采集器处于暂停状态。"
+
+    source_label = {
+        "gmail": "Gmail",
+        "calendar": "Google Calendar",
+        "whatsapp": "WhatsApp Web",
+        "telegram": "Telegram Web",
+        "linkedin": "LinkedIn",
+    }.get(source, source or "collector")
+
+    if auth_status == "api_connected":
+        if browser_login_status == "logged_out":
+            return "API 已连接", f"{source_label} API 可用；浏览器未登录，只影响可见页面采集。"
+        if browser_login_status == "unavailable":
+            return "API 已连接", f"{source_label} API 可用；云端浏览器当前不可用。"
+        if collection_status == "degraded":
+            return "API 已连接", f"{source_label} API 可用；浏览器采集异常。"
+        return "API 已连接", f"{source_label} API 同步可用。"
+
+    if auth_status == "api_not_connected":
+        if browser_login_status == "logged_in":
+            return "浏览器已登录", f"{source_label} API 未授权；当前只能采集浏览器可见页面。"
+        if browser_login_status == "logged_out":
+            return "待授权", f"{source_label} API 未授权，浏览器也未登录。"
+        return "待授权", f"{source_label} 需要完成 API 授权。"
+
+    if browser_login_status == "logged_out":
+        action = str(details.get("user_action") or "").strip()
+        if action:
+            return "未登录", action
+        if source == "whatsapp":
+            return "未登录", "请在云端浏览器扫码登录 WhatsApp Web。"
+        return "未登录", f"请在云端浏览器登录 {source_label}。"
+    if browser_login_status == "unavailable":
+        return "浏览器异常", "云端浏览器不可用，无法判断账号登录态。"
+    if browser_login_status == "logged_in":
+        if collection_status == "healthy":
+            return "已登录", f"{source_label} 已登录，可采集当前可见页面。"
+        if collection_status == "degraded":
+            reason = str(details.get("failure_reason") or "")
+            if reason == "no_linkedin_snapshot_match":
+                return "已登录 / 采集异常", "LinkedIn 已登录，但当前可见页面解析异常。"
+            return "已登录 / 采集异常", f"{source_label} 已登录，但当前可见页面解析异常。"
+        if collection_status == "failed":
+            return "已登录 / 采集失败", f"{source_label} 已登录，但采集器执行失败。"
+        return "已登录", f"{source_label} 已登录，等待下一次采集。"
+
+    if collection_status == "failed":
+        return "异常", str(details.get("message") or "采集器执行失败。")
+    if collection_status == "degraded":
+        if str(details.get("recovery") or "") == "page_reopened":
+            return "页面恢复中", "托管浏览器页面刚被重开，采集器会在下一轮重新判断登录态和采集质量。"
+        return "待检测", str(details.get("message") or "暂时无法确认登录态和采集质量。")
+    if auth_status == "browser_required" and collection_status == "healthy":
+        if details.get("browser_command") or isinstance(details.get("command_result"), dict):
+            return "浏览器已打开", f"{source_label} 页面已打开，等待下一轮采集确认登录态和可见内容。"
+    return "本地", "本地或间接信号采集器。"
+
+
+def add_collector_status_dimensions(
+    item: dict[str, Any],
+    composio_connections: dict[str, bool],
+) -> dict[str, Any]:
+    source = str(item.get("source") or "").strip().lower()
+    details = item.get("details") if isinstance(item.get("details"), dict) else {}
+    auth_status = collector_auth_status(source, composio_connections)
+    browser_login_status = browser_login_status_from_details(details)
+    collection_status = collection_status_from_health(str(item.get("health_status") or "unknown"))
+    status_label, status_detail = collector_status_labels(
+        source,
+        enabled=bool(item.get("enabled", True)),
+        paused=bool(item.get("paused", False)),
+        auth_status=auth_status,
+        browser_login_status=browser_login_status,
+        collection_status=collection_status,
+        details=details,
+    )
+    return {
+        **item,
+        "auth_status": auth_status,
+        "browser_login_status": browser_login_status,
+        "collection_status": collection_status,
+        "status_label": status_label,
+        "status_detail": status_detail,
+    }
+
+
 def row_to_collector_setting(row: Any) -> dict[str, Any]:
     paused_until = row[2]
     now = datetime.now(timezone.utc)
@@ -6328,12 +8300,16 @@ def row_to_collector_health(row: Any) -> dict[str, Any]:
     }
 
 
-def merge_collector_status(settings: list[dict[str, Any]], health_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def merge_collector_status(
+    settings: list[dict[str, Any]],
+    health_rows: list[dict[str, Any]],
+    composio_connections: Optional[dict[str, bool]] = None,
+) -> list[dict[str, Any]]:
     health_by_source = {row["collector"]: row for row in health_rows}
     merged = []
     for setting in settings:
         health = health_by_source.get(setting["source"], {})
-        merged.append(
+        item = (
             {
                 **setting,
                 "health_status": health.get("health_status", "unknown"),
@@ -6345,6 +8321,7 @@ def merge_collector_status(settings: list[dict[str, Any]], health_rows: list[dic
                 "health_updated_at": health.get("health_updated_at"),
             }
         )
+        merged.append(add_collector_status_dimensions(item, composio_connections or {}))
     return sorted(merged, key=lambda item: item["source"])
 
 
@@ -6412,6 +8389,20 @@ def health() -> dict[str, str]:
 def model_status(x_par_password: Optional[str] = Header(default=None)) -> dict[str, Any]:
     require_password(x_par_password)
     return model_gateway().status()
+
+
+@app.get("/api/model/config")
+def model_config_get(x_par_password: Optional[str] = Header(default=None)) -> dict[str, Any]:
+    require_password(x_par_password)
+    return load_user_model_config()
+
+
+@app.put("/api/model/config")
+def model_config_put(body: UserModelConfigIn, x_par_password: Optional[str] = Header(default=None)) -> dict[str, Any]:
+    require_password(x_par_password)
+    payload = save_user_model_config(body)
+    reset_model_gateway()
+    return payload
 
 
 @app.get("/api/memory/status")
@@ -6692,6 +8683,36 @@ def assistant_phone_call_status_webhook(
     return {"status": "accepted", "event": event}
 
 
+@app.post("/api/assistant-inbox/phone/calls/duplex/turn")
+def assistant_phone_call_duplex_turn_webhook(
+    body: AssistantPhoneDuplexTurnWebhookIn,
+    x_assistant_webhook_token: Optional[str] = Header(default=None, alias="x-assistant-webhook-token"),
+) -> dict[str, Any]:
+    _verify_assistant_phone_webhook_token(x_assistant_webhook_token)
+    gateway = AssistantInboxGateway(
+        ContactResolver(user_keys=set(body.user_keys), known_contacts=body.known_contacts)
+    )
+    event = gateway.normalize_phone_duplex_turn(
+        identity_id=body.identity_id,
+        payload={
+            "provider_call_id": body.provider_call_id,
+            "from": body.from_number,
+            "to": body.to_number,
+            "transcript": body.transcript,
+            "turn_index": body.turn_index,
+            "timestamp": body.timestamp or datetime.now(timezone.utc).isoformat(),
+        },
+    )
+    _ASSISTANT_INBOX_EVENTS.append(event)
+    reply_instruction = PhoneDuplexTurnHandler().build_reply_instruction(
+        transcript=body.transcript,
+        voice=body.voice,
+    )
+    reply_instruction["provider_call_id"] = body.provider_call_id or ""
+    reply_instruction["turn_index"] = body.turn_index
+    return {"status": "accepted", "event": event, "reply_instruction": reply_instruction}
+
+
 @app.get("/api/assistant-inbox/phone/calls/{call_instruction_id}/instruction")
 def assistant_phone_call_instruction(
     call_instruction_id: str,
@@ -6806,6 +8827,14 @@ def assistant_outbound_messages(
     return {"count": len(items), "items": items}
 
 
+@app.get("/api/assistant-outbound")
+def assistant_outbound_messages_alias(
+    x_par_password: Optional[str] = Header(default=None),
+    limit: int = Query(default=50, ge=1, le=200),
+) -> dict[str, Any]:
+    return assistant_outbound_messages(x_par_password=x_par_password, limit=limit)
+
+
 @app.post("/api/tools/route")
 def tool_route(body: ToolRouteIn, x_par_password: Optional[str] = Header(default=None)) -> dict[str, Any]:
     require_password(x_par_password)
@@ -6826,7 +8855,21 @@ def delegated_automation_upsert_grant(
     x_par_password: Optional[str] = Header(default=None),
 ) -> dict[str, Any]:
     require_password(x_par_password)
-    grant = DelegationGrant.from_dict(body)
+    try:
+        grant = DelegationGrant.from_dict(body)
+    except KeyError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error": "invalid_delegated_automation_grant",
+                "missing_field": str(exc).strip("'"),
+            },
+        ) from exc
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={"error": "invalid_delegated_automation_grant", "message": str(exc)},
+        ) from exc
     stored = _DELEGATED_AUTOMATION_STORE.upsert_grant(grant)
     return {"grant": stored.to_dict()}
 
@@ -6844,7 +8887,21 @@ def delegated_automation_upsert_manifest(
     x_par_password: Optional[str] = Header(default=None),
 ) -> dict[str, Any]:
     require_password(x_par_password)
-    manifest = TargetManifest.from_dict(body)
+    try:
+        manifest = TargetManifest.from_dict(body)
+    except KeyError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error": "invalid_delegated_automation_manifest",
+                "missing_field": str(exc).strip("'"),
+            },
+        ) from exc
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={"error": "invalid_delegated_automation_manifest", "message": str(exc)},
+        ) from exc
     stored = _DELEGATED_AUTOMATION_STORE.upsert_manifest(manifest)
     return {"manifest": stored.to_dict()}
 
@@ -6894,6 +8951,78 @@ def delegated_automation_trace(
     )
     stored = _DELEGATED_AUTOMATION_STORE.append_trace(trace)
     return {"trace": stored.to_dict()}
+
+
+@app.post("/api/delegated-automation/execute")
+def delegated_automation_execute(
+    body: DelegatedAutomationExecuteIn,
+    x_par_password: Optional[str] = Header(default=None),
+) -> dict[str, Any]:
+    require_password(x_par_password)
+    grant = _DELEGATED_AUTOMATION_STORE.get_grant(body.grant_id)
+    if grant is None:
+        raise HTTPException(status_code=404, detail="delegation grant not found")
+    manifest = _DELEGATED_AUTOMATION_STORE.get_manifest(body.manifest_id)
+    if manifest is None:
+        raise HTTPException(status_code=404, detail="target manifest not found")
+    now = parse_datetime(body.now) or datetime.now(timezone.utc)
+    decision = evaluate_delegated_action(
+        grant=grant,
+        manifest=manifest,
+        target_id=body.target_id,
+        traces=_DELEGATED_AUTOMATION_STORE.traces_for_grant(grant.grant_id),
+        now=now,
+        page_state=body.page_state,
+        content_evidence_ids=body.content_evidence_ids,
+        user_paused=body.user_paused,
+    )
+    if not decision.allowed:
+        trace = build_execution_trace(
+            decision=decision,
+            trace_id=f"exec_{uuid.uuid4().hex}",
+            status="blocked",
+            result_summary=f"blocked: {', '.join(decision.reasons)}",
+            evidence_ids=body.content_evidence_ids,
+            now=now,
+        )
+        stored = _DELEGATED_AUTOMATION_STORE.append_trace(trace)
+        return {"status": "blocked", "decision": decision.to_dict(), "trace": stored.to_dict()}
+
+    target = manifest.target_by_id(body.target_id)
+    if target is None:
+        raise HTTPException(status_code=404, detail="target not found in manifest")
+    if bool(body.request.get("dry_run")):
+        provider_result = run_delegated_automation_dry_run(
+            grant=grant,
+            manifest=manifest,
+            target=target,
+            decision=decision,
+            request=body.request,
+        )
+    else:
+        provider_result = run_delegated_automation_provider(
+            grant=grant,
+            manifest=manifest,
+            target=target,
+            decision=decision,
+            request=body.request,
+        )
+    status = str(provider_result.get("status") or "failed")
+    trace = build_execution_trace(
+        decision=decision,
+        trace_id=f"exec_{uuid.uuid4().hex}",
+        status=status,
+        result_summary=str(provider_result.get("result_summary") or status),
+        evidence_ids=text_list(provider_result.get("evidence_ids")) or body.content_evidence_ids,
+        now=now,
+    )
+    stored = _DELEGATED_AUTOMATION_STORE.append_trace(trace)
+    return {
+        "status": status,
+        "decision": decision.to_dict(),
+        "provider_result": provider_result,
+        "trace": stored.to_dict(),
+    }
 
 
 @app.post("/api/delegated-automation/grants/{grant_id}/pause")
@@ -7145,7 +9274,7 @@ def browser_open(body: BrowserOpenIn, x_par_password: Optional[str] = Header(def
         "host_fragment": target["host_fragment"],
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
-    redis_client().rpush(BROWSER_COMMAND_QUEUE_KEY, json.dumps(command, ensure_ascii=False))
+    enqueue_browser_command(command)
     long_tail_event_store().append_event(
         task_id=task_id,
         event_type="executor.live_completed",
@@ -7172,11 +9301,390 @@ def browser_open(body: BrowserOpenIn, x_par_password: Optional[str] = Header(def
     }
 
 
+@app.post("/api/browser/open-linkedin-profile")
+def browser_open_linkedin_profile(
+    body: BrowserOpenLinkedInProfileIn,
+    x_par_password: Optional[str] = Header(default=None),
+) -> dict[str, Any]:
+    require_password(x_par_password)
+    profile_url = normalize_linkedin_profile_url(body.profile_url)
+    slug = linkedin_profile_slug(profile_url)
+    task_id = f"browser_linkedin_profile:{slug}"
+    step_id = "open_linkedin_contact_profile"
+    executor_trace = {
+        "provider": "managed_browser",
+        "executor_trace_id": f"browser_exec_{uuid.uuid4().hex}",
+        "adapter_mode": "command_queue",
+        "source": "linkedin",
+        "expected_event_type": "linkedin_contact_snapshot",
+    }
+    proposed = ExecutorAdapterRegistry(event_store=long_tail_event_store(), policy_gate=PolicyGate()).propose_action(
+        task_id=task_id,
+        step_id=step_id,
+        adapter="browser",
+        action_type="browser.open_url",
+        target={
+            "kind": "linkedin_profile_url",
+            "source": "linkedin",
+            "url": profile_url,
+            "host_fragment": "linkedin.com",
+        },
+        input_summary={
+            "source": "linkedin",
+            "profile_url": profile_url,
+            "reason": body.reason or "open LinkedIn contact profile for recruiter sampling",
+        },
+        risk_level="read_only",
+        expected_effect="Open a visible LinkedIn profile page for contact snapshot collection without sending messages or submitting forms.",
+        allowed_actions={"browser.open_url"},
+        executor_trace=executor_trace,
+    )
+    if not proposed["policy_report"].get("may_execute"):
+        raise HTTPException(status_code=403, detail=proposed["policy_report"])
+    command = {
+        "command_id": str(uuid.uuid4()),
+        "action": "open_url_direct",
+        "source": "linkedin",
+        "url": profile_url,
+        "host_fragment": "linkedin.com",
+        "expected_event_type": "linkedin_contact_snapshot",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    enqueue_browser_command(command)
+    long_tail_event_store().append_event(
+        task_id=task_id,
+        event_type="executor.live_completed",
+        step_id=step_id,
+        payload={
+            "action_request_id": proposed["action_request"]["action_id"],
+            "policy_status": proposed["policy_report"]["status"],
+            "live_result": {
+                "mode": "command_queue",
+                "status": "queued",
+                "command_id": command["command_id"],
+                "external_side_effect": False,
+            },
+            "executor_trace": executor_trace,
+        },
+        idempotency_key=f"{proposed['action_request']['idempotency_key']}:live_completed",
+    )
+    return {
+        "status": "queued",
+        "command_id": command["command_id"],
+        "source": "linkedin",
+        "target_url": profile_url,
+        "host_fragment": "linkedin.com",
+        "expected_event_type": "linkedin_contact_snapshot",
+    }
+
+
+@app.post("/api/browser/open-linkedin-job")
+def browser_open_linkedin_job(
+    body: BrowserOpenLinkedInJobIn,
+    x_par_password: Optional[str] = Header(default=None),
+) -> dict[str, Any]:
+    require_password(x_par_password)
+    job_url = normalize_linkedin_job_url(body.job_url)
+    slug = linkedin_job_slug(job_url)
+    task_id = f"browser_linkedin_job:{slug}"
+    step_id = "open_linkedin_job_detail"
+    executor_trace = {
+        "provider": "managed_browser",
+        "executor_trace_id": f"browser_exec_{uuid.uuid4().hex}",
+        "adapter_mode": "command_queue",
+        "source": "linkedin",
+        "expected_event_type": "linkedin_job_description_snapshot",
+    }
+    proposed = ExecutorAdapterRegistry(event_store=long_tail_event_store(), policy_gate=PolicyGate()).propose_action(
+        task_id=task_id,
+        step_id=step_id,
+        adapter="browser",
+        action_type="browser.open_url",
+        target={
+            "kind": "linkedin_job_detail_url",
+            "source": "linkedin",
+            "url": job_url,
+            "host_fragment": "linkedin.com",
+        },
+        input_summary={
+            "source": "linkedin",
+            "job_url": job_url,
+            "reason": body.reason or "open LinkedIn job detail in the managed browser",
+        },
+        risk_level="read_only",
+        expected_effect="Open a visible LinkedIn job detail page in the managed browser without applying, messaging, or submitting forms.",
+        allowed_actions={"browser.open_url"},
+        executor_trace=executor_trace,
+    )
+    if not proposed["policy_report"].get("may_execute"):
+        raise HTTPException(status_code=403, detail=proposed["policy_report"])
+    command = {
+        "command_id": str(uuid.uuid4()),
+        "action": "open_linkedin_job_detail",
+        "source": "linkedin",
+        "url": job_url,
+        "host_fragment": "linkedin.com",
+        "expected_event_type": "linkedin_job_description_snapshot",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    enqueue_browser_command(command)
+    long_tail_event_store().append_event(
+        task_id=task_id,
+        event_type="executor.live_completed",
+        step_id=step_id,
+        payload={
+            "action_request_id": proposed["action_request"]["action_id"],
+            "policy_status": proposed["policy_report"]["status"],
+            "live_result": {
+                "mode": "command_queue",
+                "status": "queued",
+                "command_id": command["command_id"],
+                "external_side_effect": False,
+            },
+            "executor_trace": executor_trace,
+        },
+        idempotency_key=f"{proposed['action_request']['idempotency_key']}:live_completed",
+    )
+    return {
+        "status": "queued",
+        "command_id": command["command_id"],
+        "source": "linkedin",
+        "target_url": job_url,
+        "host_fragment": "linkedin.com",
+        "expected_event_type": "linkedin_job_description_snapshot",
+    }
+
+
+@app.post("/api/browser/search-linkedin-contacts")
+def browser_search_linkedin_contacts(
+    body: BrowserSearchLinkedInContactsIn,
+    x_par_password: Optional[str] = Header(default=None),
+) -> dict[str, Any]:
+    require_password(x_par_password)
+    search_url, search_terms = build_linkedin_contact_search_url(body.company, body.job_title, body.location)
+    search_slug = linkedin_contact_search_slug(search_terms["company"], search_terms["job_title"])
+    task_id = f"browser_linkedin_contact_search:{search_slug}"
+    step_id = "open_linkedin_people_search"
+    executor_trace = {
+        "provider": "managed_browser",
+        "executor_trace_id": f"browser_exec_{uuid.uuid4().hex}",
+        "adapter_mode": "command_queue",
+        "source": "linkedin",
+        "expected_event_type": "linkedin_contact_snapshot",
+    }
+    proposed = ExecutorAdapterRegistry(event_store=long_tail_event_store(), policy_gate=PolicyGate()).propose_action(
+        task_id=task_id,
+        step_id=step_id,
+        adapter="browser",
+        action_type="browser.open_url",
+        target={
+            "kind": "linkedin_people_search",
+            "source": "linkedin",
+            "url": search_url,
+            "host_fragment": "linkedin.com",
+            "search_terms": search_terms,
+        },
+        input_summary={
+            "source": "linkedin",
+            "company": search_terms["company"],
+            "job_title": search_terms["job_title"],
+            "location": search_terms["location"],
+            "reason": body.reason or "search LinkedIn people for likely recruiter or hiring manager",
+        },
+        risk_level="read_only",
+        expected_effect=(
+            "Open a LinkedIn people search for likely recruiters or hiring managers and let the collector sample visible results. "
+            "No connection request, message, application, or form submission is executed."
+        ),
+        allowed_actions={"browser.open_url"},
+        executor_trace=executor_trace,
+    )
+    if not proposed["policy_report"].get("may_execute"):
+        raise HTTPException(status_code=403, detail=proposed["policy_report"])
+    command = {
+        "command_id": str(uuid.uuid4()),
+        "action": "open_linkedin_contact_search",
+        "source": "linkedin",
+        "url": search_url,
+        "host_fragment": "linkedin.com",
+        "company": search_terms["company"],
+        "job_title": search_terms["job_title"],
+        "location": search_terms["location"],
+        "expected_event_type": "linkedin_contact_snapshot",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    enqueue_browser_command(command)
+    long_tail_event_store().append_event(
+        task_id=task_id,
+        event_type="executor.live_completed",
+        step_id=step_id,
+        payload={
+            "action_request_id": proposed["action_request"]["action_id"],
+            "policy_status": proposed["policy_report"]["status"],
+            "live_result": {
+                "mode": "command_queue",
+                "status": "queued",
+                "command_id": command["command_id"],
+                "external_side_effect": False,
+            },
+            "executor_trace": executor_trace,
+        },
+        idempotency_key=f"{proposed['action_request']['idempotency_key']}:live_completed",
+    )
+    return {
+        "status": "queued",
+        "command_id": command["command_id"],
+        "source": "linkedin",
+        "target_url": search_url,
+        "host_fragment": "linkedin.com",
+        "expected_event_type": "linkedin_contact_snapshot",
+        "search_terms": search_terms,
+    }
+
+
+@app.post("/api/browser/search-linkedin-jobs")
+def browser_search_linkedin_jobs(
+    body: BrowserSearchLinkedInJobsIn,
+    x_par_password: Optional[str] = Header(default=None),
+) -> dict[str, Any]:
+    require_password(x_par_password)
+    search_url, search_terms = build_linkedin_job_search_url(body.query, body.location)
+    search_slug = linkedin_job_search_slug(search_terms["query"], search_terms["location"])
+    task_id = f"browser_linkedin_job_search:{search_slug}"
+    step_id = "open_linkedin_jobs_search"
+    executor_trace = {
+        "provider": "managed_browser",
+        "executor_trace_id": f"browser_exec_{uuid.uuid4().hex}",
+        "adapter_mode": "command_queue",
+        "source": "linkedin",
+        "expected_event_type": "linkedin_job_search_results",
+    }
+    proposed = ExecutorAdapterRegistry(event_store=long_tail_event_store(), policy_gate=PolicyGate()).propose_action(
+        task_id=task_id,
+        step_id=step_id,
+        adapter="browser",
+        action_type="browser.open_url",
+        target={
+            "kind": "linkedin_jobs_search",
+            "source": "linkedin",
+            "url": search_url,
+            "host_fragment": "linkedin.com",
+            "search_terms": search_terms,
+        },
+        input_summary={
+            "source": "linkedin",
+            "query": search_terms["query"],
+            "location": search_terms["location"],
+            "reason": body.reason or "search LinkedIn jobs for matching opportunities",
+        },
+        risk_level="read_only",
+        expected_effect=(
+            "Open a LinkedIn jobs search page and let the collector sample visible job results. "
+            "No connection request, message, application, or form submission is executed."
+        ),
+        allowed_actions={"browser.open_url"},
+        executor_trace=executor_trace,
+    )
+    if not proposed["policy_report"].get("may_execute"):
+        raise HTTPException(status_code=403, detail=proposed["policy_report"])
+    command = {
+        "command_id": str(uuid.uuid4()),
+        "action": "open_linkedin_job_search",
+        "source": "linkedin",
+        "url": search_url,
+        "host_fragment": "linkedin.com",
+        "query": search_terms["query"],
+        "location": search_terms["location"],
+        "expected_event_type": "linkedin_job_search_results",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    enqueue_browser_command(command)
+    long_tail_event_store().append_event(
+        task_id=task_id,
+        event_type="executor.live_completed",
+        step_id=step_id,
+        payload={
+            "action_request_id": proposed["action_request"]["action_id"],
+            "policy_status": proposed["policy_report"]["status"],
+            "live_result": {
+                "mode": "command_queue",
+                "status": "queued",
+                "command_id": command["command_id"],
+                "external_side_effect": False,
+            },
+            "executor_trace": executor_trace,
+        },
+        idempotency_key=f"{proposed['action_request']['idempotency_key']}:live_completed",
+    )
+    return {
+        "status": "queued",
+        "command_id": command["command_id"],
+        "source": "linkedin",
+        "target_url": search_url,
+        "host_fragment": "linkedin.com",
+        "expected_event_type": "linkedin_job_search_results",
+        "search_terms": search_terms,
+    }
+
+
+@app.post("/api/browser/type")
+def browser_type(body: BrowserTypeIn, x_par_password: Optional[str] = Header(default=None)) -> dict[str, Any]:
+    require_password(x_par_password)
+    text = body.text.strip("\r\n")
+    if not text:
+        raise HTTPException(status_code=400, detail={"code": "empty_browser_text"})
+    command = {
+        "command_id": str(uuid.uuid4()),
+        "action": "type_text",
+        "text": text[:2048],
+        "submit": bool(body.submit),
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    enqueue_browser_command(command)
+    return {
+        "status": "queued",
+        "command_id": command["command_id"],
+        "submit": command["submit"],
+    }
+
+
 @app.get("/api/browser/commands/next")
 def browser_command_next(x_par_password: Optional[str] = Header(default=None)) -> dict[str, Any]:
     require_password(x_par_password)
-    command = normalize_browser_command_payload(redis_client().lpop(BROWSER_COMMAND_QUEUE_KEY))
+    redis_obj = redis_client()
+    command = normalize_browser_command_payload(redis_obj.lpop(BROWSER_COMMAND_QUEUE_KEY))
+    if command:
+        write_browser_command_status(redis_obj, command, "picked")
     return {"command": command}
+
+
+@app.get("/api/browser/commands/{command_id}/status")
+def browser_command_status(command_id: str, x_par_password: Optional[str] = Header(default=None)) -> dict[str, Any]:
+    require_password(x_par_password)
+    status = read_browser_command_status(redis_client(), command_id)
+    if not status:
+        raise HTTPException(status_code=404, detail={"code": "browser_command_status_not_found"})
+    return status
+
+
+@app.post("/api/browser/commands/{command_id}/result")
+def browser_command_result(
+    command_id: str,
+    body: BrowserCommandResultIn,
+    x_par_password: Optional[str] = Header(default=None),
+) -> dict[str, Any]:
+    require_password(x_par_password)
+    command = {
+        "command_id": command_id,
+        "action": str(body.details.get("action") or ""),
+        "source": body.source,
+        "url": body.details.get("target_url") or body.details.get("url") or "",
+        "host_fragment": body.details.get("host_fragment") or "",
+        "expected_event_type": body.expected_event_type,
+        "created_at": body.details.get("created_at") or "",
+    }
+    payload = write_browser_command_status(redis_client(), command, body.status, details=body.details)
+    return payload
 
 
 @app.get("/api/pipelines/registry")
@@ -7543,6 +10051,174 @@ def parse_uuid_or_new(value: Optional[str]) -> uuid.UUID:
     return uuid.uuid4()
 
 
+DIALOGUE_MEMORY_BATCH_ROUNDS = 15
+DIALOGUE_MEMORY_IMMEDIATE_PATTERNS: list[tuple[re.Pattern[str], str]] = [
+    (re.compile(r"(记住|保存一下|以后提醒我|remember this|please remember)", re.I), "explicit_memory"),
+    (
+        re.compile(
+            r"(日程|安排|会议|见面|面试|截止|提醒|待办|todo|deadline|meeting|interview|schedule|calendar)",
+            re.I,
+        ),
+        "agenda_or_task_signal",
+    ),
+    (re.compile(r"(付款|支付|账单|发票|打车|导航|路线|购买|下单|apply|submit|投递|申请)", re.I), "action_signal"),
+    (re.compile(r"(纠正一下|刚才说错|不是这个|不是这样|correction|actually)", re.I), "user_correction"),
+]
+
+
+def dialogue_memory_policy_for_turn(
+    role: str,
+    content: str,
+    *,
+    explicit_policy: str = "auto",
+) -> dict[str, Any]:
+    requested = str(explicit_policy or "auto").strip().lower()
+    if requested in {"immediate", "defer"}:
+        return {"policy": requested, "reason": f"explicit_{requested}"}
+    text = str(content or "").strip()
+    if not text:
+        return {"policy": "defer", "reason": "empty_content"}
+    if str(role or "").strip().lower() == "user":
+        for pattern, reason in DIALOGUE_MEMORY_IMMEDIATE_PATTERNS:
+            if pattern.search(text):
+                return {"policy": "immediate", "reason": reason}
+    return {"policy": "defer", "reason": "ordinary_dialogue"}
+
+
+def dialogue_memory_status(
+    *,
+    policy: str,
+    reason: str,
+    pending_turn_count: int = 0,
+    pending_round_count: int = 0,
+    batch_created: bool = False,
+    batch_id: Optional[str] = None,
+    batch_event_id: Optional[str] = None,
+) -> dict[str, Any]:
+    return {
+        "policy": policy,
+        "reason": reason,
+        "pending_turn_count": max(0, int(pending_turn_count)),
+        "pending_round_count": max(0, int(pending_round_count)),
+        "batch_created": bool(batch_created),
+        "batch_id": batch_id,
+        "batch_event_id": batch_event_id,
+    }
+
+
+def dialogue_batch_turn_slice(
+    turns: list[dict[str, Any]],
+    *,
+    threshold_rounds: int = DIALOGUE_MEMORY_BATCH_ROUNDS,
+) -> tuple[list[dict[str, Any]], int]:
+    selected: list[dict[str, Any]] = []
+    complete_rounds = 0
+    has_unpaired_user = False
+    for turn in turns:
+        role = str(turn.get("role") or "").strip().lower()
+        selected.append(turn)
+        if role == "user":
+            has_unpaired_user = True
+        elif role == "assistant" and has_unpaired_user:
+            complete_rounds += 1
+            has_unpaired_user = False
+            if complete_rounds >= max(1, int(threshold_rounds)):
+                return selected, complete_rounds
+    return [], complete_rounds
+
+
+def maybe_enqueue_dialogue_memory_batch(
+    conn: psycopg.Connection,
+    redis_obj: Any,
+    conversation_id: uuid.UUID,
+    *,
+    threshold_rounds: int = DIALOGUE_MEMORY_BATCH_ROUNDS,
+) -> dict[str, Any]:
+    rows = conn.execute(
+        """
+        SELECT id, role, content, event_id, created_at
+        FROM assistant_turns
+        WHERE conversation_id = %s
+          AND memory_pending = TRUE
+          AND memory_enqueue_policy IN ('defer', 'auto')
+        ORDER BY created_at ASC, id ASC
+        LIMIT 200
+        """,
+        (conversation_id,),
+    ).fetchall()
+    pending_turns = [
+        {
+            "turn_id": str(row[0]),
+            "role": str(row[1]),
+            "content": str(row[2]),
+            "event_id": str(row[3]),
+            "created_at": row[4].isoformat() if hasattr(row[4], "isoformat") else str(row[4]),
+        }
+        for row in rows
+    ]
+    selected_turns, round_count = dialogue_batch_turn_slice(pending_turns, threshold_rounds=threshold_rounds)
+    if not selected_turns:
+        return dialogue_memory_status(
+            policy="defer",
+            reason="threshold_not_reached",
+            pending_turn_count=len(pending_turns),
+            pending_round_count=round_count,
+        )
+
+    batch_id = uuid.uuid4()
+    raw_data = {
+        "batch_id": str(batch_id),
+        "conversation_id": str(conversation_id),
+        "batch_start_turn_id": selected_turns[0]["turn_id"],
+        "batch_end_turn_id": selected_turns[-1]["turn_id"],
+        "round_count": round_count,
+        "turn_count": len(selected_turns),
+        "turns": selected_turns,
+    }
+    event_id, ts, protected_raw_data = insert_private_event(conn, "nomi_chat", "dialogue_batch", raw_data)
+    conn.execute(
+        """
+        INSERT INTO conversation_memory_batches
+          (id, conversation_id, start_turn_id, end_turn_id, round_count, turn_count, event_id, status, enqueued_at, payload)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, 'queued', %s, %s)
+        ON CONFLICT (event_id) DO NOTHING
+        """,
+        (
+            batch_id,
+            conversation_id,
+            uuid.UUID(selected_turns[0]["turn_id"]),
+            uuid.UUID(selected_turns[-1]["turn_id"]),
+            round_count,
+            len(selected_turns),
+            event_id,
+            ts,
+            json.dumps(raw_data, ensure_ascii=False, default=str),
+        ),
+    )
+    turn_ids = [uuid.UUID(turn["turn_id"]) for turn in selected_turns]
+    conn.execute(
+        """
+        UPDATE assistant_turns
+        SET memory_batch_id = %s,
+            memory_enqueue_policy = 'batch',
+            memory_pending = FALSE,
+            memory_enqueued_at = %s
+        WHERE id = ANY(%s::UUID[])
+        """,
+        (batch_id, ts, turn_ids),
+    )
+    enqueue_raw_event(redis_obj, event_id, ts, "nomi_chat", "dialogue_batch", protected_raw_data)
+    return dialogue_memory_status(
+        policy="batch_created",
+        reason="threshold_reached",
+        pending_turn_count=len(pending_turns),
+        pending_round_count=round_count,
+        batch_created=True,
+        batch_id=str(batch_id),
+        batch_event_id=str(event_id),
+    )
+
+
 def enqueue_raw_event(
     redis_obj: Any,
     event_id: uuid.UUID,
@@ -7586,6 +10262,110 @@ def insert_private_event(
     return event_id, timestamp, protected_raw_data
 
 
+def normalized_observation_url(value: Any) -> str:
+    parsed = urlparse(str(value or "").strip())
+    host = parsed.netloc.lower()
+    path = re.sub(r"/+", "/", parsed.path or "/").rstrip("/")
+    if not path:
+        path = "/"
+    if not parsed.scheme or not host:
+        return str(value or "").strip().rstrip("/")
+    return f"{parsed.scheme.lower()}://{host}{path}"
+
+
+def normalized_collector_identity_text(value: Any, *, limit: int = 500) -> str:
+    text = re.sub(r"\s+", " ", str(value or "").strip())
+    return text[:limit]
+
+
+def stable_social_message_event_key(source: str, event_type: str, raw_data: dict[str, Any]) -> str:
+    message = normalized_collector_identity_text(
+        raw_data.get("message") or raw_data.get("text") or raw_data.get("body"),
+        limit=500,
+    )
+    if not message or re.fullmatch(r"\d+\+?", message):
+        return ""
+    identity = {
+        "source": source,
+        "event_type": event_type,
+        "conversation": normalized_collector_identity_text(
+            raw_data.get("chat_name")
+            or raw_data.get("conversation_id")
+            or raw_data.get("thread_title")
+            or raw_data.get("subject"),
+            limit=160,
+        ),
+        "sender": normalized_collector_identity_text(raw_data.get("sender") or raw_data.get("from") or raw_data.get("speaker"), limit=160),
+        "message": message,
+    }
+    if not identity["conversation"] and not identity["sender"]:
+        return ""
+    return json.dumps(identity, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def stable_collector_event_key(source: str, event_type: str, raw_data: dict[str, Any]) -> str:
+    clean_source = str(source or "").strip().lower()
+    clean_event_type = str(event_type or "").strip()
+    if (
+        clean_source in {"whatsapp", "telegram"}
+        and clean_event_type in {"whatsapp_message", "telegram_message_preview"}
+    ):
+        social_key = stable_social_message_event_key(clean_source, clean_event_type, raw_data)
+        if social_key:
+            return social_key
+    if clean_source == "linkedin" and clean_event_type == "linkedin_profile_snapshot":
+        identity = {
+            "source": clean_source,
+            "event_type": clean_event_type,
+            "profile_name": str(raw_data.get("profile_name") or "").strip(),
+            "headline": str(raw_data.get("headline") or "").strip(),
+            "location": str(raw_data.get("location") or "").strip(),
+            "company": str(raw_data.get("company") or "").strip(),
+            "capture_scope": str(raw_data.get("capture_scope") or "").strip(),
+            "url": normalized_observation_url(raw_data.get("url")),
+        }
+        if any(identity.get(key) for key in ["profile_name", "headline", "company"]):
+            return json.dumps(identity, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    explicit_source_event_id = str(raw_data.get("source_event_id") or "").strip()
+    if explicit_source_event_id:
+        return json.dumps(
+            {
+                "source": clean_source,
+                "event_type": clean_event_type,
+                "source_event_id": explicit_source_event_id,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    return ""
+
+
+def insert_collector_event(
+    conn: psycopg.Connection,
+    source: str,
+    event_type: str,
+    raw_data: dict[str, Any],
+    ts: Optional[datetime] = None,
+) -> tuple[uuid.UUID, datetime, dict[str, Any], bool]:
+    stable_key = stable_collector_event_key(source, event_type, raw_data)
+    event_id = stable_uuid_from_value(f"collector_event:{stable_key}") if stable_key else uuid.uuid4()
+    timestamp = ts or datetime.now(timezone.utc)
+    protected_raw_data = protect_private_payload(raw_data)
+    private_raw_data = encrypt_private_raw_data(raw_data)
+    cursor = conn.execute(
+        """
+        INSERT INTO events (event_id, timestamp, source, event_type, raw_data, raw_data_private)
+        VALUES (%s, %s, %s, %s, %s, %s)
+        ON CONFLICT (event_id) DO NOTHING
+        """,
+        (event_id, timestamp, source, event_type, json.dumps(protected_raw_data), json.dumps(private_raw_data)),
+    )
+    rowcount = getattr(cursor, "rowcount", None)
+    inserted = True if rowcount is None else rowcount != 0
+    return event_id, timestamp, protected_raw_data, inserted
+
+
 def composio_execution_result_payload(execution: dict[str, Any]) -> Any:
     live_result = execution.get("live_result") if isinstance(execution, dict) else {}
     if isinstance(live_result, dict) and "result" in live_result:
@@ -7623,54 +10403,290 @@ def list_from_message_field(value: Any) -> list[str]:
     return [item.strip() for item in text.split(",") if item.strip()]
 
 
+def gmail_text_field(value: Any, *preferred_keys: str) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, dict):
+        for key in preferred_keys:
+            nested = value.get(key)
+            text = gmail_text_field(nested, *preferred_keys)
+            if text:
+                return text
+        for key in ["body", "text", "plain_text", "messageText", "content", "snippet", "summary", "subject"]:
+            nested = value.get(key)
+            text = gmail_text_field(nested, *preferred_keys)
+            if text:
+                return text
+        return ""
+    if isinstance(value, list):
+        parts = [gmail_text_field(item, *preferred_keys) for item in value]
+        return "\n".join(part for part in parts if part).strip()
+    return str(value).strip()
+
+
+def truncate_text_chars(value: str, limit: int) -> str:
+    text = str(value or "").strip()
+    if len(text) <= limit:
+        return text
+    return text[:limit].rstrip() + f"\n[truncated {len(text) - limit} chars]"
+
+
+def normalize_gmail_text(value: Any, *, limit: int) -> str:
+    text = gmail_text_field(value)
+    if not text:
+        return ""
+    if "<" in text and ">" in text:
+        text = clean_html_to_text(text)
+    text = re.sub(r"\r\n?", "\n", text)
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text).strip()
+    return truncate_text_chars(text, limit)
+
+
+def parse_gmail_message_datetime(value: Any) -> Optional[datetime]:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        parsed = value
+    elif isinstance(value, (int, float)):
+        numeric = float(value)
+        parsed = datetime.fromtimestamp(numeric / 1000 if numeric > 10_000_000_000 else numeric, timezone.utc)
+    else:
+        text = str(value).strip()
+        if not text:
+            return None
+        if re.fullmatch(r"\d{10,16}", text):
+            numeric = float(text)
+            parsed = datetime.fromtimestamp(numeric / 1000 if numeric > 10_000_000_000 else numeric, timezone.utc)
+        else:
+            try:
+                parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+            except ValueError:
+                try:
+                    parsed = parsedate_to_datetime(text)
+                except (TypeError, ValueError, IndexError, OverflowError):
+                    return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def gmail_raw_metadata(item: dict[str, Any]) -> dict[str, Any]:
+    serialized_size = len(json.dumps(item, ensure_ascii=False, default=str))
+    safe_values: dict[str, Any] = {}
+    for key in [
+        "id",
+        "message_id",
+        "messageId",
+        "thread_id",
+        "threadId",
+        "historyId",
+        "internalDate",
+        "messageTimestamp",
+        "sizeEstimate",
+        "labelIds",
+        "display_url",
+    ]:
+        if key in item and key not in {"payload", "body", "content", "html"}:
+            safe_values[key] = item.get(key)
+    return {
+        "omitted": True,
+        "reason": "normalized_gmail_payload",
+        "source_keys": sorted(str(key) for key in item.keys()),
+        "serialized_size_chars": serialized_size,
+        "safe_values": safe_values,
+    }
+
+
+def gmail_header_value(item: dict[str, Any], header_name: str) -> str:
+    payload = item.get("payload")
+    headers = payload.get("headers") if isinstance(payload, dict) else None
+    if not isinstance(headers, list):
+        headers = item.get("headers") if isinstance(item.get("headers"), list) else []
+    for header in headers:
+        if not isinstance(header, dict):
+            continue
+        if str(header.get("name") or "").strip().lower() == header_name.lower():
+            return str(header.get("value") or "").strip()
+    return ""
+
+
 def gmail_message_payload_from_composio(item: Any) -> dict[str, Any]:
     if not isinstance(item, dict):
+        body = truncate_text_chars(str(item), GMAIL_BODY_CHAR_LIMIT)
         return {
             "message_id": "",
             "thread_id": "",
             "subject": "",
             "from": "",
             "to": [],
-            "snippet": str(item),
-            "body": str(item),
+            "snippet": truncate_text_chars(body, GMAIL_SNIPPET_CHAR_LIMIT),
+            "body": body,
             "source_adapter": "composio:gmail",
-            "raw": item,
+            "raw": {"omitted": True, "reason": "non_object_payload", "serialized_size_chars": len(str(item))},
         }
     message_id = str(item.get("message_id") or item.get("messageId") or item.get("id") or "").strip()
     thread_id = str(item.get("thread_id") or item.get("threadId") or item.get("thread") or "").strip()
-    snippet = str(item.get("snippet") or item.get("preview") or item.get("summary") or "").strip()
-    body = str(item.get("body") or item.get("text") or item.get("plain_text") or item.get("content") or snippet).strip()
+    preview = item.get("preview") if isinstance(item.get("preview"), dict) else {}
+    subject = normalize_gmail_text(gmail_text_field(item.get("subject")) or gmail_text_field(preview, "subject"), limit=500)
+    snippet = (
+        gmail_text_field(item.get("snippet"))
+        or gmail_text_field(item.get("preview"), "body", "snippet", "summary", "text")
+        or gmail_text_field(item.get("summary"))
+    )
+    body = (
+        gmail_text_field(item.get("body"), "body", "text", "plain_text", "messageText", "content")
+        or gmail_text_field(item.get("text"))
+        or gmail_text_field(item.get("plain_text"))
+        or gmail_text_field(item.get("messageText"))
+        or gmail_text_field(item.get("content"), "body", "text", "plain_text", "messageText", "content")
+        or snippet
+    )
+    snippet = normalize_gmail_text(snippet, limit=GMAIL_SNIPPET_CHAR_LIMIT)
+    body = normalize_gmail_text(body, limit=GMAIL_BODY_CHAR_LIMIT)
+    message_datetime = parse_gmail_message_datetime(
+        item.get("date")
+        or item.get("received_at")
+        or item.get("receivedAt")
+        or item.get("messageTimestamp")
+        or item.get("message_timestamp")
+        or item.get("internalDate")
+        or item.get("internal_date")
+        or gmail_header_value(item, "Date")
+    )
     return {
         "message_id": message_id,
         "thread_id": thread_id,
-        "subject": str(item.get("subject") or "").strip(),
+        "subject": subject,
         "from": str(item.get("from") or item.get("sender") or "").strip(),
         "to": list_from_message_field(item.get("to") or item.get("recipients")),
         "cc": list_from_message_field(item.get("cc")),
-        "date": str(item.get("date") or item.get("received_at") or item.get("receivedAt") or "").strip(),
+        "date": message_datetime.isoformat() if message_datetime else str(item.get("date") or item.get("received_at") or item.get("receivedAt") or "").strip(),
         "snippet": snippet,
         "body": body,
         "source_adapter": "composio:gmail",
-        "raw": item,
+        "raw": gmail_raw_metadata(item),
     }
+
+
+def existing_gmail_event_id(conn: psycopg.Connection, raw_data: dict[str, Any]) -> Optional[str]:
+    message_id = str(raw_data.get("message_id") or "").strip()
+    if not message_id:
+        return None
+    row = conn.execute(
+        """
+        SELECT event_id FROM events
+        WHERE source = 'gmail'
+          AND event_type = 'gmail_message_snapshot'
+          AND raw_data->>'message_id' = %s
+        ORDER BY created_at ASC
+        LIMIT 1
+        """,
+        (message_id,),
+    ).fetchone()
+    return str(row[0]) if row else None
 
 
 def persist_gmail_composio_messages(messages: list[Any]) -> list[dict[str, str]]:
     persisted: list[dict[str, str]] = []
-    redis_obj = redis_client()
+    pending_queue: list[tuple[Any, datetime, str, str, dict[str, Any]]] = []
     with db() as conn:
         ensure_collector_event_allowed(conn, "gmail")
         for item in messages:
             raw_data = gmail_message_payload_from_composio(item)
+            existing_event_id = existing_gmail_event_id(conn, raw_data)
+            if existing_event_id:
+                persisted.append({"event_id": existing_event_id, "message_id": raw_data.get("message_id", ""), "status": "duplicate"})
+                continue
+            event_ts = parse_gmail_message_datetime(raw_data.get("date"))
             event_id, ts, protected_raw_data = insert_private_event(
                 conn,
                 "gmail",
                 "gmail_message_snapshot",
                 raw_data,
+                ts=event_ts,
             )
-            enqueue_raw_event(redis_obj, event_id, ts, "gmail", "gmail_message_snapshot", protected_raw_data)
-            persisted.append({"event_id": str(event_id), "message_id": raw_data.get("message_id", "")})
+            pending_queue.append((event_id, ts, "gmail", "gmail_message_snapshot", protected_raw_data))
+            persisted.append({"event_id": str(event_id), "message_id": raw_data.get("message_id", ""), "status": "created"})
+    redis_obj = redis_client()
+    for event_id, ts, source, event_type, protected_raw_data in pending_queue:
+        enqueue_raw_event(redis_obj, event_id, ts, source, event_type, protected_raw_data)
     return persisted
+
+
+def composio_toolkit_is_connected(toolkit_slug: str, session_kind: str = "readonly") -> bool:
+    try:
+        with db() as conn:
+            row = conn.execute(
+                """
+                SELECT is_connected
+                FROM composio_toolkits
+                WHERE slug = %s AND session_kind = %s
+                """,
+                (toolkit_slug, session_kind),
+            ).fetchone()
+    except psycopg.Error:
+        return False
+    return bool(row and row[0])
+
+
+def run_gmail_composio_fetch(*, query: str, limit: int) -> dict[str, Any]:
+    normalized_query = query.strip() or "newer_than:1d"
+    execution = execute_composio_tool_call(
+        ComposioToolExecuteIn(
+            session_kind="readonly",
+            toolkit_slug="gmail",
+            tool_slug="GMAIL_FETCH_EMAILS",
+            arguments={"query": normalized_query, "max_results": limit},
+            task_id="collector:gmail:composio_fetch",
+            step_id="gmail_composio_fetch",
+        )
+    )
+    result_payload = composio_execution_result_payload(execution)
+    messages = extract_items_from_composio_result(result_payload)
+    persisted = persist_gmail_composio_messages(messages)
+    created_count = sum(1 for item in persisted if item.get("status") == "created")
+    duplicate_count = sum(1 for item in persisted if item.get("status") == "duplicate")
+    return {
+        "status": execution.get("status") or "completed",
+        "source": "gmail",
+        "adapter": "composio:gmail",
+        "query": normalized_query,
+        "fetched_count": len(messages),
+        "seen_count": len(persisted),
+        "persisted_count": created_count,
+        "created_count": created_count,
+        "duplicate_count": duplicate_count,
+        "events": persisted,
+        "tool_execution": {
+            "status": execution.get("status"),
+            "toolkit_slug": "gmail",
+            "tool_slug": "GMAIL_FETCH_EMAILS",
+        },
+    }
+
+
+def gmail_composio_sync_once(*, query: str = GMAIL_COMPOSIO_SYNC_QUERY, limit: int = GMAIL_COMPOSIO_SYNC_LIMIT) -> dict[str, Any]:
+    if not COMPOSIO_API_KEY:
+        return {"status": "skipped", "reason": "composio_api_key_missing"}
+    if not composio_toolkit_is_connected("gmail", "readonly"):
+        return {"status": "skipped", "reason": "gmail_not_connected"}
+    return {"status": "synced", "fetch": run_gmail_composio_fetch(query=query, limit=limit)}
+
+
+async def gmail_composio_sync_loop() -> None:
+    while True:
+        try:
+            await asyncio.to_thread(
+                gmail_composio_sync_once,
+                query=GMAIL_COMPOSIO_SYNC_QUERY,
+                limit=GMAIL_COMPOSIO_SYNC_LIMIT,
+            )
+        except Exception as exc:
+            print(f"gmail composio sync skipped: {exc}", flush=True)
+        await asyncio.sleep(max(15.0, GMAIL_COMPOSIO_SYNC_INTERVAL_SECONDS))
 
 
 def persist_assistant_turn(
@@ -7682,11 +10698,39 @@ def persist_assistant_turn(
     client_type: str = "web",
     suggestion_id: Optional[str] = None,
     tool_call_id: Optional[str] = None,
-) -> dict[str, str]:
+    memory_enqueue_policy: str = "auto",
+) -> dict[str, Any]:
     if role not in {"user", "assistant", "system"}:
         raise ValueError("role must be user, assistant, or system")
+    if tool_call_id:
+        try:
+            existing = conn.execute(
+                """
+                SELECT id, conversation_id, event_id, role
+                FROM assistant_turns
+                WHERE tool_call_id = %s AND role = %s
+                ORDER BY created_at ASC
+                LIMIT 1
+                """,
+                (tool_call_id, role),
+            ).fetchone()
+        except (AttributeError, TypeError):
+            existing = None
+        if existing and len(existing) >= 4:
+            return {
+                "conversation_id": str(existing[1]),
+                "turn_id": str(existing[0]),
+                "event_id": str(existing[2]),
+                "role": str(existing[3]),
+                "dialogue_memory_enqueue": dialogue_memory_status(
+                    policy="skipped_duplicate",
+                    reason="client_request_id_reused",
+                ),
+            }
     conversation_uuid = parse_uuid_or_new(conversation_id)
     turn_id = uuid.uuid4()
+    memory_decision = dialogue_memory_policy_for_turn(role, content, explicit_policy=memory_enqueue_policy)
+    immediate_memory = memory_decision["policy"] == "immediate"
     raw_data = {
         "role": role,
         "content": content,
@@ -7711,8 +10755,9 @@ def persist_assistant_turn(
     conn.execute(
         """
         INSERT INTO assistant_turns
-          (id, conversation_id, role, content, event_id, suggestion_id, tool_call_id, created_at, finalized_at)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+          (id, conversation_id, role, content, event_id, suggestion_id, tool_call_id, created_at, finalized_at,
+           memory_enqueue_policy, memory_enqueued_at, memory_pending)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         """,
         (
             turn_id,
@@ -7724,14 +10769,60 @@ def persist_assistant_turn(
             tool_call_id,
             ts,
             ts if role == "assistant" else None,
+            memory_decision["policy"],
+            ts if immediate_memory else None,
+            not immediate_memory,
         ),
     )
-    enqueue_raw_event(redis_obj, event_id, ts, "nomi_chat", event_type, protected_raw_data)
+    if immediate_memory:
+        enqueue_raw_event(redis_obj, event_id, ts, "nomi_chat", event_type, protected_raw_data)
+        memory_status = dialogue_memory_status(
+            policy="immediate",
+            reason=memory_decision["reason"],
+            batch_created=False,
+        )
+    elif role == "assistant":
+        memory_status = maybe_enqueue_dialogue_memory_batch(conn, redis_obj, conversation_uuid)
+    else:
+        memory_status = dialogue_memory_status(
+            policy="defer",
+            reason=memory_decision["reason"],
+            batch_created=False,
+        )
     return {
         "conversation_id": str(conversation_uuid),
         "turn_id": str(turn_id),
         "event_id": str(event_id),
         "role": role,
+        "dialogue_memory_enqueue": memory_status,
+    }
+
+
+def find_cached_assistant_response(conn: psycopg.Connection, client_request_id: Optional[str]) -> Optional[dict[str, str]]:
+    tool_call_id = assistant_turn_idempotency_key(client_request_id, "assistant")
+    if not tool_call_id:
+        return None
+    try:
+        row = conn.execute(
+            """
+            SELECT id, conversation_id, event_id, content
+            FROM assistant_turns
+            WHERE tool_call_id = %s AND role = 'assistant'
+              AND finalized_at IS NOT NULL
+            ORDER BY created_at ASC
+            LIMIT 1
+            """,
+            (tool_call_id,),
+        ).fetchone()
+    except (AttributeError, TypeError, psycopg.Error):
+        return None
+    if not row:
+        return None
+    return {
+        "turn_id": str(row[0]),
+        "conversation_id": str(row[1]),
+        "event_id": str(row[2]),
+        "answer": str(row[3] or ""),
     }
 
 
@@ -7741,10 +10832,18 @@ def create_event(event: EventIn) -> dict[str, str]:
 
     with db() as conn:
         ensure_collector_event_allowed(conn, event.source)
-        event_id, ts, protected_raw_data = insert_private_event(conn, event.source, event.event_type, event.raw_data, ts)
+        event_id, ts, protected_raw_data, inserted = insert_collector_event(
+            conn,
+            event.source,
+            event.event_type,
+            event.raw_data,
+            ts,
+        )
 
-    enqueue_raw_event(redis_client(), event_id, ts, event.source, event.event_type, protected_raw_data)
-    return {"event_id": str(event_id), "status": "queued"}
+    if inserted:
+        enqueue_raw_event(redis_client(), event_id, ts, event.source, event.event_type, protected_raw_data)
+        return {"event_id": str(event_id), "status": "queued"}
+    return {"event_id": str(event_id), "status": "duplicate"}
 
 
 @app.get("/api/events/{event_id}/private-raw")
@@ -7812,8 +10911,97 @@ def collector_status(x_par_password: Optional[str] = Header(default=None)) -> di
             ORDER BY collector
             """
         ).fetchall()
+        composio_connections = composio_connections_by_source(conn)
     health = [row_to_collector_health(row) for row in rows]
-    return {"collectors": merge_collector_status(settings, health)}
+    return {"collectors": merge_collector_status(settings, health, composio_connections)}
+
+
+@app.post("/api/ios/devices/register")
+def register_ios_device(
+    body: IOSDeviceRegisterIn,
+    x_par_password: Optional[str] = Header(default=None),
+) -> dict[str, Any]:
+    require_password(x_par_password)
+    settings = normalize_ios_live_activity_settings(body.settings)
+    with db() as conn:
+        conn.execute(
+            """
+            INSERT INTO ios_devices
+              (id, device_id, display_name, apns_environment, apns_device_token,
+               live_activity_push_to_start_token, settings, updated_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, now())
+            ON CONFLICT (device_id) DO UPDATE SET
+              display_name = EXCLUDED.display_name,
+              apns_environment = EXCLUDED.apns_environment,
+              apns_device_token = EXCLUDED.apns_device_token,
+              live_activity_push_to_start_token = EXCLUDED.live_activity_push_to_start_token,
+              settings = EXCLUDED.settings,
+              updated_at = now()
+            """,
+            (
+                uuid.uuid4(),
+                body.device_id,
+                body.display_name,
+                body.apns_environment,
+                body.apns_device_token,
+                body.live_activity_push_to_start_token,
+                json.dumps(settings),
+            ),
+        )
+    return {"device_id": body.device_id, "settings": settings}
+
+
+@app.patch("/api/ios/devices/{device_id}/settings")
+def update_ios_device_settings(
+    device_id: str,
+    body: IOSDeviceSettingsIn,
+    x_par_password: Optional[str] = Header(default=None),
+) -> dict[str, Any]:
+    require_password(x_par_password)
+    settings = normalize_ios_live_activity_settings(body.settings)
+    with db() as conn:
+        cur = conn.execute(
+            """
+            UPDATE ios_devices
+            SET settings = %s, updated_at = now()
+            WHERE device_id = %s
+            """,
+            (json.dumps(settings), device_id),
+        )
+    if not cur.rowcount:
+        raise HTTPException(status_code=404, detail="ios device not found")
+    return {"device_id": device_id, "settings": settings}
+
+
+@app.post("/api/ios/live-activities/register")
+def register_ios_live_activity(
+    body: IOSLiveActivityRegisterIn,
+    x_par_password: Optional[str] = Header(default=None),
+) -> dict[str, Any]:
+    require_password(x_par_password)
+    with db() as conn:
+        device = conn.execute(
+            "SELECT device_id FROM ios_devices WHERE device_id = %s",
+            (body.device_id,),
+        ).fetchone()
+        if not device:
+            raise HTTPException(status_code=404, detail="ios device not found")
+        conn.execute(
+            """
+            INSERT INTO ios_live_activities
+              (id, device_id, activity_id, activity_kind, update_token, status, updated_at)
+            VALUES (%s, %s, %s, %s, %s, 'active', now())
+            ON CONFLICT (activity_id) DO UPDATE SET
+              device_id = EXCLUDED.device_id,
+              activity_kind = EXCLUDED.activity_kind,
+              update_token = EXCLUDED.update_token,
+              status = 'active',
+              ended_at = NULL,
+              updated_at = now()
+            """,
+            (uuid.uuid4(), body.device_id, body.activity_id, body.activity_kind, body.update_token),
+        )
+    return {"activity_id": body.activity_id, "device_id": body.device_id, "status": "active"}
 
 
 @app.post("/api/collectors/gmail/composio/fetch")
@@ -7823,33 +11011,7 @@ def gmail_composio_fetch(
 ) -> dict[str, Any]:
     require_password(x_par_password)
     query = body.query.strip() or "newer_than:1d"
-    execution = execute_composio_tool_call(
-        ComposioToolExecuteIn(
-            session_kind="readonly",
-            toolkit_slug="gmail",
-            tool_slug="GMAIL_FETCH_EMAILS",
-            arguments={"query": query, "max_results": body.limit},
-            task_id="collector:gmail:composio_fetch",
-            step_id="gmail_composio_fetch",
-        )
-    )
-    result_payload = composio_execution_result_payload(execution)
-    messages = extract_items_from_composio_result(result_payload)
-    persisted = persist_gmail_composio_messages(messages)
-    return {
-        "status": execution.get("status") or "completed",
-        "source": "gmail",
-        "adapter": "composio:gmail",
-        "query": query,
-        "fetched_count": len(messages),
-        "persisted_count": len(persisted),
-        "events": persisted,
-        "tool_execution": {
-            "status": execution.get("status"),
-            "toolkit_slug": "gmail",
-            "tool_slug": "GMAIL_FETCH_EMAILS",
-        },
-    }
+    return run_gmail_composio_fetch(query=query, limit=body.limit)
 
 
 @app.patch("/api/collectors/settings/{source}")
@@ -7971,6 +11133,217 @@ def decorate_context_sources(context: list[dict[str, Any]]) -> list[dict[str, An
     return decorated
 
 
+PRIVATE_RELEASE_READ_ONLY_MARKERS = (
+    "只告诉",
+    "只列出",
+    "找到了什么",
+    "看看",
+    "查看",
+    "核对",
+    "不要付款",
+    "不付款",
+    "不要支付",
+    "不支付",
+    "不要执行",
+    "不执行",
+    "未经确认",
+    "without confirmation",
+    "do not pay",
+    "don't pay",
+    "read-only",
+)
+
+PRIVATE_RELEASE_DESTRUCTIVE_MARKERS = (
+    "付款",
+    "支付",
+    "转账",
+    "打款",
+    "购买",
+    "下单",
+    "pay",
+    "purchase",
+    "transfer",
+)
+
+
+def first_party_literal_private_release_allowed(query: str) -> bool:
+    text = str(query or "").strip().lower()
+    if not text:
+        return False
+    has_read_only_marker = any(marker in text for marker in PRIVATE_RELEASE_READ_ONLY_MARKERS)
+    has_destructive_marker = any(marker in text for marker in PRIVATE_RELEASE_DESTRUCTIVE_MARKERS)
+    if has_destructive_marker and not has_read_only_marker:
+        return False
+    return has_read_only_marker
+
+
+def flatten_private_strings(value: Any, prefix: str = "") -> list[tuple[str, str]]:
+    items: list[tuple[str, str]] = []
+    if isinstance(value, str):
+        text = value.strip()
+        if text:
+            items.append((prefix, text))
+    elif isinstance(value, dict):
+        for key, inner in value.items():
+            key_text = str(key)
+            next_prefix = f"{prefix}.{key_text}" if prefix else key_text
+            if SENSITIVE_KEY_RE.search(key_text) and not isinstance(inner, (dict, list)):
+                continue
+            items.extend(flatten_private_strings(inner, next_prefix))
+    elif isinstance(value, list):
+        for index, inner in enumerate(value):
+            items.extend(flatten_private_strings(inner, f"{prefix}[{index}]"))
+    return items
+
+
+def private_line_has_blocked_secret(text: str) -> bool:
+    return any(
+        pattern.search(text)
+        for pattern in (
+            VERIFICATION_CODE_RE,
+            INLINE_SECRET_RE,
+            BEARER_RE,
+            OAUTH_FRAGMENT_RE,
+            ID_CARD_RE,
+            PASSPORT_RE,
+            BANK_CARD_RE,
+        )
+    )
+
+
+def sanitize_released_private_line(text: str) -> str:
+    sanitized = URL_QUERY_RE.sub(r"\1\2=REDACTED", text)
+    sanitized = OAUTH_FRAGMENT_RE.sub(r"\1\2=REDACTED", sanitized)
+    sanitized = INLINE_SECRET_RE.sub(r"\1=REDACTED", sanitized)
+    sanitized = BEARER_RE.sub("Bearer REDACTED", sanitized)
+    sanitized = EMAIL_RE.sub("EMAIL_1", sanitized)
+    sanitized = replace_phone_preserving_date_times(sanitized)
+    return sanitized.strip()
+
+
+def extract_releasable_amounts(text: str) -> list[str]:
+    amounts: list[str] = []
+    phone_spans = phone_spans_excluding_date_times(text)
+    for match in AMOUNT_RE.finditer(text):
+        span = match.span()
+        if any(span[0] >= phone_span[0] and span[1] <= phone_span[1] for phone_span in phone_spans):
+            continue
+        value = match.group(0).strip()
+        if re.search(r"(¥|￥|RMB|CNY|USD|美元|元|dollar|eur|€|£)", value, re.I):
+            amounts.append(value)
+    return list(dict.fromkeys(amounts))
+
+
+def parse_private_release_event_datetime(value: Any) -> datetime:
+    try:
+        parsed = datetime.fromisoformat(str(value or "").replace("Z", "+00:00"))
+    except ValueError:
+        parsed = datetime.now(timezone.utc)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(USER_TIMEZONE)
+
+
+def resolve_relative_date_clue(text: str, event_time: Any) -> Optional[str]:
+    event_dt = parse_private_release_event_datetime(event_time)
+    explicit = EXPLICIT_DATE_RE.search(text)
+    target_date: Optional[date] = None
+    raw_phrase = ""
+    if explicit:
+        year, month, day = (int(part) for part in explicit.groups())
+        try:
+            target_date = date(year, month, day)
+            raw_phrase = explicit.group(0)
+        except ValueError:
+            target_date = None
+    if target_date is None and "后天" in text:
+        target_date = (event_dt + timedelta(days=2)).date()
+        raw_phrase = "后天"
+    if target_date is None and ("明天" in text or "tomorrow" in text.lower()):
+        target_date = (event_dt + timedelta(days=1)).date()
+        raw_phrase = "明天" if "明天" in text else "tomorrow"
+    if target_date is None and ("今天" in text or "今晚" in text or "today" in text.lower()):
+        target_date = event_dt.date()
+        raw_phrase = "今天" if ("今天" in text or "今晚" in text) else "today"
+    if target_date is None:
+        weekday_match = WEEKDAY_RE.search(text)
+        english_weekday_match = EN_WEEKDAY_RE.search(text) if not weekday_match else None
+        if weekday_match:
+            next_week, raw_weekday = weekday_match.groups()
+            target_weekday = CHINESE_WEEKDAYS.get(raw_weekday)
+            raw_phrase = weekday_match.group(0)
+        elif english_weekday_match:
+            next_week, raw_weekday = english_weekday_match.groups()
+            target_weekday = ENGLISH_WEEKDAYS.get(str(raw_weekday).lower())
+            raw_phrase = english_weekday_match.group(0)
+        else:
+            target_weekday = None
+            next_week = None
+        if target_weekday is not None:
+            days_until = (target_weekday - event_dt.weekday()) % 7
+            if next_week:
+                days_until += 7
+            target_date = (event_dt + timedelta(days=days_until)).date()
+    if target_date is None:
+        return None
+    weekday = WEEKDAY_LABELS[target_date.weekday()]
+    phrase = f" for '{raw_phrase}'" if raw_phrase else ""
+    return f"{target_date.isoformat()} {weekday}{phrase}; source_event_timestamp={event_dt.isoformat()}"
+
+
+def build_literal_private_evidence_release(
+    *,
+    query: str,
+    private_raw_data: dict[str, Any],
+    matched_identifier: Optional[str],
+    event_time: Any = None,
+) -> Optional[dict[str, Any]]:
+    if not matched_identifier or not first_party_literal_private_release_allowed(query):
+        return None
+    flattened = flatten_private_strings(private_raw_data)
+    if not flattened:
+        return None
+    identifier = str(matched_identifier)
+    amounts: list[str] = []
+    time_clues: list[str] = []
+    resolved_time_clues: list[str] = []
+    matching_lines: list[str] = []
+    time_pattern = re.compile(
+        r"(due|deadline|next\s+\w+|tomorrow|today|到期|截止|下周|明天|今天|周[一二三四五六日天]|星期[一二三四五六日天]|\d{4}-\d{1,2}-\d{1,2})",
+        re.I,
+    )
+    for key, raw_text in flattened:
+        if private_line_has_blocked_secret(raw_text):
+            continue
+        sanitized = sanitize_released_private_line(raw_text)
+        if not sanitized:
+            continue
+        amounts.extend(extract_releasable_amounts(raw_text))
+        if time_pattern.search(raw_text):
+            time_clues.append(truncate_text_by_token_budget(sanitized, 500))
+            resolved = resolve_relative_date_clue(raw_text, event_time)
+            if resolved:
+                resolved_time_clues.append(resolved)
+        if identifier in raw_text or identifier in sanitized:
+            matching_lines.append(truncate_text_by_token_budget(sanitized, 700))
+        if key.lower() in {"from", "to", "cc", "bcc", "email", "sender"}:
+            continue
+    fields = {
+        "matched_identifier": identifier,
+        "amounts": list(dict.fromkeys(amounts))[:5],
+        "time_clues": list(dict.fromkeys(time_clues))[:5],
+        "resolved_time_clues": list(dict.fromkeys(resolved_time_clues))[:5],
+        "matching_lines": list(dict.fromkeys(matching_lines))[:3],
+    }
+    if not any(value for key, value in fields.items() if key != "matched_identifier"):
+        return None
+    return {
+        "release_policy": "first_party_literal_identifier_read_minimal_fields",
+        "release_reason": "The user asked a read-only or confirmation-gated question about an exact private identifier.",
+        "fields": fields,
+    }
+
+
 def build_reasoning_context(
     state_rows: list[Any],
     timeline_rows: list[Any],
@@ -7978,6 +11351,8 @@ def build_reasoning_context(
     fact_rows: list[Any],
     bm25_rows: list[Any],
     vector_rows: list[Any],
+    literal_rows: Optional[list[Any]] = None,
+    query: str = "",
 ) -> list[dict[str, Any]]:
     context: list[dict[str, Any]] = []
     for row in state_rows:
@@ -8049,6 +11424,35 @@ def build_reasoning_context(
                 "metadata": row[7] if len(row) > 7 else {},
             }
         )
+    for row in literal_rows or []:
+        item = {
+            "layer": "literal_identifier_recall",
+            "time": row[0].isoformat() if hasattr(row[0], "isoformat") else row[0],
+            "source": row[1],
+            "event_type": row[2],
+            "raw_data": row[3],
+            "summary": row[4],
+            "intent": row[5],
+            "importance": row[6],
+            "metadata": row[7] if len(row) > 7 else {},
+            "matched_identifier": row[8] if len(row) > 8 else None,
+            "inclusion_reason": "Exact identifier match from the current request.",
+        }
+        private_envelope = row[9] if len(row) > 9 and isinstance(row[9], dict) else None
+        if private_envelope:
+            try:
+                private_raw = decrypt_private_raw_data(private_envelope)
+                release = build_literal_private_evidence_release(
+                    query=query,
+                    private_raw_data=private_raw,
+                    matched_identifier=item.get("matched_identifier"),
+                    event_time=row[0],
+                )
+                if release:
+                    item["released_private_evidence"] = release
+            except ValueError:
+                item["private_evidence_release_error"] = "private_raw_data_unavailable"
+        context.append(item)
     return context
 
 
@@ -8140,14 +11544,218 @@ def context_text(item: dict[str, Any]) -> str:
     return re.sub(r"[^\w\s]", " ", text)
 
 
+CJK_RETRIEVAL_PHRASES = (
+    "测试暗号",
+    "聊天记录",
+    "人民广场",
+    "保利广场",
+    "静安寺",
+    "地铁站",
+    "报价单",
+    "利润率",
+    "保险",
+    "保单",
+    "面试官",
+    "暗号",
+    "口令",
+    "偏好",
+    "喜好",
+    "成本",
+    "合同",
+    "会面",
+    "见面",
+    "会议",
+    "开会",
+    "日程",
+    "安排",
+    "截止",
+    "提醒",
+    "岗位",
+    "简历",
+    "招聘",
+    "客户",
+    "同事",
+    "朋友",
+    "邮件",
+    "付款",
+    "打车",
+    "路线",
+    "周五",
+    "明天",
+    "后天",
+)
+CJK_QUERY_STOP_TOKENS = {
+    "我的",
+    "是什么",
+    "什么",
+    "需要",
+    "注意",
+    "具体",
+    "时间",
+    "哪天",
+    "几点",
+    "什么时候",
+}
+EN_QUERY_STOP_TOKENS = {"what", "when", "where", "which", "whose", "does", "need", "needs"}
+SOURCE_QUERY_TOKENS = {
+    "whatsapp",
+    "telegram",
+    "gmail",
+    "linkedin",
+    "email",
+    "mail",
+    "inbox",
+    "calendar",
+    "google",
+}
+CJK_FAMILY_OBJECT_RE = re.compile(
+    r"(?:谁的?|哪个人的?|哪位的?)?"
+    r"(?:儿子|女儿|孩子|小孩|爸爸|父亲|妈妈|母亲|老婆|妻子|太太|丈夫|老公|哥哥|姐姐|弟弟|妹妹)"
+    r"(?:叫|名字叫|名叫|是)"
+    r"([\u4e00-\u9fff]{2,4})"
+)
+CJK_FAMILY_SUBJECT_QUERY_RE = re.compile(
+    r"([\u4e00-\u9fff]{2,4}?)\s*(?:他的|她的|的|他|她)?\s*"
+    r"(?:儿子|女儿|孩子|小孩|爸爸|父亲|妈妈|母亲|老婆|妻子|太太|丈夫|老公|哥哥|姐姐|弟弟|妹妹)"
+    r"(?:是谁|叫什么|叫谁|名字是什么|名字叫啥|是哪位)"
+)
+CJK_PERSON_IDENTITY_RE = re.compile(
+    r"([\u4e00-\u9fff]{2,4})(?:是谁|是什么人|是什么身份|是哪个人|是哪位|什么来头)"
+)
+CJK_PERSON_RELATION_PAIR_RE = re.compile(
+    r"([\u4e00-\u9fff]{2,4})\s*(?:和|跟|与)\s*([\u4e00-\u9fff]{2,4}?)(?:是|有|的)?.{0,4}(?:什么关系|关系)"
+)
+
+
 def query_tokens(query: str) -> list[str]:
-    cleaned = re.sub(r"[^\w\s]", " ", query.lower())
-    return [token for token in re.split(r"\s+", cleaned) if len(token) >= 4]
+    raw = str(query or "")
+    tokens = [
+        match.group(0).lower()
+        for match in re.finditer(r"[A-Za-z][A-Za-z0-9_-]*|[A-Z0-9_]{4,}", raw)
+        if len(match.group(0)) >= 4
+    ]
+    tokens.extend(match.group(1).lower() for match in CJK_FAMILY_OBJECT_RE.finditer(raw))
+    tokens.extend(match.group(1).lower() for match in CJK_FAMILY_SUBJECT_QUERY_RE.finditer(raw))
+    tokens.extend(match.group(1).lower() for match in CJK_PERSON_IDENTITY_RE.finditer(raw))
+    for match in CJK_PERSON_RELATION_PAIR_RE.finditer(raw):
+        tokens.extend([match.group(1).lower(), match.group(2).lower()])
+    cjk_matches: list[tuple[int, str]] = []
+    for phrase in CJK_RETRIEVAL_PHRASES:
+        start = raw.find(phrase)
+        if start >= 0:
+            cjk_matches.append((start, phrase.lower()))
+    for match in re.finditer(r"[\u4e00-\u9fff]{2,8}", raw):
+        phrase = match.group(0)
+        if phrase not in CJK_QUERY_STOP_TOKENS and not any(term in phrase for term in CJK_RETRIEVAL_PHRASES):
+            cjk_matches.append((match.start(), phrase.lower()))
+    tokens.extend(value for _, value in sorted(cjk_matches, key=lambda pair: (pair[0], -len(pair[1]))))
+    return list(dict.fromkeys(tokens))
+
+
+def extract_literal_identifiers(query: str, *, max_identifiers: int = 8) -> list[str]:
+    text = str(query or "")
+    patterns = [
+        r"\bINV-[A-Z0-9][A-Z0-9_-]{2,}\b",
+        r"\b(?:PHONE|EMAIL|AMOUNT|CARD|ACCOUNT|ORDER|QUOTE|BILL|INVOICE|JOB|JD)_[0-9]+\b",
+        r"\b[A-Z]{2,}-[A-Z0-9][A-Z0-9_-]{3,}\b",
+        r"\b[A-Z]{2,}[_-][A-Z0-9][A-Z0-9_-]{3,}\b",
+    ]
+    identifiers: list[str] = []
+    for pattern in patterns:
+        for match in re.finditer(pattern, text, flags=re.I):
+            value = match.group(0)
+            normalized = value.upper() if re.fullmatch(r"[A-Za-z0-9_-]+", value) else value
+            if normalized not in identifiers:
+                identifiers.append(normalized)
+            if len(identifiers) >= max_identifiers:
+                return identifiers
+    return identifiers
+
+
+EXTERNAL_EVIDENCE_SOURCES = {
+    "gmail",
+    "whatsapp",
+    "telegram",
+    "linkedin",
+    "calendar",
+    "google_calendar",
+    "google_docs",
+    "browser",
+    "chrome",
+    "file",
+    "source_event",
+}
+
+
+def normalized_dialogue_text(value: Any) -> str:
+    cleaned = re.sub(r"\s+", " ", str(value or "").strip().lower())
+    return cleaned
+
+
+def raw_role(item: dict[str, Any]) -> str:
+    raw_data = item.get("raw_data") if isinstance(item.get("raw_data"), dict) else {}
+    return str(item.get("role") or raw_data.get("role") or "").lower()
+
+
+def raw_content(item: dict[str, Any]) -> str:
+    raw_data = item.get("raw_data") if isinstance(item.get("raw_data"), dict) else {}
+    return str(item.get("content") or raw_data.get("content") or raw_data.get("text") or "")
+
+
+def is_nomi_assistant_memory(item: dict[str, Any]) -> bool:
+    return (
+        str(item.get("source") or "") == "nomi_chat"
+        and (str(item.get("event_type") or "") == "assistant_message" or raw_role(item) == "assistant")
+    )
+
+
+def is_nomi_user_query_echo(item: dict[str, Any], query: str) -> bool:
+    if str(item.get("source") or "") != "nomi_chat":
+        return False
+    if str(item.get("event_type") or "") != "user_message" and raw_role(item) != "user":
+        return False
+    return normalized_dialogue_text(raw_content(item)) == normalized_dialogue_text(query)
+
+
+def released_private_evidence_has_facts(item: dict[str, Any]) -> bool:
+    release = item.get("released_private_evidence")
+    if not isinstance(release, dict):
+        return False
+    fields = release.get("fields")
+    if not isinstance(fields, dict):
+        return False
+    for key in ("amounts", "resolved_time_clues", "time_clues", "matching_lines"):
+        value = fields.get(key)
+        if isinstance(value, list) and value:
+            return True
+    return False
+
+
+def is_external_literal_evidence(item: dict[str, Any]) -> bool:
+    if item.get("layer") != "literal_identifier_recall":
+        return False
+    source = str(item.get("source") or "")
+    return source != "nomi_chat" and (source in EXTERNAL_EVIDENCE_SOURCES or released_private_evidence_has_facts(item))
+
+
+def filter_literal_identifier_noise(context: list[dict[str, Any]], query: str) -> list[dict[str, Any]]:
+    has_external_literal_evidence = any(is_external_literal_evidence(item) for item in context)
+    if not has_external_literal_evidence:
+        return context
+    filtered: list[dict[str, Any]] = []
+    for item in context:
+        if is_nomi_assistant_memory(item):
+            continue
+        if item.get("layer") in {"literal_identifier_recall", "bm25_recall", "vector_recall"} and is_nomi_user_query_echo(item, query):
+            continue
+        filtered.append(item)
+    return filtered
 
 
 def rerank_context(query: str, context: list[dict[str, Any]]) -> list[dict[str, Any]]:
     tokens = query_tokens(query)
     layer_bonus = {
+        "literal_identifier_recall": 5.0,
         "entity_graph": 1.0,
         "working_memory": 0.4,
         "timeline": 0.3,
@@ -8160,15 +11768,37 @@ def rerank_context(query: str, context: list[dict[str, Any]]) -> list[dict[str, 
         text = context_text(item)
         overlap = sum(1 for token in tokens if token in text)
         confidence = float(item.get("confidence") or item.get("importance") or item.get("rank") or 0)
-        return overlap + confidence + layer_bonus.get(item.get("layer"), 0)
+        source = str(item.get("source") or "")
+        source_bonus = 0.0
+        if is_external_literal_evidence(item):
+            source_bonus += 6.0
+        if source in EXTERNAL_EVIDENCE_SOURCES:
+            source_bonus += 1.5
+        if released_private_evidence_has_facts(item):
+            source_bonus += 2.0
+        if is_nomi_assistant_memory(item):
+            source_bonus -= 8.0
+        if is_nomi_user_query_echo(item, query):
+            source_bonus -= 4.0
+        return overlap + confidence + layer_bonus.get(item.get("layer"), 0) + source_bonus
 
     return sorted(context, key=score, reverse=True)
 
 
 def normalize_retrieval_pattern(query: str) -> str:
-    cleaned = re.sub(r"[^\w\s]", " ", query.lower())
-    cleaned = re.sub(r"\s+", " ", cleaned).strip()
-    return f"%{cleaned}%" if cleaned else "%"
+    if not re.search(r"[\u4e00-\u9fff]", str(query or "")):
+        cleaned = re.sub(r"[^\w\s]", " ", str(query or "").lower())
+        cleaned = re.sub(r"\s+", " ", cleaned).strip()
+        return f"%{cleaned}%" if cleaned else "%"
+    tokens = query_tokens(query)
+    for token in tokens:
+        if (
+            token not in CJK_QUERY_STOP_TOKENS
+            and token not in EN_QUERY_STOP_TOKENS
+            and token.lower() not in SOURCE_QUERY_TOKENS
+        ):
+            return f"%{token}%"
+    return f"%{tokens[0]}%" if tokens else "%"
 
 
 def token_patterns(query: str, max_tokens: int = 6) -> list[str]:
@@ -8354,6 +11984,41 @@ def consolidation_fact_sql() -> str:
             'locomo_conversation',
             'locomo_seed',
             'locomo_seed_backfill'
+          )
+          AND COALESCE(metadata#>>'{entities,primary_label}', '') NOT IN ('low_value', 'ordinary_chat')
+          AND NOT (COALESCE(metadata#>'{entities,labels}', '[]'::jsonb) ? 'low_value')
+          AND NOT (COALESCE(metadata#>'{entities,labels}', '[]'::jsonb) ? 'ordinary_chat')
+          AND COALESCE(metadata#>>'{entities,event_type}', metadata->>'event_type', '') !~ '(visible_snapshot|login_snapshot)$'
+          AND predicate NOT IN ('generic_event', 'notification', 'browse_feed', 'information_consumption')
+          AND CONCAT_WS(
+            ' ',
+            object,
+            metadata->>'summary',
+            metadata#>>'{entities,event_name}',
+            metadata#>>'{entities,sender}'
+          ) !~* (
+            'your receipt from|receipt from|newsletter|unsubscribe|取消订阅|'
+            || 'privacy policy|隐私政策|terms of service|服务条款|terms update|policy update|'
+            || '<!doctype html|<html\\b|made zero sales|zero sales|pitch that failed|'
+            || 'offered six figures|zero temptation|pricing question every expert|course wrong|'
+            || 'you have \\d+ new messages?|linkedin\\.com/comm/messaging|'
+            || '官方安全中心|tregsafety\\.com|验证码|verification code|login code|security code|'
+            || '订单支付成功|支付成功|payment successful|invoice paid|'
+            || '消息和通话已进行端到端加密|输入消息'
+          )
+          AND NOT (
+            COALESCE(metadata#>>'{entities,source}', metadata->>'source', '') = 'linkedin'
+            AND (
+              COALESCE(metadata#>>'{entities,primary_label}', '') = 'low_value'
+              OR COALESCE(metadata#>>'{entities,event_type}', '') IN (
+                'linkedin_visible_snapshot',
+                'linkedin_profile_snapshot',
+                'linkedin_contact_snapshot',
+                'linkedin_contact_search_results',
+                'linkedin_job_search_results',
+                'linkedin_career_prompt'
+              )
+            )
           )
         ORDER BY CASE WHEN predicate = 'benchmark_answer' THEN 1 ELSE 0 END, updated_at DESC, confidence DESC
         LIMIT 50
@@ -8592,7 +12257,7 @@ def summarize_oversized_context_text(text: str, max_tokens: int) -> dict[str, An
 
 
 def source_id_for_context_item(item: dict[str, Any], fallback: str) -> str:
-    for key in ("event_id", "id", "memory_id"):
+    for key in ("source_id", "event_id", "id", "memory_id"):
         value = item.get(key)
         if value:
             return str(value)
@@ -8669,6 +12334,23 @@ def normalize_scope_values(values: Any) -> set[str]:
 
 def sorted_scope_values(values: Any) -> list[str]:
     return sorted(normalize_scope_values(values))
+
+
+REQUEST_SOURCE_ALIASES: dict[str, tuple[str, ...]] = {
+    "gmail": ("gmail", "邮件", "email", "mail", "收件箱", "inbox"),
+    "whatsapp": ("whatsapp", "wa", "web.whatsapp.com"),
+    "telegram": ("telegram", "tg", "web.telegram.org"),
+    "linkedin": ("linkedin", "领英", "linkedin.com"),
+    "calendar": ("calendar", "日历", "google calendar", "googlecalendar"),
+}
+
+
+def infer_source_type_from_text(text: str) -> str:
+    lowered = str(text or "").lower()
+    for source, aliases in REQUEST_SOURCE_ALIASES.items():
+        if any(alias.lower() in lowered for alias in aliases):
+            return source
+    return ""
 
 
 def normalize_counterparty_values(values: Any) -> set[str]:
@@ -8862,7 +12544,12 @@ def infer_request_scope(message: str, ui_state: Optional[dict[str, Any]] = None)
         counterparties.update(normalize_counterparty_values(current_source.get("counterparty_ids")))
         counterparties.update(normalize_counterparty_values(current_source.get("counterparty_id")))
         counterparties.update(normalize_counterparty_values(current_source.get("contact_name")))
-    source_type = str(ui_state.get("source_type") or current_source.get("source_type") or "").strip().lower()
+    source_type = str(
+        ui_state.get("source_type")
+        or current_source.get("source_type")
+        or infer_source_type_from_text(message)
+        or ""
+    ).strip().lower()
     active_task_ids = sorted_scope_values(ui_state.get("active_task_ids") or ui_state.get("active_task_id"))
     topic_ids = sorted_scope_values(ui_state.get("topic_ids") or ui_state.get("topic_id"))
     return {
@@ -8917,6 +12604,111 @@ def dedupe_context_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
         seen.add(source_id)
         deduped.append(item)
     return deduped
+
+
+def merge_parallel_memory_context(parallel_context: dict[str, Any]) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    for key in ("memory_kv", "memory_graph", "memory_rag", "timeline", "memory"):
+        value = parallel_context.get(key)
+        if isinstance(value, list):
+            items.extend([item for item in value if isinstance(item, dict)])
+    return dedupe_context_items(items)
+
+
+def retrieve_memory_layer_context(
+    query: str,
+    limit: int,
+    layer: str,
+    request_scope: Optional[dict[str, Any]] = None,
+) -> list[dict[str, Any]]:
+    if limit <= 0:
+        return []
+    fetch_limit = max(limit * 3, limit, 4)
+    candidates = retrieve_context(query, fetch_limit, request_scope=request_scope)
+    filtered: list[dict[str, Any]] = []
+    for item in candidates:
+        section = context_section_name_for_memory_item(item)
+        item_layer = str(item.get("layer") or "").lower()
+        if layer == "kv" and section == "kv_profile":
+            filtered.append(item)
+        elif layer == "graph" and section == "knowledge_graph_context":
+            filtered.append(item)
+        elif layer == "rag" and section == "rag_event_memory" and item_layer != "timeline":
+            filtered.append(item)
+        elif layer == "timeline" and item_layer == "timeline":
+            filtered.append(item)
+    return filtered[:limit]
+
+
+def filter_memory_layer_candidates(candidates: list[dict[str, Any]], layer: str, limit: int) -> list[dict[str, Any]]:
+    if limit <= 0:
+        return []
+    filtered: list[dict[str, Any]] = []
+    for item in candidates:
+        section = context_section_name_for_memory_item(item)
+        item_layer = str(item.get("layer") or "").lower()
+        if layer == "kv" and section == "kv_profile":
+            filtered.append(item)
+        elif layer == "graph" and section == "knowledge_graph_context":
+            filtered.append(item)
+        elif layer == "rag" and section == "rag_event_memory" and item_layer != "timeline":
+            filtered.append(item)
+        elif layer == "timeline" and item_layer == "timeline":
+            filtered.append(item)
+    return filtered[:limit]
+
+
+def shared_memory_layer_fetchers(
+    query: str,
+    context_limits: dict[str, int],
+    context_candidate_limit: int,
+    request_scope: Optional[dict[str, Any]],
+    *,
+    include_generic_memory: bool,
+) -> dict[str, Any]:
+    layer_specs = {
+        "memory_kv": "kv",
+        "memory_graph": "graph",
+        "memory_rag": "rag",
+        "timeline": "timeline",
+    }
+    active_layer_limits = {
+        key: int(context_limits.get(key, 0) or 0)
+        for key in layer_specs
+        if int(context_limits.get(key, 0) or 0) > 0
+    }
+    fetch_limit_candidates = [max(context_candidate_limit, 1)]
+    fetch_limit_candidates.extend(max(limit, 4) for limit in active_layer_limits.values())
+    if include_generic_memory:
+        fetch_limit_candidates.append(max(context_candidate_limit, 1))
+    fetch_limit = max(fetch_limit_candidates or [max(context_candidate_limit, 1)])
+    cache_lock = threading.Lock()
+    cache: dict[str, Any] = {"loaded": False, "items": []}
+
+    def load_candidates() -> list[dict[str, Any]]:
+        if cache["loaded"]:
+            return list(cache["items"])
+        with cache_lock:
+            if not cache["loaded"]:
+                cache["items"] = retrieve_context(query, fetch_limit, request_scope=request_scope)
+                cache["loaded"] = True
+            return list(cache["items"])
+
+    fetchers: dict[str, Any] = {}
+    for key, layer in layer_specs.items():
+        limit = active_layer_limits.get(key, 0)
+        if limit <= 0:
+            continue
+        fetchers[key] = (
+            lambda layer=layer, limit=limit: filter_memory_layer_candidates(
+                load_candidates(),
+                layer,
+                limit,
+            )
+        )
+    if include_generic_memory:
+        fetchers["memory"] = lambda: load_candidates()[: max(context_candidate_limit, 1)]
+    return fetchers
 
 
 def raw_source_counterparties(raw_data: dict[str, Any], request_scope: dict[str, Any]) -> list[str]:
@@ -8987,6 +12779,19 @@ def retrieve_current_source_context(
                 """,
                 (*params, limit),
             ).fetchall()
+            if not rows:
+                rows = conn.execute(
+                    """
+                    SELECT e.event_id::text, e.source, e.event_type, e.raw_data, e.timestamp,
+                           s.summary, s.intent, s.importance
+                    FROM events e
+                    LEFT JOIN semantic_events s ON s.event_id = e.event_id
+                    WHERE lower(e.source) = %s
+                    ORDER BY e.timestamp DESC
+                    LIMIT %s
+                    """,
+                    (source_type, limit),
+                ).fetchall()
     except (psycopg.Error, AttributeError):
         return []
     items: list[dict[str, Any]] = []
@@ -9107,9 +12912,15 @@ def relevant_assistant_dialogue_items(
         content_tokens = set(query_tokens(content))
         same_conversation = bool(conversation_id and item_conversation_id == str(conversation_id))
         from_client_context = item.get("source") in {"client_context", "client_context_delta"}
+        role = str(item.get("role") or "").strip().lower()
         is_user_correction = any(marker in content for marker in ["不是", "别提醒", "不用提醒", "以后", "记住", "纠正"])
         overlaps = bool(tokens and tokens.intersection(content_tokens))
-        if same_conversation or overlaps or is_user_correction or (is_short_followup and from_client_context):
+        if (
+            same_conversation
+            or is_user_correction
+            or (overlaps and role == "user")
+            or (is_short_followup and from_client_context)
+        ):
             selected.append(item)
         if len(selected) >= limit:
             break
@@ -9185,10 +12996,270 @@ def normalize_client_dialogue_context(
     return normalized
 
 
+GENERIC_AGENDA_QUERY_RE = re.compile(
+    r"(日程|安排|会议|开会|会面|见面|提醒|截止|要开的会|最近.*会|"
+    r"\bschedule\b|\bmeeting\b|\bcalendar\b|\bappointment\b|\binterview\b)"
+)
+
+MEETING_AGENDA_QUERY_RE = re.compile(r"(会议|开会|会面|见面|要开的会|\bmeeting\b|\bappointment\b|\binterview\b)", re.I)
+MEETING_AGENDA_ITEM_RE = re.compile(r"(会议|开会|会面|见面|面试|panel|zoom|\bmeeting\b|\bappointment\b|\binterview\b)", re.I)
+UPCOMING_AGENDA_QUERY_RE = re.compile(r"(要开|接下来|即将|未来|后面|最近有|upcoming|\bnext\b)", re.I)
+
+LOW_VALUE_AGENDA_TEXT_RE = re.compile(
+    r"(0 notifications total|keyboard shortcuts|close jump menu|search by title|"
+    r"city, state, or zip code|new feed updates notifications|jobs search|"
+    r"消息和通话已进行端到端加密|消息通知已关闭|输入消息)",
+    re.I,
+)
+GMAIL_LOW_VALUE_TEXT_RE = re.compile(
+    r"(your receipt from|收据|receipt from|payment receipt|order confirmation|"
+    r"limited time offer|upgrade today|save \d+%|unsubscribe|newsletter|promotion|"
+    r"made zero sales|zero sales|pitch that failed|"
+    r"offered six figures to leave|platforms tried to buy|zero temptation to switch platforms|"
+    r"pricing question every expert|course wrong|"
+    r"<!doctype html|<html\b|"
+    r"订单已生成|订单支付提醒|请及时支付|payment reminder|"
+    r"privacy policy|隐私政策|terms of service|服务条款|terms update|policy update|"
+    r"no action is required|无需操作|do not reply|automated notification)",
+    re.I,
+)
+
+LOW_VALUE_PRIVATE_SIGNAL_RE = re.compile(
+    r"("
+    r"取消订阅|隐私\s*[·・]\s*条款|privacy\s*[·・]\s*terms|"
+    r"you have \d+ new messages?|view messages?:?\s*https?://|linkedin\.com/comm/messaging|"
+    r"订单支付成功|支付成功|payment successful|invoice paid|"
+    r"官方安全中心|账号验证|账户验证|安全中心提醒|tregsafety\.com|"
+    r"验证码|verification code|login code|security code"
+    r")",
+    re.I,
+)
+
+
+def is_low_value_gmail_noise_text(text: str) -> bool:
+    return bool(GMAIL_LOW_VALUE_TEXT_RE.search(str(text or "")))
+
+
+def is_low_value_private_signal_text(text: str) -> bool:
+    value = str(text or "")
+    return bool(GMAIL_LOW_VALUE_TEXT_RE.search(value) or LOW_VALUE_PRIVATE_SIGNAL_RE.search(value))
+
+
+def is_generic_agenda_query(query: str) -> bool:
+    return bool(GENERIC_AGENDA_QUERY_RE.search(str(query or "").lower()))
+
+
+def is_meeting_agenda_query(query: str) -> bool:
+    return bool(MEETING_AGENDA_QUERY_RE.search(str(query or "")))
+
+
+def agenda_item_semantic_text(item: dict[str, Any]) -> str:
+    time_window = item.get("time_window") if isinstance(item.get("time_window"), dict) else {}
+    values: list[Any] = [
+        item.get("title"),
+        item.get("type"),
+        item.get("place"),
+        time_window.get("raw_text"),
+        time_window.get("text"),
+        time_window.get("display"),
+    ]
+    values.extend(item.get("participants") or [])
+    values.extend(item.get("missing_fields") or [])
+    metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
+    for key in ("summary", "source_summary", "body"):
+        values.append(metadata.get(key))
+    return "\n".join(str(value or "") for value in values)
+
+
+def is_meeting_agenda_item(item: dict[str, Any]) -> bool:
+    return bool(MEETING_AGENDA_ITEM_RE.search(agenda_item_semantic_text(item)))
+
+
+def is_upcoming_agenda_query(query: str) -> bool:
+    return bool(UPCOMING_AGENDA_QUERY_RE.search(str(query or "")))
+
+
+def agenda_item_start_datetime(item: dict[str, Any]) -> Optional[datetime]:
+    time_window = item.get("time_window") if isinstance(item.get("time_window"), dict) else {}
+    for key in ("start", "at", "start_at"):
+        raw_value = time_window.get(key)
+        if not raw_value:
+            continue
+        try:
+            parsed = datetime.fromisoformat(str(raw_value).replace("Z", "+00:00"))
+            return parsed if parsed.tzinfo else parsed.replace(tzinfo=USER_TIMEZONE)
+        except ValueError:
+            continue
+    raw_date = time_window.get("date") or time_window.get("display_date")
+    if raw_date:
+        try:
+            return datetime.fromisoformat(str(raw_date)).replace(tzinfo=USER_TIMEZONE)
+        except ValueError:
+            pass
+    display = str(time_window.get("display") or time_window.get("text") or "")
+    match = re.search(r"\b(\d{4}-\d{2}-\d{2})(?:[^\d]+(\d{1,2}):(\d{2}))?", display)
+    if not match:
+        return None
+    hour = int(match.group(2) or 0)
+    minute = int(match.group(3) or 0)
+    try:
+        return datetime.fromisoformat(match.group(1)).replace(hour=hour, minute=minute, tzinfo=USER_TIMEZONE)
+    except ValueError:
+        return None
+
+
+def agenda_item_is_dated_past(item: dict[str, Any], *, now: Optional[datetime] = None) -> bool:
+    start = agenda_item_start_datetime(item)
+    if start is None:
+        return False
+    current = now or datetime.now(USER_TIMEZONE)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=USER_TIMEZONE)
+    return start.astimezone(USER_TIMEZONE) < current.astimezone(USER_TIMEZONE)
+
+
+RECENT_AGENDA_QUERY_RE = re.compile(r"(最近|刚才|刚刚|recent)", re.I)
+PAST_AGENDA_QUERY_RE = re.compile(r"(上次|之前|过去|历史|已发生|已过去|已过期|刚才|刚刚|last|previous|past)", re.I)
+CANCELLED_AGENDA_QUERY_RE = re.compile(r"(取消|被取消|不见面|不用见|不去了|取消了|cancelled|canceled|cancel)", re.I)
+SPECIFIC_AGENDA_TIME_QUERY_RE = re.compile(r"(几月几号|哪天|日期|几点|什么时候|具体时间|时间|when)", re.I)
+AGENDA_HISTORY_LOOKUP_RE = re.compile(
+    r"(来源|证据|缺什么|待补充|还缺|从哪|谁说|"
+    r"[0-2]?\d\s*点\s*前|截止|报价|成本|利润率|保单|保险|合同)"
+)
+RELATIVE_AGENDA_TEXT_RE = re.compile(r"(今天|明天|后天|今晚|明早|明晚|周[一二三四五六日天末]|星期[一二三四五六日天])")
+ACTIVE_AGENDA_STATUSES = {"scheduled", "pending", "confirmed", "active"}
+CANCELLED_AGENDA_STATUSES = {"cancelled", "canceled"}
+
+
+def is_recent_agenda_query(query: str) -> bool:
+    return bool(RECENT_AGENDA_QUERY_RE.search(str(query or "")))
+
+
+def is_past_agenda_query(query: str) -> bool:
+    return bool(PAST_AGENDA_QUERY_RE.search(str(query or "")))
+
+
+def is_cancelled_agenda_query(query: str) -> bool:
+    return bool(CANCELLED_AGENDA_QUERY_RE.search(str(query or "")))
+
+
+def is_specific_agenda_time_query(query: str) -> bool:
+    return bool(SPECIFIC_AGENDA_TIME_QUERY_RE.search(str(query or "")))
+
+
+def is_agenda_history_lookup_query(query: str) -> bool:
+    return bool(AGENDA_HISTORY_LOOKUP_RE.search(str(query or "")))
+
+
+def parse_agenda_datetime_value(value: Any) -> Optional[datetime]:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=USER_TIMEZONE)
+    return parsed.astimezone(USER_TIMEZONE)
+
+
+def agenda_item_relative_anchor_datetime(item: dict[str, Any]) -> Optional[datetime]:
+    time_window = item.get("time_window") if isinstance(item.get("time_window"), dict) else {}
+    metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
+    for value in (
+        time_window.get("anchor_time"),
+        time_window.get("source_event_timestamp"),
+        metadata.get("source_event_timestamp"),
+        item.get("updated_at"),
+        item.get("created_at"),
+    ):
+        parsed = parse_agenda_datetime_value(value)
+        if parsed:
+            return parsed
+    return None
+
+
+def agenda_item_has_relative_time_text(item: dict[str, Any]) -> bool:
+    time_window = item.get("time_window") if isinstance(item.get("time_window"), dict) else {}
+    text = " ".join(
+        str(value or "")
+        for value in (
+            item.get("title"),
+            time_window.get("raw_text"),
+            time_window.get("text"),
+            time_window.get("display"),
+        )
+    )
+    return bool(RELATIVE_AGENDA_TEXT_RE.search(text))
+
+
+def query_mentions_relative_agenda_time(query: str) -> bool:
+    return bool(RELATIVE_AGENDA_TEXT_RE.search(str(query or "")))
+
+
+def agenda_item_relative_time_matches_query(query: str, item: dict[str, Any]) -> bool:
+    query_text = str(query or "")
+    item_text = agenda_item_semantic_text(item)
+    marker_groups = [
+        ("今天", ("今天", "今晚", "明早")),
+        ("今晚", ("今晚", "今天晚上")),
+        ("明天", ("明天", "明早", "明晚")),
+        ("后天", ("后天",)),
+        ("周一", ("周一", "星期一")),
+        ("周二", ("周二", "星期二")),
+        ("周三", ("周三", "星期三")),
+        ("周四", ("周四", "星期四")),
+        ("周五", ("周五", "星期五")),
+        ("周六", ("周末", "周六", "星期六")),
+        ("周日", ("周末", "周日", "周天", "星期日", "星期天")),
+        ("周末", ("周末", "周六", "周日", "周天", "星期六", "星期日", "星期天")),
+    ]
+    return any(
+        query_marker in query_text and any(item_marker in item_text for item_marker in item_markers)
+        for query_marker, item_markers in marker_groups
+    )
+
+
+def agenda_item_is_stale_relative(item: dict[str, Any], *, now: Optional[datetime] = None) -> bool:
+    if agenda_item_start_datetime(item) is not None:
+        return False
+    if not agenda_item_has_relative_time_text(item):
+        return False
+    anchor = agenda_item_relative_anchor_datetime(item)
+    if not anchor:
+        return False
+    current = now or datetime.now(USER_TIMEZONE)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=USER_TIMEZONE)
+    return anchor.astimezone(USER_TIMEZONE) + timedelta(days=2) < current.astimezone(USER_TIMEZONE)
+
+
+def agenda_item_with_time_status(item: dict[str, Any], status: str) -> dict[str, Any]:
+    annotated = dict(item)
+    annotated["time_status"] = status
+    return annotated
+
+
+def is_low_value_agenda_item(item: dict[str, Any]) -> bool:
+    text = json.dumps(item, ensure_ascii=False, default=str)
+    metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
+    source = str(metadata.get("source") or metadata.get("source_type") or item.get("source") or "").strip().lower()
+    if source in {"gmail", "telegram", "linkedin"} and is_low_value_private_signal_text(text):
+        return True
+    return bool(LOW_VALUE_AGENDA_TEXT_RE.search(text))
+
+
 def agenda_item_matches_query(query: str, item: dict[str, Any]) -> bool:
+    if is_low_value_agenda_item(item):
+        return False
     query_text = str(query or "").lower()
     item_text = json.dumps(item, ensure_ascii=False, default=str).lower()
     tokens = set(query_tokens(query_text))
+    place = str(item.get("place") or "").strip().lower()
+    if is_cancelled_agenda_query(query) and str(item.get("status") or "").lower() in {"cancelled", "canceled"}:
+        return True
+    if agenda_place_matches_query(query, item):
+        return True
     if tokens and any(token in item_text for token in tokens):
         return True
 
@@ -9204,6 +13275,11 @@ def agenda_item_matches_query(query: str, item: dict[str, Any]) -> bool:
         if query_marker in query_text and any(marker in item_text for marker in item_markers):
             return True
 
+    mentioned_sources = mentioned_agenda_sources(query)
+    if mentioned_sources and agenda_source_matches(item, mentioned_sources):
+        if re.search(r"(刚才|最近|日程|安排|会议|开会|会面|见面|提醒|截止|什么时候|哪里|地点|时间|几点|schedule|meeting|calendar)", query_text):
+            return True
+
     participants = [str(value).lower() for value in item.get("participants") or []]
     if participants and any(participant and participant in query_text for participant in participants):
         return True
@@ -9214,16 +13290,352 @@ def agenda_item_matches_query(query: str, item: dict[str, Any]) -> bool:
     return False
 
 
-def relevant_agenda_items(query: str, agenda_context: list[dict[str, Any]], limit: int = 6) -> list[dict[str, Any]]:
-    selected: list[dict[str, Any]] = []
-    for item in agenda_context:
-        if str(item.get("status") or "scheduled") in {"done", "dismissed", "cancelled", "canceled"}:
+AGENDA_SOURCE_ALIASES = {
+    "whatsapp": {"whatsapp", "wa", "web.whatsapp.com"},
+    "telegram": {"telegram", "tg", "web.telegram.org"},
+    "gmail": {"gmail", "google mail", "email", "mail"},
+}
+
+
+def mentioned_agenda_sources(query: str) -> set[str]:
+    query_text = str(query or "").lower()
+    mentioned: set[str] = set()
+    for source, aliases in AGENDA_SOURCE_ALIASES.items():
+        if any(alias in query_text for alias in aliases):
+            mentioned.add(source)
+    return mentioned
+
+
+def agenda_item_source(item: dict[str, Any]) -> str:
+    metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
+    source = metadata.get("source") or metadata.get("source_type") or item.get("source") or ""
+    return str(source).lower()
+
+
+def agenda_source_matches(item: dict[str, Any], sources: set[str]) -> bool:
+    if not sources:
+        return False
+    item_source = agenda_item_source(item)
+    for source in sources:
+        if item_source == source or item_source in AGENDA_SOURCE_ALIASES.get(source, set()):
+            return True
+    return False
+
+
+def agenda_source_event_evidence_score(item: dict[str, Any]) -> float:
+    metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
+    evidence = metadata.get("source_event_evidence")
+    if not isinstance(evidence, list) or not evidence:
+        return 0.0
+
+    scores: list[float] = []
+    for row in evidence:
+        if not isinstance(row, dict):
             continue
+        scope = str(row.get("capture_scope") or "").strip().lower()
+        event_type = str(row.get("event_type") or "").strip().lower()
+        message = str(row.get("message") or row.get("visible_text") or "").strip()
+        chat_name = str(row.get("chat_name") or "").strip()
+
+        score = 0.0
+        if scope == "history_scroll_sync":
+            score += 70.0
+        elif "open_chat" in event_type:
+            score += 35.0
+        elif scope == "mutation_observer":
+            score += 20.0
+        elif scope == "chat_list_preview":
+            score -= 100.0
+
+        if not chat_name and agenda_item_source(item) == "whatsapp":
+            score -= 8.0
+        if message.count("\n") >= 4:
+            score -= 40.0
+        if LOW_VALUE_AGENDA_TEXT_RE.search(message):
+            score -= 120.0
+        scores.append(score)
+    return max(scores) if scores else 0.0
+
+
+def agenda_time_text_consistency_score(item: dict[str, Any]) -> float:
+    time_window = item.get("time_window") if isinstance(item.get("time_window"), dict) else {}
+    text = " ".join(
+        str(value or "")
+        for value in (
+            item.get("title"),
+            time_window.get("raw_text"),
+            time_window.get("text"),
+            time_window.get("display"),
+        )
+    )
+    start = agenda_item_start_datetime(item)
+    if start is None:
+        return 0.0
+    minute = start.astimezone(USER_TIMEZONE).minute
+    if re.search(r"\d{1,2}\s*点\s*半", text):
+        return 35.0 if minute == 30 else -120.0
+    if re.search(r"\b\d{1,2}:30\b", text):
+        return 20.0 if minute == 30 else -80.0
+    return 0.0
+
+
+def agenda_participant_matches_query(query: str, item: dict[str, Any]) -> bool:
+    query_text = str(query or "").lower()
+    participants = [str(value).lower() for value in item.get("participants") or []]
+    for participant in participants:
+        if not participant:
+            continue
+        participant_parts = {part for part in re.split(r"[_\-\s]+", participant) if len(part) >= 2}
+        if participant in query_text or any(part in query_text for part in participant_parts):
+            return True
+    return False
+
+
+def agenda_place_matches_query(query: str, item: dict[str, Any]) -> bool:
+    query_text = str(query or "").lower()
+    place = str(item.get("place") or "").strip().lower()
+    return bool(place and len(place) >= 2 and place in query_text)
+
+
+def agenda_item_relevance_score(
+    query: str,
+    item: dict[str, Any],
+    mentioned_sources: set[str],
+    *,
+    now: Optional[datetime] = None,
+) -> float:
+    query_text = str(query or "").lower()
+    item_text = json.dumps(item, ensure_ascii=False, default=str).lower()
+    tokens = set(query_tokens(query_text))
+    score = 0.0
+    if agenda_source_matches(item, mentioned_sources):
+        score += 100.0
+    if agenda_participant_matches_query(query, item):
+        score += 100.0
+    score += min(sum(1 for token in tokens if token in item_text), 5)
+    if agenda_item_source(item) == "nomi_chat":
+        score -= 50.0
+    if item.get("certainty") == "exact":
+        score += 5.0
+    if item.get("needs_clarification"):
+        score -= 2.0
+    score += agenda_source_event_evidence_score(item)
+    score += agenda_time_text_consistency_score(item)
+    start = agenda_item_start_datetime(item)
+    if start:
+        current = now or datetime.now(USER_TIMEZONE)
+        if current.tzinfo is None:
+            current = current.replace(tzinfo=USER_TIMEZONE)
+        start_local = start.astimezone(USER_TIMEZONE)
+        current_local = current.astimezone(USER_TIMEZONE)
+        if start_local >= current_local:
+            hours_until = max((start_local - current_local).total_seconds() / 3600.0, 0.0)
+            score += 80.0 + max(0.0, 24.0 - min(hours_until, 24.0))
+        else:
+            hours_ago = max((current_local - start_local).total_seconds() / 3600.0, 0.0)
+            score -= min(60.0, hours_ago / 12.0)
+            if item.get("time_status") == "past" and is_recent_agenda_query(query):
+                score += max(0.0, 24.0 - min(hours_ago, 24.0))
+    updated_at = parse_context_datetime(item.get("updated_at") or item.get("created_at"))
+    if updated_at:
+        age_hours = max((datetime.now(timezone.utc) - updated_at.astimezone(timezone.utc)).total_seconds() / 3600.0, 0)
+        score += max(0.0, 6.0 - min(age_hours / 24.0, 6.0))
+    try:
+        score += min(float(item.get("confidence") or 0), 1.0)
+    except (TypeError, ValueError):
+        pass
+    return score
+
+
+def relevant_agenda_items(
+    query: str,
+    agenda_context: list[dict[str, Any]],
+    limit: int = 6,
+    *,
+    now: Optional[datetime] = None,
+) -> list[dict[str, Any]]:
+    if limit <= 0:
+        return []
+    candidates: list[dict[str, Any]] = []
+    eligible: list[dict[str, Any]] = []
+    upcoming_query = is_upcoming_agenda_query(query)
+    past_query = is_past_agenda_query(query)
+    cancelled_query = is_cancelled_agenda_query(query)
+    specific_time_query = is_specific_agenda_time_query(query)
+    history_lookup_query = is_agenda_history_lookup_query(query)
+    relative_time_query = query_mentions_relative_agenda_time(query)
+    recent_past: list[dict[str, Any]] = []
+    for item in agenda_context:
+        status = str(item.get("status") or "scheduled").lower()
+        if status in {"done", "dismissed"}:
+            continue
+        if cancelled_query:
+            if status not in CANCELLED_AGENDA_STATUSES:
+                continue
+            item = agenda_item_with_time_status(item, "canceled")
+        elif status in CANCELLED_AGENDA_STATUSES or status not in ACTIVE_AGENDA_STATUSES:
+            continue
+        if is_low_value_agenda_item(item):
+            continue
+        if (
+            relative_time_query
+            and agenda_item_start_datetime(item) is None
+            and not agenda_item_relative_time_matches_query(query, item)
+        ):
+            continue
+        if agenda_item_is_dated_past(item, now=now):
+            past_item = agenda_item_with_time_status(item, "past")
+            if upcoming_query:
+                if is_recent_agenda_query(query) and (
+                    agenda_item_matches_query(query, past_item)
+                    or (is_generic_agenda_query(query) and is_meeting_agenda_item(past_item))
+                ):
+                    recent_past.append(past_item)
+                continue
+            if not past_query and not (
+                specific_time_query and agenda_item_matches_query(query, past_item)
+            ) and not (
+                history_lookup_query and agenda_item_matches_query(query, past_item)
+            ):
+                continue
+            item = past_item
+        if upcoming_query and agenda_item_is_stale_relative(item, now=now):
+            continue
+        eligible.append(item)
         if agenda_item_matches_query(query, item):
-            selected.append(item)
-        if len(selected) >= limit:
-            break
-    return selected
+            candidates.append(item)
+    if candidates and is_meeting_agenda_query(query):
+        candidates = [item for item in candidates if is_meeting_agenda_item(item)]
+    if not candidates:
+        if is_generic_agenda_query(query):
+            candidates = eligible
+            if is_meeting_agenda_query(query):
+                meeting_candidates = [item for item in candidates if is_meeting_agenda_item(item)]
+                if meeting_candidates:
+                    candidates = meeting_candidates
+                elif upcoming_query and is_recent_agenda_query(query) and recent_past:
+                    candidates = recent_past
+                else:
+                    candidates = []
+        else:
+            return []
+    if not candidates and upcoming_query and is_recent_agenda_query(query) and recent_past:
+        candidates = recent_past
+
+    mentioned_sources = mentioned_agenda_sources(query)
+    source_matched = [item for item in candidates if agenda_source_matches(item, mentioned_sources)]
+    if source_matched:
+        candidates = source_matched
+
+    participant_matched = [item for item in candidates if agenda_participant_matches_query(query, item)]
+    if participant_matched:
+        candidates = participant_matched
+
+    place_matched = [item for item in candidates if agenda_place_matches_query(query, item)]
+    if place_matched:
+        candidates = place_matched
+
+    if specific_time_query and not history_lookup_query and not past_query and not upcoming_query:
+        non_past_candidates = [item for item in candidates if item.get("time_status") != "past"]
+        if non_past_candidates:
+            candidates = non_past_candidates
+
+    ranked = sorted(
+        enumerate(candidates),
+        key=lambda pair: (agenda_item_relevance_score(query, pair[1], mentioned_sources, now=now), -pair[0]),
+        reverse=True,
+    )
+    return [item for _, item in ranked[:limit]]
+
+
+def annotate_agenda_source_event_evidence(
+    conn: psycopg.Connection,
+    items: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    source_event_ids: set[str] = set()
+    for item in items:
+        for event_id in item.get("source_event_ids") or []:
+            if event_id:
+                source_event_ids.add(str(event_id))
+    if not source_event_ids:
+        return items
+    try:
+        rows = conn.execute(
+            """
+            SELECT event_id::text,
+                   event_type,
+                   raw_data->>'capture_scope' AS capture_scope,
+                   raw_data->>'chat_name' AS chat_name,
+                   raw_data->>'sender' AS sender,
+                   raw_data->>'message' AS message,
+                   raw_data->>'visible_text' AS visible_text
+            FROM events
+            WHERE event_id::text = ANY(%s::text[])
+            """,
+            (list(source_event_ids),),
+        ).fetchall()
+    except (psycopg.Error, AttributeError):
+        return items
+
+    by_id = {
+        str(row[0]): {
+            "event_id": str(row[0]),
+            "event_type": row[1] or "",
+            "capture_scope": row[2] or "",
+            "chat_name": row[3] or "",
+            "sender": row[4] or "",
+            "message": row[5] or "",
+            "visible_text": row[6] or "",
+        }
+        for row in rows
+    }
+    annotated: list[dict[str, Any]] = []
+    for item in items:
+        metadata = dict(item.get("metadata") or {})
+        evidence = [by_id[str(event_id)] for event_id in item.get("source_event_ids") or [] if str(event_id) in by_id]
+        if evidence:
+            metadata["source_event_evidence"] = evidence
+            item = {**item, "metadata": metadata}
+        annotated.append(item)
+    return annotated
+
+
+MAX_AGENDA_EVIDENCE_TEXT_CHARS = 320
+
+
+def compact_agenda_context_item(item: dict[str, Any]) -> dict[str, Any]:
+    metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
+    evidence = metadata.get("source_event_evidence")
+    if not isinstance(evidence, list) or not evidence:
+        return item
+
+    compact_evidence: list[dict[str, Any]] = []
+    for row in evidence:
+        if not isinstance(row, dict):
+            continue
+        message = str(row.get("message") or "").strip()
+        visible_text = str(row.get("visible_text") or "").strip()
+        evidence_text = message or visible_text
+        if evidence_text and LOW_VALUE_AGENDA_TEXT_RE.search(evidence_text) and len(evidence_text) > MAX_AGENDA_EVIDENCE_TEXT_CHARS:
+            continue
+        compact_row = {
+            key: row.get(key)
+            for key in ("event_id", "event_type", "capture_scope", "chat_name", "sender")
+            if row.get(key)
+        }
+        if message:
+            compact_row["message"] = message[:MAX_AGENDA_EVIDENCE_TEXT_CHARS]
+        elif visible_text:
+            compact_row["visible_text"] = visible_text[:MAX_AGENDA_EVIDENCE_TEXT_CHARS]
+        if compact_row:
+            compact_evidence.append(compact_row)
+
+    compact_metadata = dict(metadata)
+    if compact_evidence:
+        compact_metadata["source_event_evidence"] = compact_evidence
+    else:
+        compact_metadata.pop("source_event_evidence", None)
+    return {**item, "metadata": compact_metadata}
 
 
 def retrieve_active_agenda_context(
@@ -9235,22 +13647,28 @@ def retrieve_active_agenda_context(
         with db() as conn:
             if not hasattr(conn, "execute"):
                 return []
+            include_cancelled = is_cancelled_agenda_query(query)
+            status_filter = (
+                "status IN ('cancelled', 'canceled')"
+                if include_cancelled
+                else "status IN ('scheduled', 'pending', 'confirmed', 'active')"
+            )
             rows = conn.execute(
-                """
+                f"""
                 SELECT id, type, title, status, certainty, time_window, place, participants,
                        missing_fields, needs_clarification, confidence, source_event_ids,
                        metadata, created_at, updated_at,
                        NULL AS operation, NULL AS reason, NULL AS version_created_at
                 FROM agenda_items
-                WHERE status NOT IN ('done', 'dismissed', 'cancelled', 'canceled')
+                WHERE {status_filter}
                 ORDER BY needs_clarification DESC, updated_at DESC
                 LIMIT %s
                 """,
-                (max(limit * 4, 12),),
+                (max(limit * 20, 80),),
             ).fetchall()
+            candidates = annotate_agenda_source_event_evidence(conn, [agenda_item_from_row(row) for row in rows])
     except (psycopg.Error, AttributeError):
         return []
-    candidates = [agenda_item_from_row(row) for row in rows]
     return relevant_agenda_items(query, candidates, limit=limit)
 
 
@@ -9387,7 +13805,9 @@ def build_context_pack(
     agenda_context: Optional[list[dict[str, Any]]] = None,
     source_context: Optional[list[dict[str, Any]]] = None,
     task_context: Optional[list[dict[str, Any]]] = None,
+    career_context: Optional[dict[str, Any]] = None,
     max_dialogue_items: int = 64,
+    max_agenda_items: int = 6,
     context_budget: Optional[dict[str, Any]] = None,
     request_scope: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
@@ -9396,6 +13816,7 @@ def build_context_pack(
     agenda_context = agenda_context or []
     source_context = source_context or []
     task_context = task_context or []
+    career_context = career_context or {}
     request_scope = request_scope or {}
     selected_dialogue = relevant_assistant_dialogue_items(
         message,
@@ -9418,7 +13839,10 @@ def build_context_pack(
             if key not in selected_by_id:
                 selected_dialogue.append({**item, "layer": "assistant_dialogue", "source": "session_search"})
                 selected_by_id[key] = item
-    selected_agenda = relevant_agenda_items(message, agenda_context, limit=6)
+    selected_agenda = [
+        compact_agenda_context_item(item)
+        for item in relevant_agenda_items(message, agenda_context, limit=max(0, int(max_agenda_items)))
+    ]
     excluded: list[dict[str, Any]] = []
     warnings: list[dict[str, Any]] = []
     scoped_memory: list[dict[str, Any]] = []
@@ -9467,7 +13891,7 @@ def build_context_pack(
     )
     packed_agenda, agenda_section = pack_context_section(
         "agenda_context",
-        score_context_candidates(message, selected_agenda, "agenda_context", request_scope),
+        score_context_candidates(message, selected_agenda, "agenda_context", request_scope, sort_items=False),
         budget,
         warnings,
         excluded,
@@ -9480,7 +13904,12 @@ def build_context_pack(
         packed_items, section = pack_context_section(section_name, section_items, budget, warnings, excluded)
         packed_memory.extend(packed_items)
         memory_sections.append(section)
-    sections = [request_section, dialogue_section, source_section, task_section, agenda_section] + memory_sections
+    career_section = {
+        "name": "career_context",
+        "tokens_used": estimate_context_tokens(career_context) if career_context else 0,
+        "items": [career_context] if career_context else [],
+    }
+    sections = [request_section, dialogue_section, source_section, task_section, agenda_section, career_section] + memory_sections
     input_used = sum(int(section.get("tokens_used") or 0) for section in sections)
     included_event_ids = (
         collect_context_ids(packed_request)
@@ -9506,6 +13935,7 @@ def build_context_pack(
         "source_context": packed_source,
         "task_context": packed_task,
         "agenda_context": packed_agenda,
+        "career_context": career_context,
         "included_event_ids": included_event_ids,
         "included_memory_ids": list(dict.fromkeys(included_memory_ids)),
         "included_agenda_ids": list(dict.fromkeys(included_agenda_ids)),
@@ -9530,19 +13960,21 @@ def retrieve_assistant_dialogue_context(
     conversation_id: Optional[str] = None,
     limit: int = 8,
 ) -> list[dict[str, Any]]:
-    patterns = token_patterns(query, max_tokens=4)
     conditions = []
     params: list[Any] = []
+    scoped_to_conversation = False
     if conversation_id:
         try:
             conversation_uuid = uuid.UUID(str(conversation_id))
             conditions.append("t.conversation_id = %s")
             params.append(conversation_uuid)
+            scoped_to_conversation = True
         except ValueError:
             pass
-    for pattern in patterns:
-        conditions.append("t.content ILIKE %s")
-        params.append(pattern)
+    if not scoped_to_conversation:
+        for pattern in token_patterns(query, max_tokens=4):
+            conditions.append("t.content ILIKE %s")
+            params.append(pattern)
     where = f"WHERE {' OR '.join(conditions)}" if conditions else ""
     try:
         with db() as conn:
@@ -9609,10 +14041,84 @@ def persist_context_snapshot(
     )
 
 
+def context_layer_counts(context_pack: dict[str, Any]) -> dict[str, int]:
+    return {
+        "current_request": len(context_pack.get("current_request") or []),
+        "assistant_dialogue": len(context_pack.get("assistant_dialogue") or []),
+        "source_context": len(context_pack.get("source_context") or []),
+        "task_context": len(context_pack.get("task_context") or []),
+        "agenda_context": len(context_pack.get("agenda_context") or []),
+        "memory_context": len(context_pack.get("memory_context") or []),
+    }
+
+
+def context_fusion_summary(context_pack: dict[str, Any]) -> dict[str, Any]:
+    sections = context_pack.get("sections") if isinstance(context_pack.get("sections"), list) else []
+    return {
+        "sections": [
+            {
+                "name": section.get("name"),
+                "item_count": len(section.get("items") or []),
+                "tokens_used": int(section.get("tokens_used") or 0),
+                "tokens_budget": int(section.get("tokens_budget") or 0),
+            }
+            for section in sections
+            if isinstance(section, dict)
+        ],
+        "excluded_count": len(context_pack.get("excluded") or []),
+        "warning_count": len(context_pack.get("warnings") or []),
+        "retrieval_modes": context_pack.get("retrieval_modes") or {},
+    }
+
+
+def persist_context_route_trace(
+    conn: psycopg.Connection,
+    *,
+    event_id: str,
+    conversation_id: str,
+    route_decision: dict[str, Any],
+    fetch_limits: dict[str, Any],
+    fetch_latency: dict[str, Any],
+    context_pack: dict[str, Any],
+) -> str:
+    trace_id = str(uuid.uuid4())
+    conn.execute(
+        """
+        INSERT INTO context_route_traces (
+          id, event_id, conversation_id, intent, reason, route_decision, fetch_limits,
+          fetch_latency, layer_counts, fusion_summary, token_budget
+        )
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        """,
+        (
+            trace_id,
+            event_id,
+            conversation_id,
+            str(route_decision.get("intent") or ""),
+            str(route_decision.get("reason") or ""),
+            jsonb_param(route_decision),
+            jsonb_param(fetch_limits),
+            jsonb_param(fetch_latency),
+            jsonb_param(context_layer_counts(context_pack)),
+            jsonb_param(context_fusion_summary(context_pack)),
+            jsonb_param(context_pack.get("token_budget") or {}),
+        ),
+    )
+    return trace_id
+
+
+def safe_persist_context_route_trace(conn: psycopg.Connection, **kwargs: Any) -> Optional[str]:
+    try:
+        return persist_context_route_trace(conn, **kwargs)
+    except Exception:
+        return None
+
+
 def retrieve_context(query: str, limit: int, request_scope: Optional[dict[str, Any]] = None) -> list[dict[str, Any]]:
     pattern = f"%{query}%"
     graph_pattern = normalize_retrieval_pattern(query)
     patterns = token_patterns(query)
+    literal_identifiers = extract_literal_identifiers(query)
     query_vector = vector_literal(text_embedding(query))
     plan = plan_retrieval(query, limit)
     with db() as conn:
@@ -9700,16 +14206,363 @@ def retrieve_context(query: str, limit: int, request_scope: Optional[dict[str, A
                 """,
                 (query_vector, plan.vector_limit),
             ).fetchall()
-    context = build_reasoning_context(state_rows, timeline_rows, semantic_rows, fact_rows, bm25_rows, vector_rows)
+        if literal_identifiers:
+            literal_conditions = " OR ".join(
+                [
+                    "e.raw_data::text ILIKE %s OR COALESCE(s.summary, '') ILIKE %s OR COALESCE(v.metadata, '{}'::jsonb)::text ILIKE %s"
+                    for _ in literal_identifiers
+                ]
+            )
+            literal_params: list[Any] = []
+            for identifier in literal_identifiers:
+                literal_pattern = f"%{identifier}%"
+                literal_params.extend([literal_pattern, literal_pattern, literal_pattern])
+            literal_rows = conn.execute(
+                f"""
+                /* literal_identifier_recall */
+                WITH matched_literal_events AS (
+                SELECT DISTINCT ON (e.event_id)
+                       e.timestamp, e.source, e.event_type, e.raw_data, s.summary, s.intent, s.importance,
+                       COALESCE(v.metadata, '{{}}'::jsonb) AS metadata,
+                       %s AS matched_identifier,
+                       e.raw_data_private
+                FROM events e
+                LEFT JOIN semantic_events s ON s.event_id = e.event_id
+                LEFT JOIN memory_vectors v ON v.event_id = e.event_id
+                WHERE {literal_conditions}
+                ORDER BY e.event_id, e.timestamp DESC
+                )
+                SELECT *
+                FROM matched_literal_events
+                ORDER BY
+                  CASE WHEN source = 'nomi_chat' THEN 1 ELSE 0 END,
+                  CASE WHEN raw_data_private IS NULL THEN 1 ELSE 0 END,
+                  timestamp DESC
+                LIMIT %s
+                """,
+                (literal_identifiers[0], *literal_params, max(limit, len(literal_identifiers), 4)),
+            ).fetchall()
+        else:
+            literal_rows = []
+    context = build_reasoning_context(
+        state_rows,
+        timeline_rows,
+        semantic_rows,
+        fact_rows,
+        bm25_rows,
+        vector_rows,
+        literal_rows,
+        query=query,
+    )
     policy = infer_memory_access_policy(query, explicit_context=request_scope or {})
     scoped_context = filter_context_by_memory_access_policy(context, policy)
+    scoped_context = filter_literal_identifier_noise(scoped_context, query)
     return rerank_context(query, scoped_context)[: max(limit, 1)]
+
+
+def retrieve_career_chat_context(limit: int = 8) -> dict[str, Any]:
+    bounded_limit = max(1, min(int(limit or 8), 20))
+    try:
+        with db() as conn:
+            profile_rows = conn.execute(
+                """
+                SELECT id, headline, target_roles, target_locations, skills, source_event_ids, payload, updated_at
+                FROM career_profiles
+                ORDER BY updated_at DESC
+                LIMIT %s
+                """,
+                (min(bounded_limit, 4),),
+            ).fetchall()
+            resume_rows = conn.execute(
+                """
+                SELECT id, filename, file_type, status, source_event_ids, parsed_text, payload, created_at, updated_at
+                FROM career_resumes
+                WHERE status <> 'deleted'
+                ORDER BY CASE WHEN payload->>'is_default' = 'true' THEN 1 ELSE 0 END DESC,
+                         updated_at DESC
+                LIMIT %s
+                """,
+                (min(bounded_limit, 4),),
+            ).fetchall()
+            opportunity_rows = conn.execute(
+                """
+                SELECT id, source, title, company, location, url, status, fit_score,
+                       requirements, source_event_ids, payload, created_at, updated_at
+                FROM job_opportunities
+                ORDER BY updated_at DESC
+                LIMIT %s
+                """,
+                (bounded_limit,),
+            ).fetchall()
+            health_row = conn.execute(
+                """
+                SELECT status, last_event_at, last_injection_at, error_count, details, updated_at
+                FROM collector_health
+                WHERE collector = 'linkedin'
+                ORDER BY updated_at DESC
+                LIMIT 1
+                """
+            ).fetchone()
+    except (psycopg.errors.UndefinedTable, psycopg.errors.UndefinedColumn):
+        return {
+            "retrieval_status": "schema_missing",
+            "profiles": [],
+            "career_resumes": [],
+            "opportunities": [],
+            "linkedin": {"collection_status": "unknown", "browser_login_status": "unknown"},
+            "missing": ["career_schema"],
+        }
+    except psycopg.Error as exc:
+        return {
+            "retrieval_status": "error",
+            "profiles": [],
+            "career_resumes": [],
+            "opportunities": [],
+            "linkedin": {"collection_status": "unknown", "browser_login_status": "unknown"},
+            "error": str(exc)[:180],
+        }
+
+    opportunities = filter_stale_career_opportunity_rows(
+        [
+            row
+            for row in opportunity_rows
+            if not is_demo_career_opportunity(row) and not is_low_value_career_opportunity(row)
+        ],
+        career_context_freshness_anchor(profile_rows, resume_rows),
+    )
+    linkedin_details = health_row[4] if health_row and isinstance(health_row[4], dict) else {}
+    linkedin = {
+        "collection_status": collection_status_from_health(str(health_row[0] or "unknown")) if health_row else "unknown",
+        "browser_login_status": browser_login_status_from_details(linkedin_details) if health_row else "unknown",
+        "last_event_at": isoformat_or_value(health_row[1]) if health_row else None,
+        "last_injection_at": isoformat_or_value(health_row[2]) if health_row else None,
+        "error_count": int(health_row[3] or 0) if health_row else 0,
+        "updated_at": isoformat_or_value(health_row[5]) if health_row else None,
+    }
+    missing: list[str] = []
+    if not profile_rows:
+        missing.append("career_profile")
+    if not resume_rows:
+        missing.append("career_resume")
+    if not opportunities:
+        missing.append("job_opportunities")
+    return {
+        "retrieval_status": "ready",
+        "profiles": [career_profile_from_row(row) for row in profile_rows],
+        "career_resumes": [career_base_resume_from_row(row) for row in resume_rows],
+        "opportunities": [career_opportunity_from_row(row) for row in opportunities[:bounded_limit]],
+        "linkedin": linkedin,
+        "missing": missing,
+        "freshness": {
+            "profile_count": len(profile_rows),
+            "resume_count": len(resume_rows),
+            "opportunity_count": len(opportunities[:bounded_limit]),
+        },
+    }
+
+
+def career_context_freshness_anchor(profile_rows: list[Any], resume_rows: list[Any]) -> Optional[datetime]:
+    timestamps: list[datetime] = []
+    for row, index in [(row, 7) for row in profile_rows] + [(row, 8) for row in resume_rows]:
+        try:
+            parsed = parse_context_datetime(row[index])
+        except (IndexError, TypeError):
+            parsed = None
+        if parsed:
+            timestamps.append(parsed.astimezone(timezone.utc))
+    return max(timestamps) if timestamps else None
+
+
+def filter_stale_career_opportunity_rows(rows: list[Any], anchor: Optional[datetime]) -> list[Any]:
+    if not anchor:
+        return rows
+    normalized_anchor = anchor.astimezone(timezone.utc)
+    fresh_rows: list[Any] = []
+    for row in rows:
+        try:
+            updated_at = parse_context_datetime(row[12])
+        except (IndexError, TypeError):
+            updated_at = None
+        if updated_at and updated_at.astimezone(timezone.utc) >= normalized_anchor:
+            fresh_rows.append(row)
+    return fresh_rows
+
+
+def first_mapping(items: Any) -> dict[str, Any]:
+    if isinstance(items, list):
+        for item in items:
+            if isinstance(item, dict):
+                return item
+    return {}
+
+
+def career_context_to_job_search_pipeline_context(career_context: dict[str, Any]) -> dict[str, Any]:
+    profile = first_mapping(career_context.get("profiles"))
+    resume = first_mapping(career_context.get("career_resumes"))
+    pipeline_context: dict[str, Any] = {
+        "pipeline_id": "job_discovery_pipeline",
+        "career_profile": profile,
+    }
+    if resume:
+        payload = resume.get("payload") if isinstance(resume.get("payload"), dict) else {}
+        pipeline_context["resume"] = {
+            "resume_id": resume.get("resume_id") or resume.get("id"),
+            "filename": resume.get("filename"),
+            "summary": resume.get("parsed_text_summary") or payload.get("summary"),
+            "target_roles": payload.get("target_roles") or profile.get("target_roles") or [],
+            "target_locations": payload.get("target_locations") or profile.get("target_locations") or [],
+            "skills": payload.get("skills") or profile.get("skills") or [],
+            "payload": payload,
+        }
+    return pipeline_context
+
+
+def linkedin_job_search_status_from_pipeline(result: dict[str, Any]) -> dict[str, Any]:
+    output = result.get("output") if isinstance(result.get("output"), dict) else {}
+    planned = output.get("linkedin_job_search") if isinstance(output.get("linkedin_job_search"), dict) else {}
+    for call in result.get("provider_calls") or []:
+        if not isinstance(call, dict):
+            continue
+        command = call.get("command") if isinstance(call.get("command"), dict) else None
+        if call.get("action") == "browser.open_linkedin_job_search" and command:
+            return {**planned, "command": command}
+    return planned if planned.get("command") else {}
+
+
+def linkedin_job_search_connection_block(linked_in: dict[str, Any]) -> dict[str, Any]:
+    collection_status = str(linked_in.get("collection_status") or "unknown")
+    browser_login_status = str(linked_in.get("browser_login_status") or "unknown")
+    login_blocking_statuses = {"logged_out", "login_required", "authwall", "error", "blocked"}
+    if collection_status != "healthy" or browser_login_status in login_blocking_statuses:
+        reason = "linkedin_login_required" if browser_login_status in login_blocking_statuses else "linkedin_collection_unhealthy"
+        return {
+            "status": "blocked",
+            "source": "linkedin",
+            "reason": reason,
+            "collection_status": collection_status,
+            "browser_login_status": browser_login_status,
+            "expected_event_type": "linkedin_job_search_results",
+            "external_side_effect": False,
+        }
+    return {}
+
+
+def maybe_queue_linkedin_job_search_for_chat(message: str, career_context: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(career_context, dict) or career_context.get("retrieval_status") in {"schema_missing", "error"}:
+        return {}
+    linked_in = career_context.get("linkedin") if isinstance(career_context.get("linkedin"), dict) else {}
+    connection_block = linkedin_job_search_connection_block(linked_in)
+    if connection_block:
+        return connection_block
+    existing_opportunities = [item for item in career_context.get("opportunities") or [] if isinstance(item, dict)]
+    wants_fresh_search = bool(
+        re.search(
+            r"(最新|实时|重新找|再找|重新搜索|再搜|搜索|找找|"
+            r"\bsearch\b|\bfind\b|\blook\s+for\b|\bfresh\b|\blatest\b|\bnew\b)",
+            message or "",
+            re.IGNORECASE,
+        )
+    )
+    if existing_opportunities and linked_in.get("collection_status") == "healthy" and not wants_fresh_search:
+        return {}
+    pipeline_context = career_context_to_job_search_pipeline_context(career_context)
+    result = run_core_pipeline(message, pipeline_context)
+    planned = linkedin_job_search_status_from_pipeline(result)
+    command = planned.get("command") if isinstance(planned.get("command"), dict) else {}
+    if not command:
+        return {
+            "status": "not_planned",
+            "source": "linkedin",
+            "pipeline_id": str(result.get("pipeline_id") or ""),
+            "pipeline_status": str(result.get("status") or ""),
+            "external_side_effect": False,
+        }
+    command = dict(command)
+    search_terms = planned.get("search_terms") if isinstance(planned.get("search_terms"), dict) else {}
+    query = clean_linkedin_search_term(str(search_terms.get("query") or command.get("query") or ""), max_length=220)
+    location = clean_linkedin_search_term(str(search_terms.get("location") or command.get("location") or ""), max_length=120)
+    if not query:
+        return {
+            "status": "not_planned",
+            "source": "linkedin",
+            "pipeline_id": str(result.get("pipeline_id") or ""),
+            "pipeline_status": str(result.get("status") or ""),
+            "external_side_effect": False,
+        }
+    target_url = normalize_linkedin_job_search_url(str(planned.get("target_url") or command.get("url") or ""))
+    command.update(
+        {
+            "command_id": str(command.get("command_id") or uuid.uuid4()),
+            "action": "open_linkedin_job_search",
+            "source": "linkedin",
+            "url": target_url,
+            "host_fragment": "linkedin.com",
+            "query": query,
+            "location": location,
+            "expected_event_type": str(command.get("expected_event_type") or "linkedin_job_search_results"),
+            "created_at": str(command.get("created_at") or datetime.now(timezone.utc).isoformat()),
+            "external_side_effect": False,
+        }
+    )
+    search_terms = {"query": query, "location": location}
+    dedupe_key = f"browser:linkedin_job_search:dedupe:{linkedin_job_search_slug(query, location)}"
+    redis_obj = redis_client()
+    try:
+        existing = redis_obj.get(dedupe_key)
+    except Exception:
+        existing = None
+    if existing:
+        return {
+            "status": "duplicate_skipped",
+            "source": "linkedin",
+            "command_id": str(command["command_id"]),
+            "target_url": target_url,
+            "expected_event_type": str(command["expected_event_type"]),
+            "search_terms": search_terms,
+            "external_side_effect": False,
+            "pipeline_id": str(result.get("pipeline_id") or ""),
+            "pipeline_status": str(result.get("status") or ""),
+            "dedupe_key": dedupe_key,
+        }
+    if hasattr(redis_obj, "setex"):
+        redis_obj.setex(dedupe_key, LINKEDIN_JOB_SEARCH_DEDUPE_TTL_SECONDS, json.dumps(command, ensure_ascii=False))
+    elif hasattr(redis_obj, "set"):
+        redis_obj.set(dedupe_key, json.dumps(command, ensure_ascii=False))
+    if not hasattr(redis_obj, "rpush"):
+        return {}
+    redis_obj.rpush(BROWSER_COMMAND_QUEUE_KEY, json.dumps(command, ensure_ascii=False))
+    write_browser_command_status(
+        redis_obj,
+        command,
+        "queued",
+        details={
+            "source": "chat_job_query",
+            "pipeline_id": str(result.get("pipeline_id") or ""),
+            "pipeline_status": str(result.get("status") or ""),
+            "search_terms": search_terms,
+            "dedupe_key": dedupe_key,
+        },
+    )
+    return {
+        "status": "queued",
+        "source": "linkedin",
+        "command_id": str(command["command_id"]),
+        "target_url": target_url,
+        "expected_event_type": str(command["expected_event_type"]),
+        "search_terms": search_terms,
+        "external_side_effect": False,
+        "pipeline_id": str(result.get("pipeline_id") or ""),
+        "pipeline_status": str(result.get("status") or ""),
+        "dedupe_key": dedupe_key,
+    }
 
 
 @app.post("/api/chat")
 async def chat(body: ChatIn, x_par_password: Optional[str] = Header(default=None)) -> dict[str, Any]:
     require_password(x_par_password)
+    total_start_ms = monotonic_ms()
     redis_obj = redis_client()
+    initial_persist_start_ms = monotonic_ms()
     with db() as conn:
         user_turn = persist_assistant_turn(
             conn,
@@ -9718,36 +14571,97 @@ async def chat(body: ChatIn, x_par_password: Optional[str] = Header(default=None
             content=body.message,
             conversation_id=body.conversation_id,
             client_type=body.client_type,
+            tool_call_id=assistant_turn_idempotency_key(body.client_request_id, "user"),
         )
+        cached_assistant = find_cached_assistant_response(conn, body.client_request_id)
+    initial_persist_ms = elapsed_ms(initial_persist_start_ms)
+    if cached_assistant:
+        return {
+            "answer": cached_assistant["answer"],
+            "sources": [],
+            "conversation_id": cached_assistant["conversation_id"],
+            "client_request_id": normalize_client_request_id(body.client_request_id),
+            "duplicate": True,
+            "context_pack": {
+                "included_event_ids": [],
+                "included_memory_ids": [],
+                "included_agenda_ids": [],
+                "assistant_dialogue_count": 0,
+                "agenda_context_count": 0,
+                "memory_context_count": 0,
+                "source_context_count": 0,
+                "task_context_count": 0,
+                "token_budget": {},
+                "sections": [],
+                "excluded": [],
+                "warnings": ["duplicate_client_request_reused_cached_assistant_answer"],
+            },
+        }
     request_scope = infer_request_scope(body.message, body.ui_state)
-    source_context = dedupe_context_items(
-        normalize_ui_state_source_context(body.ui_state, request_scope)
-        + retrieve_current_source_context(body.message, request_scope, limit=6)
+    deterministic_route = route_chat_context(body.message, body.ui_state)
+    chat_route = await apply_semantic_context_router(body.message, body.ui_state, deterministic_route)
+    context_limits = context_fetch_limits(chat_route, body.limit)
+    context_start_ms = monotonic_ms()
+    context_candidate_limit = context_limits.get("memory") or chat_context_candidate_limit(body.limit)
+    fetchers = {
+        "source": lambda: dedupe_context_items(
+            normalize_ui_state_source_context(body.ui_state, request_scope)
+            + retrieve_current_source_context(body.message, request_scope, limit=context_limits.get("source", 0))
+        ),
+        "dialogue": lambda: retrieve_assistant_dialogue_context(
+            body.message,
+            conversation_id=user_turn["conversation_id"],
+            limit=context_limits.get("dialogue", 16),
+        ),
+        "agenda": lambda: retrieve_active_agenda_context(
+            body.message,
+            conversation_id=user_turn["conversation_id"],
+            limit=context_limits.get("agenda", 0),
+        ),
+        "tasks": lambda: retrieve_active_task_context(
+            body.message,
+            conversation_id=user_turn["conversation_id"],
+            limit=context_limits.get("tasks", 0),
+        ),
+    }
+    if any(context_limits.get(key, 0) > 0 for key in ("memory_kv", "memory_graph", "memory_rag", "timeline")):
+        fetchers.update(
+            shared_memory_layer_fetchers(
+                body.message,
+                context_limits,
+                context_candidate_limit,
+                request_scope,
+                include_generic_memory=bool(extract_literal_identifiers(body.message)),
+            )
+        )
+    else:
+        fetchers["memory"] = lambda: retrieve_context(
+            body.message,
+            context_candidate_limit,
+            request_scope=request_scope,
+        )
+    parallel_context = retrieve_chat_context_parallel(
+        chat_route,
+        fetchers,
     )
-    context_candidate_limit = max(body.limit, 80)
-    context = retrieve_context(body.message, context_candidate_limit, request_scope=request_scope)
-    assistant_context = retrieve_assistant_dialogue_context(
-        body.message,
-        conversation_id=user_turn["conversation_id"],
-        limit=64,
-    )
+    source_context = parallel_context["source"]
+    context = merge_parallel_memory_context(parallel_context)
+    assistant_context = parallel_context["dialogue"]
     raw_client_delta = body.client_context_delta or body.client_context
     client_dialogue_context = normalize_client_dialogue_context(
         raw_client_delta,
         user_turn["conversation_id"],
         current_message=body.message,
-        token_budget=8000,
+        token_budget=min(8000, max(2000, int(context_limits.get("input_target_tokens", 12000) * 0.2))),
     )
-    agenda_context = retrieve_active_agenda_context(
-        body.message,
-        conversation_id=user_turn["conversation_id"],
-        limit=6,
-    )
-    task_context = retrieve_active_task_context(
-        body.message,
-        conversation_id=user_turn["conversation_id"],
-        limit=8,
-    )
+    agenda_context = parallel_context["agenda"]
+    task_context = parallel_context["tasks"]
+    career_context = retrieve_career_chat_context(limit=8) if chat_route.intent == "job_query" else {}
+    if career_context:
+        linkedin_job_search = maybe_queue_linkedin_job_search_for_chat(body.message, career_context)
+        if linkedin_job_search:
+            career_context = {**career_context, "linkedin_job_search": linkedin_job_search}
+    context_retrieval_ms = elapsed_ms(context_start_ms)
     context_pack = build_context_pack(
         body.message,
         context,
@@ -9756,43 +14670,86 @@ async def chat(body: ChatIn, x_par_password: Optional[str] = Header(default=None
         agenda_context=agenda_context,
         source_context=source_context,
         task_context=task_context,
+        career_context=career_context,
         request_scope=request_scope,
-        context_budget={"input_target": CONTEXT_INPUT_TARGET_TOKENS, "hard_input_ceiling": CONTEXT_HARD_INPUT_CEILING_TOKENS},
+        max_dialogue_items=context_limits.get("dialogue", 16),
+        max_agenda_items=context_limits.get("agenda", 0),
+        context_budget={
+            "input_target": min(CONTEXT_INPUT_TARGET_TOKENS, context_limits.get("input_target_tokens", CONTEXT_INPUT_TARGET_TOKENS)),
+            "hard_input_ceiling": min(CONTEXT_HARD_INPUT_CEILING_TOKENS, context_limits.get("input_target_tokens", CONTEXT_INPUT_TARGET_TOKENS) * 2),
+        },
     )
+    route_decision = chat_route.to_decision()
+    context_pack["chat_route"] = {
+        "decision": route_decision,
+        "intent": chat_route.intent,
+        "needs_dialogue": chat_route.needs_dialogue,
+        "needs_source": chat_route.needs_source,
+        "needs_memory": chat_route.needs_memory,
+        "needs_memory_kv": chat_route.needs_memory_kv,
+        "needs_memory_graph": chat_route.needs_memory_graph,
+        "needs_memory_rag": chat_route.needs_memory_rag,
+        "needs_timeline": chat_route.needs_timeline,
+        "needs_agenda": chat_route.needs_agenda,
+        "needs_tasks": chat_route.needs_tasks,
+        "needs_external_tool_state": chat_route.needs_external_tool_state,
+        "reason": chat_route.reason,
+        "fetch_limits": context_limits,
+    }
+    context_pack["fusion_summary"] = context_fusion_summary(context_pack)
     messages = build_chat_messages(body.message, context_pack)
-    try:
-        answer_result = await model_gateway().chat(messages)
-        answer = answer_result.text
-        context_pack["model_provider_id"] = answer_result.provider_id
-        context_pack["model_trace"] = answer_result.trace
-    except ModelGatewayError as exc:
+    agenda_answer = deterministic_agenda_answer(body.message, context_pack)
+    career_application_answer = None if agenda_answer is not None else deterministic_career_application_answer(body.message, context_pack)
+    career_answer = None if agenda_answer is not None or career_application_answer is not None else deterministic_career_answer(body.message, context_pack)
+    deterministic_answer = agenda_answer or career_application_answer or career_answer
+    if deterministic_answer is not None:
+        answer = deterministic_answer
+        model_ms = 0
+        if agenda_answer is not None:
+            deterministic_mode = "deterministic_agenda_answer"
+        elif career_application_answer is not None:
+            deterministic_mode = "deterministic_career_application_answer"
+        else:
+            deterministic_mode = "deterministic_career_answer"
+        context_pack["model_provider_id"] = deterministic_mode.replace("_answer", "")
+        context_pack["model_trace"] = {"mode": deterministic_mode, "fallback_from": []}
+    else:
         try:
-            with db() as conn:
-                safe_persist_model_request_trace(
-                    conn,
-                    task_class="chat",
-                    selected_provider_id="",
-                    status="failed",
-                    error_type="model_unavailable",
-                    user_visible_message=exc.to_payload()["message"],
-                    context_snapshot_id=context_pack.get("context_pack_id"),
-                    input_token_estimate=(context_pack.get("token_budget") or {}).get("input_used"),
-                    payload=exc.to_payload(),
-                )
-        except psycopg.Error:
-            pass
-        raise HTTPException(
-            status_code=503,
-            detail=exc.to_payload(),
-        ) from exc
-    except httpx.TimeoutException as exc:
-        raise HTTPException(
-            status_code=503,
-            detail={
-                "error": "model_timeout",
-                "message": "The model endpoint did not respond before the configured timeout.",
-            },
-        ) from exc
+            model_start_ms = monotonic_ms()
+            answer_result = await model_gateway().chat(messages)
+            model_ms = elapsed_ms(model_start_ms)
+            answer = answer_result.text
+            context_pack["model_provider_id"] = answer_result.provider_id
+            context_pack["model_trace"] = answer_result.trace
+        except ModelGatewayError as exc:
+            try:
+                with db() as conn:
+                    safe_persist_model_request_trace(
+                        conn,
+                        task_class="chat",
+                        selected_provider_id="",
+                        status="failed",
+                        error_type="model_unavailable",
+                        user_visible_message=exc.to_payload()["message"],
+                        context_snapshot_id=context_pack.get("context_pack_id"),
+                        input_token_estimate=(context_pack.get("token_budget") or {}).get("input_used"),
+                        payload=exc.to_payload(),
+                    )
+            except psycopg.Error:
+                pass
+            raise HTTPException(
+                status_code=503,
+                detail=exc.to_payload(),
+            ) from exc
+        except httpx.TimeoutException as exc:
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "error": "model_timeout",
+                    "message": "The model endpoint did not respond before the configured timeout.",
+                },
+            ) from exc
+    persist_start_ms = monotonic_ms()
     with db() as conn:
         assistant_turn = persist_assistant_turn(
             conn,
@@ -9801,26 +14758,49 @@ async def chat(body: ChatIn, x_par_password: Optional[str] = Header(default=None
             content=answer,
             conversation_id=user_turn["conversation_id"],
             client_type=body.client_type,
+            tool_call_id=assistant_turn_idempotency_key(body.client_request_id, "assistant"),
         )
+        context_pack["dialogue_memory_enqueue"] = assistant_turn.get("dialogue_memory_enqueue") or user_turn.get("dialogue_memory_enqueue")
         safe_persist_model_request_trace(
             conn,
             task_class="chat",
-            selected_provider_id=answer_result.provider_id,
+            selected_provider_id=str(context_pack.get("model_provider_id") or ""),
             status="succeeded",
-            fallback_provider_ids=model_trace_fallbacks(answer_result.trace),
+            fallback_provider_ids=model_trace_fallbacks(context_pack.get("model_trace") or {}),
             context_snapshot_id=context_pack.get("context_pack_id"),
             input_token_estimate=(context_pack.get("token_budget") or {}).get("input_used"),
             output_token_estimate=estimate_context_tokens(answer),
-            payload={"trace": answer_result.trace, "conversation_id": user_turn["conversation_id"]},
+            payload={"trace": context_pack.get("model_trace") or {}, "conversation_id": user_turn["conversation_id"]},
         )
+    persist_ms = elapsed_ms(persist_start_ms)
     context_pack["final_model_answer_event_id"] = assistant_turn["event_id"]
     context_pack["final_model_answer_turn_id"] = assistant_turn["turn_id"]
+    context_pack["latency_trace"] = {
+        "total_ms": elapsed_ms(total_start_ms),
+        "initial_persist_ms": initial_persist_ms,
+        "context_retrieval_ms": context_retrieval_ms,
+        "context_steps": parallel_context.get("latency_trace", {}),
+        "model_ms": model_ms,
+        "persist_ms": persist_ms,
+    }
     with db() as conn:
+        route_trace_id = safe_persist_context_route_trace(
+            conn,
+            event_id=user_turn["event_id"],
+            conversation_id=user_turn["conversation_id"],
+            route_decision=route_decision,
+            fetch_limits=context_limits,
+            fetch_latency=parallel_context.get("latency_trace", {}),
+            context_pack=context_pack,
+        )
+        if route_trace_id:
+            context_pack["context_route_trace_id"] = route_trace_id
         persist_context_snapshot(conn, user_turn["event_id"], "chat_response", context_pack)
     return {
         "answer": answer,
         "sources": decorate_context_sources(context),
         "conversation_id": user_turn["conversation_id"],
+        "client_request_id": normalize_client_request_id(body.client_request_id),
         "context_pack": {
             "included_event_ids": context_pack["included_event_ids"],
             "included_memory_ids": context_pack.get("included_memory_ids", []),
@@ -9842,9 +14822,14 @@ async def chat(body: ChatIn, x_par_password: Optional[str] = Header(default=None
             "excluded": context_pack.get("excluded", []),
             "warnings": context_pack.get("warnings", []),
             "context_pack_id": context_pack.get("context_pack_id"),
+            "context_route_trace_id": context_pack.get("context_route_trace_id"),
             "retrieval_modes": context_pack.get("retrieval_modes", {}),
+            "fusion_summary": context_pack.get("fusion_summary", {}),
             "scope_filters_applied": context_pack.get("scope_filters_applied", {}),
+            "chat_route": context_pack.get("chat_route", {}),
+            "dialogue_memory_enqueue": context_pack.get("dialogue_memory_enqueue") or {},
             "reason": context_pack["reason"],
+            "latency_trace": context_pack.get("latency_trace", {}),
         },
     }
 
@@ -9904,8 +14889,585 @@ def chat_history(
     }
 
 
+MODEL_CONTEXT_TOP_LEVEL_KEYS = (
+    "context_pack_id",
+    "request_scope",
+    "chat_route",
+    "token_budget",
+    "current_request",
+    "assistant_dialogue",
+    "source_context",
+    "task_context",
+    "agenda_context",
+    "memory_context",
+    "career_context",
+    "included_event_ids",
+    "included_memory_ids",
+    "included_agenda_ids",
+    "retrieval_modes",
+    "scope_filters_applied",
+    "session_search",
+    "reason",
+)
+
+MODEL_CONTEXT_ITEM_KEYS = {
+    "id",
+    "event_id",
+    "memory_id",
+    "agenda_id",
+    "task_id",
+    "layer",
+    "source",
+    "source_type",
+    "role",
+    "sender",
+    "contact",
+    "content",
+    "text",
+    "summary",
+    "title",
+    "headline",
+    "description",
+    "company",
+    "url",
+    "filename",
+    "file_type",
+    "parsed_text_summary",
+    "target_roles",
+    "target_locations",
+    "skills",
+    "requirements",
+    "fit_score",
+    "profiles",
+    "career_resumes",
+    "opportunities",
+    "linkedin",
+    "linkedin_job_search",
+    "target_url",
+    "expected_event_type",
+    "search_terms",
+    "command_id",
+    "dedupe_key",
+    "pipeline_id",
+    "pipeline_status",
+    "query",
+    "external_side_effect",
+    "collection_status",
+    "browser_login_status",
+    "freshness",
+    "retrieval_status",
+    "missing",
+    "error_count",
+    "last_event_at",
+    "last_injection_at",
+    "status",
+    "certainty",
+    "confidence",
+    "created_at",
+    "starts_at",
+    "ends_at",
+    "time_status",
+    "time",
+    "time_window",
+    "place",
+    "location",
+    "participants",
+    "missing_fields",
+    "needs_clarification",
+    "source_event_ids",
+    "metadata",
+    "released_private_evidence",
+    "private_evidence_release_error",
+    "release_policy",
+    "release_reason",
+    "fields",
+    "amounts",
+    "time_clues",
+    "resolved_time_clues",
+    "matching_lines",
+    "session_search",
+    "included_turns",
+    "active_tasks",
+    "short_reply_resolution",
+    "is_short_reply",
+    "resolved",
+    "prior_question_turn_id",
+    "referenced_assistant_question",
+    "referenced_task_titles",
+    "user_reply",
+    "interpretation",
+    "token_budget",
+    "limit",
+    "used",
+    "reason",
+}
+
+
+def compact_model_value(value: Any, *, max_string_chars: int = 1600) -> Any:
+    if isinstance(value, str):
+        if len(value) <= max_string_chars:
+            return value
+        return value[:max_string_chars] + f"...[truncated {len(value) - max_string_chars} chars]"
+    if isinstance(value, list):
+        return [compact_model_value(item, max_string_chars=max_string_chars) for item in value[:24]]
+    if isinstance(value, dict):
+        return {
+            key: compact_model_value(val, max_string_chars=max_string_chars)
+            for key, val in value.items()
+            if key in MODEL_CONTEXT_ITEM_KEYS
+        }
+    return value
+
+
+def compact_context_for_model(context: list[dict[str, Any]] | dict[str, Any]) -> Any:
+    if isinstance(context, list):
+        return [compact_model_value(item) for item in context[:24]]
+    if not isinstance(context, dict):
+        return context
+    compact: dict[str, Any] = {}
+    for key in MODEL_CONTEXT_TOP_LEVEL_KEYS:
+        if key in context:
+            compact[key] = compact_model_value(context.get(key))
+    return compact
+
+
+def agenda_item_time_display(item: dict[str, Any]) -> str:
+    time_window = item.get("time_window") if isinstance(item.get("time_window"), dict) else {}
+    display = str(time_window.get("display") or "").strip()
+    if display:
+        return display
+    start = agenda_item_start_datetime(item)
+    if not start:
+        return str(time_window.get("raw_text") or time_window.get("text") or "时间不明确")
+    localized = start.astimezone(USER_TIMEZONE)
+    weekday = "一二三四五六日"[localized.weekday()]
+    return localized.strftime(f"%Y-%m-%d 周{weekday} %H:%M")
+
+
+def agenda_item_effective_time_status(item: dict[str, Any], *, now: Optional[datetime] = None) -> str:
+    explicit = str(item.get("time_status") or "").strip().lower()
+    if explicit:
+        return explicit
+    if agenda_item_is_dated_past(item, now=now):
+        return "past"
+    start = agenda_item_start_datetime(item)
+    if start:
+        return "upcoming"
+    return "unknown"
+
+
+def agenda_item_answer_title(item: dict[str, Any]) -> str:
+    title = str(item.get("title") or "").strip()
+    if not title:
+        return "未命名日程"
+    if "：" in title:
+        title = title.split("：", 1)[0].strip()
+    if ":" in title and len(title.split(":", 1)[0]) <= 40:
+        title = title.split(":", 1)[0].strip()
+    return title[:80]
+
+
+def agenda_item_source_label(item: dict[str, Any]) -> str:
+    source = agenda_item_source(item)
+    return source or "unknown"
+
+
+def deterministic_agenda_answer(message: str, context_pack: dict[str, Any], *, now: Optional[datetime] = None) -> Optional[str]:
+    if not isinstance(context_pack, dict) or not is_upcoming_agenda_query(message):
+        return None
+    route = context_pack.get("chat_route") if isinstance(context_pack.get("chat_route"), dict) else {}
+    if route and route.get("intent") != "agenda_query":
+        return None
+    agenda_items = [item for item in context_pack.get("agenda_context") or [] if isinstance(item, dict)]
+    if not agenda_items:
+        return None
+    current = now or datetime.now(USER_TIMEZONE)
+    future_or_unknown = [
+        item for item in agenda_items
+        if agenda_item_effective_time_status(item, now=current) not in {"past", "expired"}
+    ]
+    if future_or_unknown:
+        return None
+    lines = ["没有找到未开始的会议。最近解析到的会议都已过去："]
+    for index, item in enumerate(agenda_items[:3], start=1):
+        source = agenda_item_source_label(item)
+        lines.append(
+            f"{index}. {agenda_item_time_display(item)}：{agenda_item_answer_title(item)}"
+            f"（来源：{source}，已过去）"
+        )
+    lines.append("如果你刚发邮件测试会议，Nomi 已经采集并解析到了；只是按当前时间看，这条会议时间已经过去。")
+    return "\n".join(lines)
+
+
+CAREER_RECOMMENDATION_QUERY_RE = re.compile(
+    r"(推荐|适合|工作机会|岗位|职位|招聘|job|jobs|opportunit|position|linkedin)",
+    re.I,
+)
+
+CAREER_APPLICATION_REQUEST_RE = re.compile(
+    r"(easy\s*apply|apply|submit|投递|申请|提交申请|点击\s*apply|帮我投|帮我申请|自动投|批量投)",
+    re.I,
+)
+LINKEDIN_JOB_MARKDOWN_LINK_RE = re.compile(
+    r"\[([^\]\n]{1,300})\]\((https?://(?:[\w-]+\.)?linkedin\.com/jobs/view/\d{6,}/?[^)\s\"'<>，。；、]*)\)",
+    re.I,
+)
+LINKEDIN_JOB_DETAIL_LINK_RE = re.compile(
+    r"https?://(?:[\w-]+\.)?linkedin\.com/jobs/view/\d{6,}/?[^)\s\"'<>，。；、]*",
+    re.I,
+)
+
+
+def opportunity_sort_score(item: dict[str, Any]) -> float:
+    try:
+        return float(item.get("fit_score") or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def opportunity_recommendation_reason(item: dict[str, Any]) -> str:
+    payload = item.get("payload") if isinstance(item.get("payload"), dict) else {}
+    matched = [str(value) for value in payload.get("matched_requirements") or [] if str(value).strip()]
+    gaps = [str(value) for value in payload.get("gap_requirements") or [] if str(value).strip()]
+    if matched:
+        reason = f"匹配你的 { '、'.join(matched[:5]) }"
+        if gaps:
+            reason += f"；需要再确认 { '、'.join(gaps[:3]) }"
+        return reason + "。"
+    summary = str(payload.get("summary") or "").strip()
+    if summary:
+        return summary[:180]
+    score = opportunity_sort_score(item)
+    if score >= 0.8:
+        return "匹配度较高，值得优先打开 JD 核对细节。"
+    if score >= 0.65:
+        return "匹配度可接受，可以作为备选机会继续跟进。"
+    return "有一定相关性，但需要进一步核对 JD 与简历匹配度。"
+
+
+def opportunity_summary(item: dict[str, Any]) -> str:
+    payload = item.get("payload") if isinstance(item.get("payload"), dict) else {}
+    summary = str(payload.get("summary") or "").strip()
+    if summary:
+        return summary[:220]
+    title = str(item.get("title") or "未知岗位").strip()
+    company = str(item.get("company") or "未知公司").strip()
+    location = str(item.get("location") or "地点未标注").strip()
+    return f"{company} 的 {title}，地点 {location}。"
+
+
+LOW_VALUE_CAREER_OPPORTUNITY_RE = re.compile(
+    r"(^\s*\d+\s+notifications?(?:\s+total)?\s*$|keyboard shortcuts|close jump menu|"
+    r"new feed updates notifications|message notifications are off|处理邮件待办)",
+    re.I,
+)
+
+
+def is_low_value_career_opportunity(item: Any) -> bool:
+    if isinstance(item, dict):
+        title = str(item.get("title") or "")
+        company = str(item.get("company") or "")
+        location = str(item.get("location") or "")
+        payload = item.get("payload") if isinstance(item.get("payload"), dict) else {}
+    else:
+        try:
+            title = str(item[2] or "")
+            company = str(item[3] or "")
+            location = str(item[4] or "")
+            payload = item[10] if isinstance(item[10], dict) else {}
+        except Exception:
+            title = company = location = ""
+            payload = {}
+    text = "\n".join([title, company, location, json.dumps(payload, ensure_ascii=False, default=str)])
+    if LOW_VALUE_CAREER_OPPORTUNITY_RE.search(text):
+        return True
+    if re.fullmatch(r"\s*\d+\s*", company) and re.fullmatch(r"\s*\d+\s+notifications?(?:\s+total)?\s*", title, re.I):
+        return True
+    return False
+
+
+def linkedin_job_id_from_url(url: str) -> str:
+    match = re.search(r"/jobs/view/(\d+)", str(url or ""))
+    return match.group(1) if match else ""
+
+
+def text_mentions_identifier(text: str, identifier: str) -> bool:
+    normalized_text = str(text or "").lower()
+    normalized_identifier = str(identifier or "").strip().lower()
+    if not normalized_identifier:
+        return False
+    if re.fullmatch(r"[a-z0-9_.-]{1,12}", normalized_identifier):
+        return bool(re.search(rf"(?<![a-z0-9]){re.escape(normalized_identifier)}(?![a-z0-9])", normalized_text))
+    return normalized_identifier in normalized_text
+
+
+def opportunity_application_match_score(message: str, item: dict[str, Any]) -> float:
+    score = 0.0
+    url = str(item.get("url") or "")
+    job_id = linkedin_job_id_from_url(url)
+    if job_id and job_id in str(message or ""):
+        score += 20.0
+    for field, weight in [("company", 12.0), ("title", 8.0), ("id", 5.0)]:
+        value = str(item.get(field) or "").strip()
+        if value and text_mentions_identifier(message, value):
+            score += weight
+    title = str(item.get("title") or "")
+    for token in re.findall(r"[A-Za-z][A-Za-z0-9+#.-]{2,}|[\u4e00-\u9fff]{2,}", title):
+        if len(token) >= 3 and text_mentions_identifier(message, token):
+            score += 1.5
+    return score
+
+
+def valid_career_opportunities(career_context: dict[str, Any]) -> list[dict[str, Any]]:
+    return [
+        item
+        for item in career_context.get("opportunities") or []
+        if isinstance(item, dict)
+        and str(item.get("url") or "").startswith(("http://", "https://"))
+        and not is_low_value_career_opportunity(item)
+    ]
+
+
+def context_pack_text_values(context_pack: dict[str, Any]) -> list[str]:
+    texts: list[str] = []
+    for section in ("assistant_dialogue", "source_context", "memory_context"):
+        values = context_pack.get(section)
+        if not isinstance(values, list):
+            continue
+        for item in values:
+            if isinstance(item, str) and item.strip():
+                texts.append(item.strip())
+                continue
+            if not isinstance(item, dict):
+                continue
+            for key in ("content", "summary", "text", "body"):
+                value = item.get(key)
+                if isinstance(value, str) and value.strip():
+                    texts.append(value.strip())
+            raw_data = item.get("raw_data")
+            if isinstance(raw_data, dict):
+                for key in ("content", "message", "text", "body"):
+                    value = raw_data.get(key)
+                    if isinstance(value, str) and value.strip():
+                        texts.append(value.strip())
+    return texts
+
+
+def linkedin_context_company_location(window_text: str, label: str) -> tuple[str, str]:
+    company = ""
+    location = ""
+    match = re.search(r"(?:公司/地点|公司|Company/Location|Company)\s*[：:]\s*([^·\n|]+)(?:[·|]\s*([^\n]+))?", window_text, re.I)
+    if match:
+        company = match.group(1).strip()
+        location = (match.group(2) or "").strip()
+    if not company:
+        split_match = re.match(r"\s*([^-–—|]{1,80})\s*[-–—|]\s*(.{2,220})", label)
+        if split_match:
+            company = split_match.group(1).strip()
+    return company, location
+
+
+def linkedin_context_fit_score(window_text: str) -> float:
+    match = re.search(r"(?:匹配度|fit(?:\s+score)?)\s*[：:]\s*(\d{1,3})\s*%", window_text, re.I)
+    if not match:
+        return 0.0
+    try:
+        return min(max(float(match.group(1)) / 100.0, 0.0), 1.0)
+    except ValueError:
+        return 0.0
+
+
+def linkedin_context_matched_requirements(window_text: str) -> list[str]:
+    match = re.search(r"推荐理由\s*[：:]\s*(?:匹配你的\s*)?([^\n。.!]+)", window_text, re.I)
+    if not match:
+        return []
+    return [
+        item.strip()
+        for item in re.split(r"[、,，/]+", match.group(1))
+        if item.strip()
+    ][:8]
+
+
+def linkedin_job_opportunities_from_context_pack(context_pack: dict[str, Any]) -> list[dict[str, Any]]:
+    opportunities: list[dict[str, Any]] = []
+    seen_urls: set[str] = set()
+    for text in context_pack_text_values(context_pack):
+        lines = text.splitlines()
+        for index, line in enumerate(lines):
+            markdown_matches = list(LINKEDIN_JOB_MARKDOWN_LINK_RE.finditer(line))
+            bare_urls = [] if markdown_matches else [(None, match.group(0)) for match in LINKEDIN_JOB_DETAIL_LINK_RE.finditer(line)]
+            matches: list[tuple[str, str]] = [
+                (match.group(1).strip(), match.group(2).strip()) for match in markdown_matches
+            ] + [(line.replace(url, "").strip(" -:：[]()") or "LinkedIn job", url) for _, url in bare_urls]
+            for label, url in matches:
+                try:
+                    clean_url = normalize_linkedin_job_url(url)
+                except HTTPException:
+                    continue
+                if clean_url in seen_urls:
+                    continue
+                seen_urls.add(clean_url)
+                window_text = "\n".join(lines[max(0, index - 1) : min(len(lines), index + 5)])
+                company, location = linkedin_context_company_location(window_text, label)
+                matched_requirements = linkedin_context_matched_requirements(window_text)
+                summary = f"{company + ' 的 ' if company else ''}{label.strip() or 'LinkedIn job'}"
+                if location:
+                    summary += f"，地点 {location}"
+                summary += "。"
+                opportunities.append(
+                    {
+                        "id": f"context_linkedin_job_{linkedin_job_id_from_url(clean_url) or len(opportunities) + 1}",
+                        "source": "assistant_dialogue_context",
+                        "title": label.strip() or "LinkedIn job",
+                        "company": company or "",
+                        "location": location or "地点未标注",
+                        "url": clean_url,
+                        "fit_score": linkedin_context_fit_score(window_text),
+                        "payload": {
+                            "summary": summary[:500],
+                            "matched_requirements": matched_requirements,
+                            "source": "recent_dialogue_linkedin_job_link",
+                        },
+                    }
+                )
+    return opportunities
+
+
+def merge_career_application_opportunities(
+    career_context: dict[str, Any],
+    context_pack: dict[str, Any],
+) -> list[dict[str, Any]]:
+    merged: list[dict[str, Any]] = []
+    seen_urls: set[str] = set()
+    for item in valid_career_opportunities(career_context) + linkedin_job_opportunities_from_context_pack(context_pack):
+        url = str(item.get("url") or "")
+        if url in seen_urls:
+            continue
+        seen_urls.add(url)
+        merged.append(item)
+    return merged
+
+
+def select_career_application_opportunity(message: str, opportunities: list[dict[str, Any]]) -> Optional[dict[str, Any]]:
+    scored = [
+        (opportunity_application_match_score(message, item), opportunity_sort_score(item), item)
+        for item in opportunities
+    ]
+    scored = [item for item in scored if item[0] > 0]
+    if not scored:
+        return None
+    scored.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    return scored[0][2]
+
+
+def deterministic_career_application_answer(message: str, context_pack: dict[str, Any]) -> Optional[str]:
+    if not isinstance(context_pack, dict) or not CAREER_APPLICATION_REQUEST_RE.search(message or ""):
+        return None
+    route = context_pack.get("chat_route") if isinstance(context_pack.get("chat_route"), dict) else {}
+    if route and route.get("intent") != "job_query":
+        return None
+    career_context = context_pack.get("career_context") if isinstance(context_pack.get("career_context"), dict) else {}
+    opportunities = merge_career_application_opportunities(career_context, context_pack)
+    if not opportunities:
+        return None
+    target = select_career_application_opportunity(message, opportunities)
+    has_resume = bool(career_context.get("career_resumes"))
+    if target is None:
+        ranked = sorted(opportunities, key=opportunity_sort_score, reverse=True)[:3]
+        lines = [
+            "我识别到你想申请/投递岗位，但还没能从这句话里唯一定位目标岗位。",
+            "Apply/Submit 属于外部执行动作，我不会直接点击或提交。",
+            "",
+            "请先从下面选一个目标岗位：",
+        ]
+        for index, item in enumerate(ranked, start=1):
+            title = str(item.get("title") or "未知岗位").strip()
+            company = str(item.get("company") or "未知公司").strip()
+            url = str(item.get("url") or "").strip()
+            lines.append(f"{index}. [{company} - {title}]({url})")
+        lines.append("")
+        lines.append("你确认目标后，我可以继续生成针对该 JD 的简历修改建议、Cover Letter 和申请前检查清单。")
+        return "\n".join(lines)
+
+    title = str(target.get("title") or "未知岗位").strip()
+    company = str(target.get("company") or "未知公司").strip()
+    location = str(target.get("location") or "地点未标注").strip()
+    url = str(target.get("url") or "").strip()
+    lines = [
+        "我识别到这是申请/投递请求。Apply/Submit 属于外部执行动作，我现在不会直接点击或提交。",
+        "",
+        f"已定位岗位：{company} - {title}",
+        f"地点：{location}",
+        f"岗位链接：{url}",
+        f"匹配依据：{opportunity_recommendation_reason(target)}",
+    ]
+    if has_resume:
+        lines.append("我可以基于你的已导入简历和该 JD 先准备定制简历、Cover Letter 和申请前检查。")
+    else:
+        lines.append("当前没有完整简历可用；我只能先基于职业画像准备申请清单，正式申请前需要补充简历。")
+    lines.extend(
+        [
+            "",
+            "下一步需要你确认要做哪件事：",
+            "1. 打开岗位页核对 JD",
+            "2. 生成定制简历/求职信草稿",
+            "3. 进入 Apply/Submit 流程，但最终点击提交前还需要再次确认",
+            "",
+            "状态：未执行投递、未点击 Apply、未提交任何表单。",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def deterministic_career_answer(message: str, context_pack: dict[str, Any]) -> Optional[str]:
+    if not isinstance(context_pack, dict) or not CAREER_RECOMMENDATION_QUERY_RE.search(message or ""):
+        return None
+    if CAREER_APPLICATION_REQUEST_RE.search(message or ""):
+        return None
+    route = context_pack.get("chat_route") if isinstance(context_pack.get("chat_route"), dict) else {}
+    if route and route.get("intent") != "job_query":
+        return None
+    career_context = context_pack.get("career_context") if isinstance(context_pack.get("career_context"), dict) else {}
+    opportunities = valid_career_opportunities(career_context)
+    if not opportunities:
+        return None
+    opportunities = sorted(
+        opportunities,
+        key=lambda item: (
+            1 if str(item.get("status") or "").lower() == "recommended" else 0,
+            opportunity_sort_score(item),
+        ),
+        reverse=True,
+    )[:3]
+    if not opportunities:
+        return None
+    has_resume = bool(career_context.get("career_resumes"))
+    basis = "已采集到的 LinkedIn 岗位和你的简历/职业画像" if has_resume else "已采集到的 LinkedIn 岗位和现有职业画像"
+    lines = [f"我基于{basis}，优先推荐这 {len(opportunities)} 个："]
+    for index, item in enumerate(opportunities, start=1):
+        title = str(item.get("title") or "未知岗位").strip()
+        company = str(item.get("company") or "未知公司").strip()
+        location = str(item.get("location") or "地点未标注").strip()
+        url = str(item.get("url") or "").strip()
+        score = opportunity_sort_score(item)
+        score_text = f"{round(score * 100)}%" if score else "未评分"
+        lines.extend(
+            [
+                "",
+                f"{index}. [{title}]({url})",
+                f"公司/地点：{company} · {location}",
+                f"匹配度：{score_text}",
+                f"岗位总结：{opportunity_summary(item)}",
+                f"推荐理由：{opportunity_recommendation_reason(item)}",
+            ]
+        )
+    lines.append("")
+    lines.append("我没有执行投递、加人或私信；这些都需要你确认后才会进入下一步。")
+    return "\n".join(lines)
+
+
 def build_chat_messages(message: str, context: list[dict[str, Any]] | dict[str, Any]) -> list[dict[str, str]]:
-    context_text = json.dumps(context, ensure_ascii=False, default=str)
+    context_text = json.dumps(compact_context_for_model(context), ensure_ascii=False, default=str)
     return [
         {
             "role": "system",
@@ -9916,6 +15478,22 @@ def build_chat_messages(message: str, context: list[dict[str, Any]] | dict[str, 
                 "如果某条上下文只适合用户私下分析，不要把它写进对外回复草稿。"
                 "上下文可能包含 bounded context pack；优先使用相关的 Nomi 对话纠正、用户偏好和当前任务，但不要使用无关对话。"
                 "当用户只回复“需要、可以、好的、确认、yes、ok”等短句时，必须结合 assistant_dialogue 中最近的 Nomi 提问判断指代。"
+                "回答日程、约定、提醒、截止时间时，必须优先使用上下文中的绝对日期、星期、具体时间和地点；"
+                "不要只说“明天、周五、下周”等相对时间，除非上下文没有可解析的绝对日期。"
+                "如果 agenda_context 中 time_status 为 past，表示该日程已经发生或已过期，必须明确说已发生/已过去，"
+                "不要建议用户准备、出发或把它当成未来会议。"
+                "英文账单或发票里的 due 默认表示“到期/截止”，不要翻译成“已逾期”；"
+                "只有绝对到期日期早于当前或来源时间时，才可以说已逾期。"
+                "回答求职、岗位推荐、简历或 LinkedIn 相关问题时，必须优先使用 career_context。"
+                "如果 career_context.missing 包含 career_resume，必须明确说明当前没有导入完整简历，"
+                "只能基于已有职业画像或用户临时提供的信息做初筛。"
+                "如果 career_context.linkedin.collection_status 不是 healthy，"
+                "不要声称已经完成实时 LinkedIn 搜索，只能说明 LinkedIn 采集/搜索需要重新连接或继续执行。"
+                "如果 career_context.linkedin_job_search.status 为 queued 或 duplicate_skipped，"
+                "说明已排队或近期已排队打开 LinkedIn Jobs 搜索页；回答时要告诉用户正在采集岗位，"
+                "采集到 JD 后再按简历/画像筛选推荐，不要声称已经完成最终筛选。"
+                "不要把 queued、duplicate_skipped、degraded、healthy 这类内部状态码原样暴露给用户；"
+                "要翻译成自然中文，例如“正在采集”“相同搜索刚刚提交过”“连接不稳定”“连接正常”。"
             ),
         },
         {
@@ -9942,6 +15520,9 @@ async def websocket_realtime(websocket: WebSocket, password: Optional[str] = Non
                     int(data.get("limit") or 12),
                     conversation_id=data.get("conversation_id"),
                     client_type=str(data.get("client_type") or "realtime"),
+                    client_request_id=str(data.get("client_request_id") or ""),
+                    ios_live_activity_id=str(data.get("ios_live_activity_id") or ""),
+                    ios_stream_to_live_activity=bool(data.get("ios_stream_to_live_activity") or False),
                 )
             elif data.get("type") == "ping":
                 await websocket.send_json({"type": "pong"})
@@ -9979,16 +15560,184 @@ async def redis_realtime_listener(websocket: WebSocket) -> None:
         await client.close()
 
 
+async def ios_live_activity_realtime_bridge_loop() -> None:
+    client = aioredis.Redis.from_url(REDIS_URL, decode_responses=True)
+    pubsub = client.pubsub()
+    apns = APNsLiveActivityClient()
+    try:
+        await pubsub.subscribe(REALTIME_CHANNEL)
+        async for message in pubsub.listen():
+            if message.get("type") != "message":
+                continue
+            try:
+                event = json.loads(message.get("data") or "{}")
+            except json.JSONDecodeError:
+                continue
+            await push_realtime_event_to_ios_live_activities(event, apns)
+    except asyncio.CancelledError:
+        raise
+    finally:
+        await pubsub.close()
+        await client.close()
+
+
+async def push_realtime_event_to_ios_live_activities(event: dict[str, Any], apns: APNsLiveActivityClient) -> None:
+    if event.get("type") not in {"proactive_message", "agent_task_delivery", "agent_task_fallback"}:
+        return
+    with db() as conn:
+        activities = active_ios_live_activities(conn)
+        for activity in activities:
+            settings = activity["settings"]
+            if not settings.get("live_activity_enabled", True):
+                continue
+            private_context = fetch_ios_private_context_for_event(conn, event, settings)
+            state = build_live_activity_content_state(event, settings, private_context=private_context)
+            result = await apns.send_update(activity["update_token"], state)
+            record_ios_live_activity_delivery(
+                conn,
+                activity_id=activity["activity_id"],
+                device_id=activity["device_id"],
+                event_type=str(event.get("type") or ""),
+                source_id=str(event.get("suggestion_id") or event.get("task_id") or event.get("id") or ""),
+                payload_mode=str(state.get("payloadMode") or "safe"),
+                delivery_status=str(result.get("status") or "unknown"),
+                payload=result.get("payload") or {"content_state": state},
+                error=str(result.get("error") or ""),
+            )
+            if (
+                result.get("status") != "sent"
+                and settings.get("notification_fallback_enabled", True)
+                and activity.get("apns_device_token")
+            ):
+                fallback = await apns.send_alert(
+                    activity["apns_device_token"],
+                    title=str(state.get("title") or "Nomi"),
+                    body=str(state.get("body") or "Open Nomi to review it."),
+                    deep_link=str(state.get("deepLink") or ""),
+                )
+                record_ios_live_activity_delivery(
+                    conn,
+                    activity_id=activity["activity_id"],
+                    device_id=activity["device_id"],
+                    event_type=str(event.get("type") or ""),
+                    source_id=str(event.get("suggestion_id") or event.get("task_id") or event.get("id") or ""),
+                    payload_mode=str(state.get("payloadMode") or "safe"),
+                    delivery_status=f"notification_fallback_{fallback.get('status') or 'unknown'}",
+                    payload=fallback.get("payload") or {},
+                    error=str(fallback.get("error") or ""),
+                )
+
+
+def fetch_ios_private_context_for_event(
+    conn: psycopg.Connection,
+    event: dict[str, Any],
+    settings: dict[str, Any],
+) -> dict[str, Any]:
+    if not settings.get("sensitive_apns_payload_enabled"):
+        return {}
+    if not (settings.get("include_contact_names") or settings.get("include_raw_private_context")):
+        return {}
+    source_event_id = str(event.get("source_event_id") or "")
+    if not source_event_id:
+        return {}
+    row = conn.execute(
+        """
+        SELECT source, event_type, COALESCE(raw_data_private, raw_data)
+        FROM events
+        WHERE id = %s
+        """,
+        (source_event_id,),
+    ).fetchone()
+    if not row:
+        return {}
+    raw = row[2] if isinstance(row[2], dict) else {}
+    contact = (
+        raw.get("sender")
+        or raw.get("from")
+        or raw.get("contact")
+        or raw.get("chat_name")
+        or raw.get("thread_title")
+        or ""
+    )
+    raw_snippet = (
+        raw.get("body")
+        or raw.get("text")
+        or raw.get("message")
+        or raw.get("snippet")
+        or raw.get("summary")
+        or ""
+    )
+    return {
+        "contact": str(contact)[:120],
+        "channel": str(row[0] or event.get("source") or ""),
+        "rawSnippet": str(raw_snippet)[: int(settings.get("max_sensitive_payload_chars") or 2400)],
+    }
+
+
+async def maybe_push_ios_chat_delta(
+    activity_id: str,
+    conversation_id: str,
+    partial_answer: str,
+    token_sequence: int,
+    apns: APNsLiveActivityClient | None = None,
+) -> None:
+    if not activity_id:
+        return
+    apns = apns or APNsLiveActivityClient()
+    with db() as conn:
+        row = conn.execute(
+            """
+            SELECT a.activity_id, a.device_id, a.update_token, d.settings
+            FROM ios_live_activities a
+            JOIN ios_devices d ON d.device_id = a.device_id
+            WHERE a.activity_id = %s AND a.status = 'active'
+            """,
+            (activity_id,),
+        ).fetchone()
+        if not row:
+            return
+        settings = normalize_ios_live_activity_settings(row[3] or {})
+        if not settings.get("live_activity_enabled"):
+            return
+        if not settings.get("token_level_chat_streaming_enabled"):
+            return
+        if settings.get("token_level_chat_delivery") not in {"apns_best_effort", "local_and_apns_best_effort"}:
+            return
+        event = {
+            "type": "chat_delta",
+            "conversation_id": conversation_id,
+            "partial_answer": partial_answer,
+            "token_sequence": token_sequence,
+        }
+        state = build_live_activity_content_state(event, settings)
+        result = await apns.send_update(row[2], state)
+        record_ios_live_activity_delivery(
+            conn,
+            activity_id=row[0],
+            device_id=row[1],
+            event_type="chat_delta",
+            source_id=conversation_id,
+            payload_mode=str(state.get("payloadMode") or "safe"),
+            delivery_status=str(result.get("status") or "unknown"),
+            payload=result.get("payload") or {"content_state": state},
+            error=str(result.get("error") or ""),
+        )
+
+
 async def stream_chat_to_websocket(
     websocket: WebSocket,
     message: str,
     limit: int,
     conversation_id: Optional[str] = None,
     client_type: str = "realtime",
+    client_request_id: Optional[str] = None,
+    ios_live_activity_id: str = "",
+    ios_stream_to_live_activity: bool = False,
 ) -> None:
     if not message.strip():
         await websocket.send_json({"type": "error", "message": "message is required"})
         return
+    total_start_ms = monotonic_ms()
     redis_obj = redis_client()
     try:
         with db() as conn:
@@ -9999,15 +15748,60 @@ async def stream_chat_to_websocket(
                 content=message,
                 conversation_id=conversation_id,
                 client_type=client_type,
+                tool_call_id=assistant_turn_idempotency_key(client_request_id, "user"),
             )
     except psycopg.Error:
         user_turn = transient_assistant_turn("user", conversation_id)
+    context_start_ms = monotonic_ms()
     request_scope = infer_request_scope(message, {})
-    source_context = retrieve_current_source_context(message, request_scope, limit=6)
-    context = retrieve_context(message, max(80, min(limit, 50)), request_scope=request_scope)
-    assistant_context = retrieve_assistant_dialogue_context(message, conversation_id=user_turn["conversation_id"], limit=64)
-    agenda_context = retrieve_active_agenda_context(message, conversation_id=user_turn["conversation_id"], limit=6)
-    task_context = retrieve_active_task_context(message, conversation_id=user_turn["conversation_id"], limit=8)
+    deterministic_route = route_chat_context(message, {})
+    chat_route = await apply_semantic_context_router(message, {}, deterministic_route)
+    context_limits = context_fetch_limits(chat_route, limit)
+    context_candidate_limit = context_limits.get("memory") or chat_context_candidate_limit(limit)
+    fetchers = {
+        "source": lambda: dedupe_context_items(
+            normalize_ui_state_source_context({}, request_scope)
+            + retrieve_current_source_context(message, request_scope, limit=context_limits.get("source", 0))
+        ),
+        "dialogue": lambda: retrieve_assistant_dialogue_context(
+            message,
+            conversation_id=user_turn["conversation_id"],
+            limit=context_limits.get("dialogue", 16),
+        ),
+        "agenda": lambda: retrieve_active_agenda_context(
+            message,
+            conversation_id=user_turn["conversation_id"],
+            limit=context_limits.get("agenda", 0),
+        ),
+        "tasks": lambda: retrieve_active_task_context(
+            message,
+            conversation_id=user_turn["conversation_id"],
+            limit=context_limits.get("tasks", 0),
+        ),
+    }
+    if any(context_limits.get(key, 0) > 0 for key in ("memory_kv", "memory_graph", "memory_rag", "timeline")):
+        fetchers.update(
+            shared_memory_layer_fetchers(
+                message,
+                context_limits,
+                context_candidate_limit,
+                request_scope,
+                include_generic_memory=bool(extract_literal_identifiers(message)),
+            )
+        )
+    else:
+        fetchers["memory"] = lambda: retrieve_context(message, context_candidate_limit, request_scope=request_scope)
+    parallel_context = retrieve_chat_context_parallel(chat_route, fetchers)
+    source_context = parallel_context["source"]
+    context = merge_parallel_memory_context(parallel_context)
+    assistant_context = parallel_context["dialogue"]
+    agenda_context = parallel_context["agenda"]
+    task_context = parallel_context["tasks"]
+    career_context = retrieve_career_chat_context(limit=8) if chat_route.intent == "job_query" else {}
+    if career_context:
+        linkedin_job_search = maybe_queue_linkedin_job_search_for_chat(message, career_context)
+        if linkedin_job_search:
+            career_context = {**career_context, "linkedin_job_search": linkedin_job_search}
     context_pack = build_context_pack(
         message,
         context,
@@ -10016,51 +15810,142 @@ async def stream_chat_to_websocket(
         agenda_context=agenda_context,
         source_context=source_context,
         task_context=task_context,
+        career_context=career_context,
         request_scope=request_scope,
-        context_budget={"input_target": CONTEXT_INPUT_TARGET_TOKENS, "hard_input_ceiling": CONTEXT_HARD_INPUT_CEILING_TOKENS},
+        max_dialogue_items=context_limits.get("dialogue", 16),
+        max_agenda_items=context_limits.get("agenda", 0),
+        context_budget={
+            "input_target": min(CONTEXT_INPUT_TARGET_TOKENS, context_limits.get("input_target_tokens", CONTEXT_INPUT_TARGET_TOKENS)),
+            "hard_input_ceiling": min(CONTEXT_HARD_INPUT_CEILING_TOKENS, context_limits.get("input_target_tokens", CONTEXT_INPUT_TARGET_TOKENS) * 2),
+        },
     )
+    route_decision = chat_route.to_decision()
+    context_pack["chat_route"] = {
+        "decision": route_decision,
+        "intent": chat_route.intent,
+        "needs_dialogue": chat_route.needs_dialogue,
+        "needs_source": chat_route.needs_source,
+        "needs_memory": chat_route.needs_memory,
+        "needs_memory_kv": chat_route.needs_memory_kv,
+        "needs_memory_graph": chat_route.needs_memory_graph,
+        "needs_memory_rag": chat_route.needs_memory_rag,
+        "needs_timeline": chat_route.needs_timeline,
+        "needs_agenda": chat_route.needs_agenda,
+        "needs_tasks": chat_route.needs_tasks,
+        "needs_external_tool_state": chat_route.needs_external_tool_state,
+        "reason": chat_route.reason,
+        "fetch_limits": context_limits,
+    }
+    context_pack["fusion_summary"] = context_fusion_summary(context_pack)
     messages = build_chat_messages(message, context_pack)
+    context_retrieval_ms = elapsed_ms(context_start_ms)
     answer_parts: list[str] = []
-    try:
-        provider_id = ""
-        model_trace: dict[str, Any] = {}
-        async for chunk in model_gateway().stream_chat(messages):
-            delta = chunk.delta
-            provider_id = chunk.provider_id
-            model_trace = chunk.trace
-            if not delta:
-                continue
-            answer_parts.append(delta)
-            await websocket.send_json({"type": "chat_delta", "delta": delta})
-        if provider_id:
-            context_pack["model_provider_id"] = provider_id
-            context_pack["model_trace"] = model_trace
-    except ModelGatewayError as exc:
-        payload = exc.to_payload()
+    model_start_ms = monotonic_ms()
+    stream_first_token_ms: Optional[int] = None
+    model_first_token_ms: Optional[int] = None
+    agenda_answer = deterministic_agenda_answer(message, context_pack)
+    career_application_answer = None if agenda_answer is not None else deterministic_career_application_answer(message, context_pack)
+    career_answer = None if agenda_answer is not None or career_application_answer is not None else deterministic_career_answer(message, context_pack)
+    deterministic_answer = agenda_answer or career_application_answer or career_answer
+    if deterministic_answer is not None:
+        stream_first_token_ms = elapsed_ms(total_start_ms)
+        model_first_token_ms = 0
+        answer_parts.append(deterministic_answer)
+        if agenda_answer is not None:
+            deterministic_mode = "deterministic_agenda_answer"
+        elif career_application_answer is not None:
+            deterministic_mode = "deterministic_career_application_answer"
+        else:
+            deterministic_mode = "deterministic_career_answer"
+        context_pack["model_provider_id"] = deterministic_mode.replace("_answer", "")
+        context_pack["model_trace"] = {"mode": deterministic_mode, "fallback_from": []}
+        await websocket.send_json(
+            {
+                "type": "chat_delta",
+                "delta": deterministic_answer,
+                "elapsed_ms": stream_first_token_ms,
+                "is_first_delta": True,
+                "stream_first_token_ms": stream_first_token_ms,
+                "model_first_token_ms": model_first_token_ms,
+            }
+        )
+    else:
         try:
-            with db() as conn:
-                safe_persist_model_request_trace(
-                    conn,
-                    task_class="websocket_chat",
-                    selected_provider_id="",
-                    status="failed",
-                    error_type="model_unavailable",
-                    user_visible_message=payload["message"],
-                    context_snapshot_id=context_pack.get("context_pack_id"),
-                    input_token_estimate=(context_pack.get("token_budget") or {}).get("input_used"),
-                    payload=payload,
-                )
-        except psycopg.Error:
-            pass
-        await websocket.send_json({"type": "error", "message": payload["message"], "detail": payload})
-        return
-    except Exception:
-        await websocket.send_json({"type": "error", "message": "模型服务暂时不可用，请稍后重试。"})
-        return
+            provider_id = ""
+            model_trace: dict[str, Any] = {}
+            async for chunk in model_gateway().stream_chat(messages):
+                delta = chunk.delta
+                provider_id = chunk.provider_id
+                model_trace = chunk.trace
+                if not delta:
+                    continue
+                is_first_delta = stream_first_token_ms is None
+                if is_first_delta:
+                    stream_first_token_ms = elapsed_ms(total_start_ms)
+                    model_first_token_ms = elapsed_ms(model_start_ms)
+                answer_parts.append(delta)
+                event: dict[str, Any] = {
+                    "type": "chat_delta",
+                    "delta": delta,
+                    "elapsed_ms": elapsed_ms(total_start_ms),
+                }
+                if is_first_delta:
+                    event["is_first_delta"] = True
+                    event["stream_first_token_ms"] = stream_first_token_ms
+                    event["model_first_token_ms"] = model_first_token_ms
+                await websocket.send_json(event)
+                if ios_stream_to_live_activity and ios_live_activity_id:
+                    asyncio.create_task(
+                        maybe_push_ios_chat_delta(
+                            ios_live_activity_id,
+                            user_turn["conversation_id"],
+                            "".join(answer_parts)[-800:],
+                            len(answer_parts),
+                        )
+                    )
+            if provider_id:
+                context_pack["model_provider_id"] = provider_id
+                context_pack["model_trace"] = model_trace
+        except ModelGatewayError as exc:
+            payload = exc.to_payload()
+            failed_model_ms = elapsed_ms(model_start_ms)
+            try:
+                with db() as conn:
+                    safe_persist_model_request_trace(
+                        conn,
+                        task_class="websocket_chat",
+                        selected_provider_id="",
+                        status="failed",
+                        error_type="model_unavailable",
+                        user_visible_message=payload["message"],
+                        context_snapshot_id=context_pack.get("context_pack_id"),
+                        input_token_estimate=(context_pack.get("token_budget") or {}).get("input_used"),
+                        latency_ms=failed_model_ms,
+                        payload={**payload, "latency_trace": {"model_ms": failed_model_ms, "total_ms": elapsed_ms(total_start_ms)}},
+                    )
+            except psycopg.Error:
+                pass
+            await websocket.send_json({"type": "error", "message": payload["message"], "detail": payload})
+            return
+        except Exception:
+            await websocket.send_json({"type": "error", "message": "模型服务暂时不可用，请稍后重试。"})
+            return
     answer = "".join(answer_parts)
     if not answer.strip():
         await websocket.send_json({"type": "error", "message": "模型没有返回内容，请稍后重试。"})
         return
+    model_ms = elapsed_ms(model_start_ms)
+    latency_trace: dict[str, Any] = {
+        "total_ms": elapsed_ms(total_start_ms),
+        "context_retrieval_ms": context_retrieval_ms,
+        "context_steps": parallel_context.get("latency_trace", {}),
+        "model_ms": model_ms,
+        "stream_first_token_ms": stream_first_token_ms,
+        "model_first_token_ms": model_first_token_ms,
+        "persist_ms": 0,
+    }
+    context_pack["latency_trace"] = latency_trace
+    persist_start_ms = monotonic_ms()
     try:
         with db() as conn:
             assistant_turn = persist_assistant_turn(
@@ -10070,9 +15955,22 @@ async def stream_chat_to_websocket(
                 content=answer,
                 conversation_id=user_turn["conversation_id"],
                 client_type=client_type,
+                tool_call_id=assistant_turn_idempotency_key(client_request_id, "assistant"),
             )
             context_pack["final_model_answer_event_id"] = assistant_turn["event_id"]
             context_pack["final_model_answer_turn_id"] = assistant_turn["turn_id"]
+            context_pack["dialogue_memory_enqueue"] = assistant_turn.get("dialogue_memory_enqueue") or user_turn.get("dialogue_memory_enqueue")
+            route_trace_id = safe_persist_context_route_trace(
+                conn,
+                event_id=user_turn["event_id"],
+                conversation_id=user_turn["conversation_id"],
+                route_decision=route_decision,
+                fetch_limits=context_limits,
+                fetch_latency=parallel_context.get("latency_trace", {}),
+                context_pack=context_pack,
+            )
+            if route_trace_id:
+                context_pack["context_route_trace_id"] = route_trace_id
             persist_context_snapshot(conn, user_turn["event_id"], "websocket_chat_response", context_pack)
             safe_persist_model_request_trace(
                 conn,
@@ -10083,15 +15981,24 @@ async def stream_chat_to_websocket(
                 context_snapshot_id=context_pack.get("context_pack_id"),
                 input_token_estimate=(context_pack.get("token_budget") or {}).get("input_used"),
                 output_token_estimate=estimate_context_tokens(answer),
-                payload={"trace": context_pack.get("model_trace") or {}, "conversation_id": user_turn["conversation_id"]},
+                stream_first_token_ms=stream_first_token_ms,
+                latency_ms=model_ms,
+                payload={
+                    "trace": context_pack.get("model_trace") or {},
+                    "conversation_id": user_turn["conversation_id"],
+                    "latency_trace": latency_trace,
+                },
             )
     except psycopg.Error:
         pass
+    latency_trace["persist_ms"] = elapsed_ms(persist_start_ms)
+    latency_trace["total_ms"] = elapsed_ms(total_start_ms)
     await websocket.send_json(
         {
             "type": "chat_done",
             "answer": answer,
             "conversation_id": user_turn["conversation_id"],
+            "client_request_id": normalize_client_request_id(client_request_id),
             "sources": decorate_context_sources(context),
             "context_pack": {
                 "included_event_ids": context_pack["included_event_ids"],
@@ -10102,6 +16009,7 @@ async def stream_chat_to_websocket(
                 "memory_context_count": len(context_pack.get("memory_context", [])),
                 "source_context_count": len(context_pack.get("source_context", [])),
                 "task_context_count": len(context_pack.get("task_context", [])),
+                "dialogue_memory_enqueue": context_pack.get("dialogue_memory_enqueue") or {},
                 "token_budget": context_pack.get("token_budget", {}),
                 "sections": [
                     {
@@ -10114,8 +16022,12 @@ async def stream_chat_to_websocket(
                 "excluded": context_pack.get("excluded", []),
                 "warnings": context_pack.get("warnings", []),
                 "context_pack_id": context_pack.get("context_pack_id"),
+                "context_route_trace_id": context_pack.get("context_route_trace_id"),
                 "retrieval_modes": context_pack.get("retrieval_modes", {}),
+                "fusion_summary": context_pack.get("fusion_summary", {}),
                 "scope_filters_applied": context_pack.get("scope_filters_applied", {}),
+                "chat_route": context_pack.get("chat_route", {}),
+                "latency_trace": latency_trace,
                 "reason": context_pack["reason"],
             },
         }
@@ -10321,6 +16233,7 @@ def agenda_items(
             source=source,
             limit=bounded_limit,
         )
+    items = [item for item in items if not is_low_value_agenda_item(item)]
     return {
         "filters": {"status": status, "certainty": certainty, "source": source, "limit": bounded_limit},
         "items": items,
@@ -10349,9 +16262,1311 @@ def snooze_agenda_item(
         return snooze_agenda_item_with_version(conn, agenda_id, body)
 
 
+def career_profile_from_row(row: Any) -> dict[str, Any]:
+    return {
+        "id": str(row[0]),
+        "headline": row[1],
+        "target_roles": text_list(row[2]),
+        "target_locations": text_list(row[3]),
+        "skills": text_list(row[4]),
+        "source_event_ids": text_list(row[5]),
+        "payload": row[6] or {},
+        "updated_at": isoformat_or_value(row[7]),
+    }
+
+
+def career_opportunity_from_row(row: Any) -> dict[str, Any]:
+    return {
+        "id": str(row[0]),
+        "source": row[1],
+        "title": row[2],
+        "company": row[3],
+        "location": row[4],
+        "url": row[5],
+        "status": row[6],
+        "fit_score": row[7],
+        "requirements": row[8] or [],
+        "source_event_ids": text_list(row[9]),
+        "payload": row[10] or {},
+        "created_at": isoformat_or_value(row[11]),
+        "updated_at": isoformat_or_value(row[12]),
+    }
+
+
+def career_resume_from_row(row: Any) -> dict[str, Any]:
+    return {
+        "id": str(row[0]),
+        "base_resume_id": row[1],
+        "target_job_id": row[2],
+        "status": row[3],
+        "source_event_ids": text_list(row[4]),
+        "payload": row[5] or {},
+        "created_at": isoformat_or_value(row[6]),
+        "updated_at": isoformat_or_value(row[7]),
+    }
+
+
+def career_parsed_text_summary(parsed_text: str, limit: int = 320) -> str:
+    display_text = str(parsed_text or "")
+    for marker in ["技术能力:", "技术能力：", "工作经历:", "工作经历："]:
+        if marker in display_text:
+            display_text = display_text[display_text.index(marker) :]
+            break
+    compact = re.sub(r"\s+", " ", str(protect_private_value(display_text))).strip()
+    if len(compact) <= limit:
+        return compact
+    return f"{compact[:limit].rstrip()}..."
+
+
+def career_base_resume_from_row(row: Any) -> dict[str, Any]:
+    return {
+        "id": str(row[0]),
+        "filename": row[1],
+        "file_type": row[2],
+        "status": row[3],
+        "source_event_ids": text_list(row[4]),
+        "parsed_text_summary": career_parsed_text_summary(row[5]),
+        "payload": row[6] or {},
+        "created_at": isoformat_or_value(row[7]),
+        "updated_at": isoformat_or_value(row[8]),
+    }
+
+
+def career_application_from_row(row: Any) -> dict[str, Any]:
+    return {
+        "id": str(row[0]),
+        "job_id": row[1],
+        "status": row[2],
+        "stage": row[3],
+        "next_step": row[4],
+        "application_action": row[5],
+        "platform": row[6],
+        "source_event_ids": text_list(row[7]),
+        "payload": row[8] or {},
+        "created_at": isoformat_or_value(row[9]),
+        "updated_at": isoformat_or_value(row[10]),
+    }
+
+
+SUPPORTED_PUBLIC_ATS_HOSTS = {
+    "greenhouse_public": ["greenhouse.io"],
+    "lever_public": ["jobs.lever.co", "lever.co"],
+    "ashby_public": ["ashbyhq.com"],
+    "workable_public": ["workable.com"],
+    "smartrecruiters_public": ["smartrecruiters.com"],
+}
+
+
+def public_ats_source_from_url(url: str) -> Optional[str]:
+    lowered = str(url or "").lower()
+    for source, markers in SUPPORTED_PUBLIC_ATS_HOSTS.items():
+        if any(marker in lowered for marker in markers):
+            return source
+    return None
+
+
+def ats_preview_source_event_id(url: str) -> str:
+    parsed = urlparse(url)
+    identity = "_".join(part for part in [parsed.scheme, parsed.netloc, parsed.path.strip("/")] if part)
+    slug = re.sub(r"[^a-zA-Z0-9]+", "_", identity).strip("_").lower()
+    return f"ats_preview_{slug[:160] or 'job_page'}"
+
+
+def clean_html_to_text(raw_html: str) -> str:
+    text = re.sub(r"(?is)<(script|style|noscript).*?>.*?</\1>", "\n", str(raw_html or ""))
+    text = re.sub(r"(?is)<head.*?>.*?</head>", "\n", text)
+    text = re.sub(r"(?i)<br\s*/?>", "\n", text)
+    text = re.sub(r"(?i)</(p|div|li|h[1-6]|section|article|tr)>", "\n", text)
+    text = re.sub(r"(?s)<[^>]+>", " ", text)
+    text = html.unescape(text)
+    lines = [re.sub(r"\s+", " ", line).strip() for line in text.splitlines()]
+    return "\n".join(line for line in lines if line)
+
+
+def html_title(raw_html: str) -> str:
+    match = re.search(r"(?is)<title[^>]*>(.*?)</title>", str(raw_html or ""))
+    if not match:
+        return ""
+    return re.sub(r"\s+", " ", html.unescape(match.group(1))).strip()
+
+
+def fetch_public_ats_page(url: str) -> dict[str, str]:
+    response = httpx.get(
+        url,
+        timeout=20,
+        follow_redirects=True,
+        headers={
+            "User-Agent": "NomiCareerPreview/1.0 (+https://github.com/mrzichang2152-boop/nomi)",
+            "Accept": "text/html,application/xhtml+xml,text/plain;q=0.9,*/*;q=0.8",
+        },
+    )
+    response.raise_for_status()
+    raw = response.text or ""
+    return {
+        "url": str(response.url),
+        "title": html_title(raw),
+        "text": clean_html_to_text(raw),
+    }
+
+
+def fetch_public_ats_json(url: str) -> dict[str, Any]:
+    response = httpx.get(
+        url,
+        timeout=20,
+        follow_redirects=True,
+        headers={
+            "User-Agent": "NomiCareerPreview/1.0 (+https://github.com/mrzichang2152-boop/nomi)",
+            "Accept": "application/json,text/plain;q=0.8,*/*;q=0.7",
+        },
+    )
+    response.raise_for_status()
+    data = response.json()
+    return data if isinstance(data, dict) else {"items": data}
+
+
+def ats_board_slug(url: str) -> str:
+    parsed = urlparse(url)
+    parts = [part for part in parsed.path.split("/") if part]
+    host = parsed.netloc.lower()
+    if "boards.greenhouse.io" in host or "jobs.lever.co" in host or "ashbyhq.com" in host:
+        return parts[0] if parts else ""
+    if "workable.com" in host:
+        if host == "apply.workable.com":
+            return parts[0] if parts else ""
+        if host.endswith(".workable.com"):
+            return host.split(".")[0]
+    if "smartrecruiters.com" in host:
+        return parts[0] if parts else ""
+    return ""
+
+
+def public_ats_list_api_url(url: str) -> tuple[str, str, str]:
+    source = public_ats_source_from_url(url)
+    board = ats_board_slug(url)
+    if not source or not board:
+        raise HTTPException(status_code=400, detail="unsupported public ATS list URL")
+    if source == "greenhouse_public":
+        return source, board, f"https://boards-api.greenhouse.io/v1/boards/{board}/jobs?content=true"
+    if source == "lever_public":
+        return source, board, f"https://api.lever.co/v0/postings/{board}?mode=json"
+    if source == "ashby_public":
+        return source, board, f"https://api.ashbyhq.com/posting-api/job-board/{board}"
+    if source == "workable_public":
+        return source, board, f"https://www.workable.com/api/accounts/{board}?details=true"
+    if source == "smartrecruiters_public":
+        return source, board, f"https://api.smartrecruiters.com/v1/companies/{board}/postings?limit=100"
+    raise HTTPException(status_code=400, detail="unsupported public ATS list URL")
+
+
+def ats_location_text(location_value: Any, item: dict[str, Any]) -> str:
+    if isinstance(location_value, dict):
+        direct = location_value.get("name") or location_value.get("location") or location_value.get("location_str")
+        if direct:
+            return str(direct)
+        parts = [
+            location_value.get("city"),
+            location_value.get("region"),
+            location_value.get("country"),
+        ]
+        return ", ".join(str(part) for part in parts if part)
+    categories = item.get("categories") if isinstance(item.get("categories"), dict) else {}
+    return str(location_value or categories.get("location") or "")
+
+
+def ats_description_text(item: dict[str, Any]) -> str:
+    direct = item.get("content") or item.get("description") or item.get("descriptionHtml")
+    if direct:
+        return clean_html_to_text(str(direct))
+    job_ad = item.get("jobAd") if isinstance(item.get("jobAd"), dict) else {}
+    sections = job_ad.get("sections") if isinstance(job_ad.get("sections"), dict) else {}
+    texts: list[str] = []
+    for value in sections.values():
+        if isinstance(value, dict):
+            texts.append(str(value.get("text") or value.get("html") or ""))
+        elif isinstance(value, str):
+            texts.append(value)
+    return clean_html_to_text("\n".join(texts))
+
+
+def normalize_ats_list_jobs(source: str, board: str, payload: dict[str, Any], *, limit: int) -> list[dict[str, Any]]:
+    raw_items: Any
+    if source == "greenhouse_public":
+        raw_items = payload.get("jobs") or []
+    elif source == "lever_public":
+        raw_items = payload.get("items") or payload.get("postings") or []
+    elif source == "smartrecruiters_public":
+        raw_items = payload.get("content") or payload.get("items") or payload.get("postings") or []
+    else:
+        raw_items = payload.get("jobs") or payload.get("items") or []
+    if isinstance(raw_items, dict):
+        raw_items = [raw_items]
+    jobs: list[dict[str, Any]] = []
+    company = board.replace("-", " ").replace("_", " ").title()
+    for index, item in enumerate(raw_items[:limit] if isinstance(raw_items, list) else []):
+        if not isinstance(item, dict):
+            continue
+        item_id = str(
+            item.get("id")
+            or item.get("shortcode")
+            or item.get("uuid")
+            or item.get("jobId")
+            or item.get("postingId")
+            or item.get("ashbyJobId")
+            or index
+        )
+        title = str(item.get("title") or item.get("name") or item.get("text") or "").strip()
+        location = ats_location_text(item.get("location"), item)
+        url = str(
+            item.get("absolute_url")
+            or item.get("hostedUrl")
+            or item.get("applyUrl")
+            or item.get("application_url")
+            or item.get("shortlink")
+            or item.get("ref")
+            or item.get("url")
+            or ""
+        )
+        jd_text = ats_description_text(item)
+        jobs.append(
+            {
+                "job_id": f"job_{source}_{board}_{item_id}",
+                "source": source,
+                "title": title,
+                "company": company,
+                "location": location,
+                "url": url,
+                "jd_text": jd_text,
+                "requirements": [],
+                "source_event_ids": [f"ats_list_{source}_{item_id}"],
+            }
+        )
+    return jobs
+
+
+def build_public_ats_list_preview(url: str, *, limit: int = 25) -> dict[str, Any]:
+    source, board, api_url = public_ats_list_api_url(url)
+    payload = fetch_public_ats_json(api_url)
+    jobs = normalize_ats_list_jobs(source, board, payload, limit=limit)
+    pipeline_result = run_core_pipeline(
+        "预览公开 ATS 岗位列表",
+        {"pipeline_id": "job_discovery_pipeline", "jobs": jobs, "query": f"{board} jobs"},
+    )
+    output = pipeline_result.get("output") or {}
+    return {
+        "status": pipeline_result.get("status"),
+        "source": source,
+        "board": board,
+        "api_url": api_url,
+        "job_opportunities": output.get("job_opportunities") or [],
+        "next_actions": output.get("next_actions") or [],
+        "external_effects": pipeline_result.get("external_effects") or [],
+        "writeback_plan": pipeline_result.get("writeback_plan") or [],
+        "writeback_ready": bool(pipeline_result.get("writeback_plan")),
+        "writeback_performed": False,
+        "risk": pipeline_result.get("risk") or {"permission": "read_only"},
+    }
+
+
+def build_public_ats_preview(url: str, *, title: str = "", text: str = "") -> dict[str, Any]:
+    source = public_ats_source_from_url(url)
+    if not source:
+        raise HTTPException(status_code=400, detail="unsupported public ATS URL")
+    source_event_id = ats_preview_source_event_id(url)
+    cleaned_text = clean_html_to_text(text) if "<" in text and ">" in text else str(text or "").strip()
+    if len(cleaned_text) < 20:
+        raise HTTPException(status_code=422, detail="ATS page did not contain enough readable job text")
+    pipeline_result = run_core_pipeline(
+        "预览公开 ATS 岗位页面",
+        {
+            "pipeline_id": "job_discovery_pipeline",
+            "job_pages": [
+                {
+                    "url": url,
+                    "title": title,
+                    "text": cleaned_text,
+                    "source_event_id": source_event_id,
+                }
+            ],
+        },
+    )
+    output = pipeline_result.get("output") or {}
+    jobs = output.get("job_opportunities") or []
+    return {
+        "status": pipeline_result.get("status"),
+        "source": source,
+        "source_event_id": source_event_id,
+        "job_opportunities": jobs,
+        "next_actions": output.get("next_actions") or [],
+        "source_adapters": output.get("source_adapters") or [],
+        "external_effects": pipeline_result.get("external_effects") or [],
+        "writeback_plan": pipeline_result.get("writeback_plan") or [],
+        "writeback_ready": bool(pipeline_result.get("writeback_plan")),
+        "writeback_performed": False,
+        "risk": pipeline_result.get("risk") or {"permission": "read_only"},
+    }
+
+
+CAREER_SKILL_HINTS = [
+    "Java",
+    "Go",
+    "JVM tuning",
+    "high concurrency",
+    "high availability",
+    "distributed systems",
+    "microservices",
+    "Kafka",
+    "RocketMQ",
+    "Redis",
+    "Elasticsearch",
+    "MySQL",
+    "sharding",
+    "DDD",
+    "SQL optimization",
+    "Spark",
+    "Hive",
+    "observability",
+    "team leadership",
+    "AI Agent",
+    "LLM product",
+    "workflow automation",
+    "data analysis",
+    "cross-functional collaboration",
+    "B2B SaaS",
+    "ATS",
+    "LinkedIn outreach",
+    "resume writing",
+]
+
+CAREER_SKILL_ALIASES = {
+    "Java": ["java"],
+    "Go": [" go。", " go ", "golang", "熟悉 go"],
+    "JVM tuning": ["jvm", "gc", "fullgc", "垃圾回收", "调优"],
+    "high concurrency": ["高并发", "tps", "concurrency"],
+    "high availability": ["高可用", "availability"],
+    "distributed systems": ["分布式", "distributed"],
+    "microservices": ["微服务", "microservice"],
+    "Kafka": ["kafka"],
+    "RocketMQ": ["rocketmq", "rocket mq"],
+    "Redis": ["redis"],
+    "Elasticsearch": ["elasticsearch", "elastic search", " es "],
+    "MySQL": ["mysql"],
+    "sharding": ["分库分表", "sharding"],
+    "DDD": ["ddd", "领域驱动"],
+    "SQL optimization": ["sql 调优", "sql优化", "sql optimization"],
+    "Spark": ["spark"],
+    "Hive": ["hive"],
+    "observability": ["otel", "prometheus", "grafana", "可观测"],
+    "team leadership": ["leader", "技术 owner", "技术owner", "指导和培养", "管理者"],
+    "AI Agent": ["ai agent", "aelf agent", "智能体", "harness"],
+    "LLM product": ["llm", "大模型", "claude code", "cursor"],
+    "workflow automation": ["workflow automation", "自动化", "工作流"],
+    "data analysis": ["data analysis", "analytics", "数据分析", "数据"],
+    "cross-functional collaboration": ["cross-functional", "跨职能", "业务沟通", "协作"],
+    "B2B SaaS": ["b2b", "saas", "tob"],
+    "ATS": ["ats"],
+    "LinkedIn outreach": ["linkedin outreach", "linkedin 外联"],
+    "resume writing": ["resume", "简历"],
+}
+
+
+def clean_resume_text(text: str) -> str:
+    lines = []
+    for line in str(text or "").splitlines():
+        value = re.sub(r"\s+", " ", line).strip()
+        if not value or is_resume_noise_line(value):
+            continue
+        lines.append(value)
+    return "\n".join(lines)
+
+
+def is_resume_noise_line(value: str) -> bool:
+    text = str(value or "").strip()
+    if not text:
+        return True
+    if text in {"~ ~", "~~", "g", "M", "S", "P", "_", "m", "Wi", "O", "W", "b", "P-", "U", "wI-", "R", "F", "H"}:
+        return True
+    if len(text) <= 2 and re.fullmatch(r"[A-Za-z0-9~_-]+", text):
+        return True
+    if re.fullmatch(r"[A-Za-z0-9~_-]{24,}", text):
+        return True
+    if re.fullmatch(r".*[A-Fa-f0-9]{20,}.*", text) and len(text) > 24:
+        return True
+    return False
+
+
+def skills_from_resume_text(text: str) -> list[str]:
+    lowered = f" {str(text or '').lower()} "
+    skills: list[str] = []
+    for skill in CAREER_SKILL_HINTS:
+        aliases = CAREER_SKILL_ALIASES.get(skill, [skill])
+        if any(alias.lower() in lowered for alias in aliases):
+            skills.append(skill)
+    return text_list(skills)
+
+
+def infer_resume_profile_name(text: str, fallback: str = "") -> str:
+    match = re.search(r"姓\s*名\s*[：:]\s*([\u4e00-\u9fffA-Za-z][\u4e00-\u9fffA-Za-z\s·.-]{1,40})", text)
+    if match:
+        name = re.split(r"\s*(?:性\s*别|男|女|联系方式|出生|工作年限)\s*", match.group(1).strip(), maxsplit=1)[0].strip()
+        if name:
+            return name
+    return fallback or "User"
+
+
+def infer_resume_headline(cleaned_text: str) -> str:
+    lowered = cleaned_text.lower()
+    lines = [line.strip() for line in cleaned_text.splitlines() if line.strip()]
+    first_meaningful = ""
+    for line in lines[:8]:
+        if line.rstrip("：:") in {"基本信息", "技术能力", "工作经历", "教育背景"}:
+            continue
+        if re.search(r"(manager|engineer|architect|developer|产品经理|工程师|架构|leader|负责人)", line, re.I):
+            first_meaningful = line
+            break
+    if "java" in lowered and ("leader" in lowered or "架构" in cleaned_text):
+        return "Java 后端架构 / 技术 Leader"
+    if "java" in lowered and ("后端" in cleaned_text or "backend" in lowered):
+        return "Java 后端工程师"
+    if first_meaningful:
+        return first_meaningful[:120]
+    return lines[0][:120] if lines else ""
+
+
+def career_resume_context_from_text(body: CareerProfileIngestIn) -> dict[str, Any]:
+    cleaned_text = clean_resume_text(body.resume_text)
+    text = re.sub(r"\s+", " ", cleaned_text).strip()
+    headline = infer_resume_headline(cleaned_text)
+    skills = skills_from_resume_text(text)
+    source_event_id = body.source_event_id or "career_resume_text_default"
+    return {
+        "resume_id": "resume_text_default",
+        "profile_name": infer_resume_profile_name(cleaned_text, body.profile_name or ""),
+        "headline": headline,
+        "summary": text[:1200],
+        "skills": skills,
+        "experience": [
+            {
+                "role": headline,
+                "summary": text[:1200],
+                "evidence_id": source_event_id,
+            }
+        ],
+    }
+
+
+def build_career_profile_ingest(body: CareerProfileIngestIn) -> dict[str, Any]:
+    source_event_id = body.source_event_id or "career_resume_text_default"
+    resume = career_resume_context_from_text(body)
+    result = run_core_pipeline(
+        "根据用户简历生成职业画像",
+        {
+            "pipeline_id": "career_profile_pipeline",
+            "resume": resume,
+            "career_profile": {
+                "career_profile_id": "career_profile_default",
+                "target_roles": body.target_roles or [],
+                "target_locations": body.target_locations or [],
+                "skills": resume.get("skills") or [],
+            },
+            "source_event_ids": [source_event_id],
+        },
+    )
+    output = result.get("output") or {}
+    profile = output.get("career_profile") or {}
+    profile["profile_name"] = resume.get("profile_name") or body.profile_name or "User"
+    profile["source_event_ids"] = text_list(profile.get("evidence_ids") or [source_event_id])
+    result["writeback_targets"] = ["career_profiles", "task_trace"]
+    result["writeback_plan"] = [
+        {
+            "target": "career_profiles",
+            "operation": "upsert_career_profile",
+            "payload": {
+                **profile,
+                "headline": profile.get("headline") or resume.get("headline") or "",
+                "target_locations": body.target_locations or [],
+                "source_event_ids": profile["source_event_ids"],
+                "resume_id": resume.get("resume_id"),
+                "summary": resume.get("summary"),
+                "profile_name": resume.get("profile_name"),
+            },
+        }
+    ]
+    with db() as conn:
+        writeback = apply_pipeline_writeback_plan(conn, result)
+    return {
+        "status": result.get("status"),
+        "career_profile": profile,
+        "unsupported_claims": output.get("unsupported_claims") or [],
+        "external_effects": result.get("external_effects") or [],
+        "writeback": writeback,
+        "writeback_performed": writeback.get("applied_count", 0) > 0 and writeback.get("failed_count", 0) == 0,
+    }
+
+
+def career_file_type(filename: str) -> str:
+    suffix = Path(filename).suffix.lower().lstrip(".")
+    if suffix in {"docx", "pdf", "txt", "md"}:
+        return suffix
+    raise HTTPException(status_code=400, detail="unsupported resume file type")
+
+
+def decode_resume_content(content_base64: str) -> bytes:
+    try:
+        return base64.b64decode(content_base64, validate=True)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="invalid base64 resume content") from exc
+
+
+def parse_resume_file_text(filename: str, content: bytes) -> tuple[str, str]:
+    file_type = career_file_type(filename)
+    if file_type == "docx":
+        try:
+            from docx import Document as DocxDocument
+            document = DocxDocument(BytesIO(content))
+            text = "\n".join(paragraph.text for paragraph in document.paragraphs if paragraph.text.strip())
+        except Exception as exc:
+            raise HTTPException(status_code=422, detail=f"failed to parse docx resume: {str(exc)[:180]}") from exc
+    elif file_type == "pdf":
+        try:
+            from pypdf import PdfReader
+            reader = PdfReader(BytesIO(content))
+            text = "\n".join((page.extract_text() or "").strip() for page in reader.pages)
+        except Exception as exc:
+            raise HTTPException(status_code=422, detail=f"failed to parse pdf resume: {str(exc)[:180]}") from exc
+    else:
+        try:
+            text = content.decode("utf-8")
+        except UnicodeDecodeError:
+            text = content.decode("utf-8", errors="ignore")
+    text = "\n".join(line.strip() for line in text.splitlines() if line.strip())
+    if len(text) < 20:
+        raise HTTPException(status_code=422, detail="resume file did not contain enough readable text")
+    return file_type, text
+
+
+def persist_base_resume(
+    *,
+    filename: str,
+    file_type: str,
+    parsed_text: str,
+    source_event_ids: list[str],
+) -> dict[str, Any]:
+    resume_id = f"career_resume_{stable_uuid_text(filename + ':' + parsed_text[:120])}"
+    payload = {
+        "resume_id": resume_id,
+        "filename": filename,
+        "file_type": file_type,
+        "status": "active",
+        "source_event_ids": source_event_ids,
+        "parsed_text": parsed_text,
+        "text_preview": parsed_text[:1200],
+    }
+    writeback_result = {
+        "task_trace_id": str(uuid.uuid4()),
+        "pipeline_id": "career_resume_import",
+        "source_event_ids": source_event_ids,
+        "writeback_plan": [{"target": "career_resumes", "operation": "upsert", "payload": payload}],
+    }
+    with db() as conn:
+        summary = apply_pipeline_writeback_plan(conn, writeback_result)
+    return {"payload": payload, "writeback": summary}
+
+
+def import_career_resume_file(body: CareerResumeFileImportIn) -> dict[str, Any]:
+    content = decode_resume_content(body.content_base64)
+    file_type, parsed_text = parse_resume_file_text(body.filename, content)
+    source_event_id = f"career_resume_file_{stable_uuid_text(body.filename)}"
+    resume_write = persist_base_resume(
+        filename=body.filename,
+        file_type=file_type,
+        parsed_text=parsed_text,
+        source_event_ids=[source_event_id],
+    )
+    ingest = build_career_profile_ingest(
+        CareerProfileIngestIn(
+            resume_text=parsed_text,
+            target_roles=body.target_roles,
+            target_locations=body.target_locations,
+            profile_name=body.profile_name,
+            source_event_id=source_event_id,
+        )
+    )
+    writeback = {
+        "failed_count": resume_write["writeback"].get("failed_count", 0) + ingest.get("writeback", {}).get("failed_count", 0),
+        "applied_count": resume_write["writeback"].get("applied_count", 0) + ingest.get("writeback", {}).get("applied_count", 0),
+    }
+    return {
+        "status": ingest.get("status"),
+        "file_type": file_type,
+        "base_resume": {
+            "id": resume_write["payload"]["resume_id"],
+            "filename": body.filename,
+            "file_type": file_type,
+            "source_event_ids": [source_event_id],
+        },
+        "parsed_text": parsed_text,
+        "career_profile": ingest.get("career_profile") or {},
+        "writeback": writeback,
+        "writeback_performed": writeback["applied_count"] > 0 and writeback["failed_count"] == 0,
+    }
+
+
+def safe_export_filename(filename: str, extension: str) -> str:
+    stem = re.sub(r"[^a-zA-Z0-9._-]+", "-", filename.strip()).strip("-._") or "nomi-resume"
+    if stem.lower().endswith(f".{extension}"):
+        return stem
+    return f"{stem}.{extension}"
+
+
+def resume_export_text(body: CareerResumeExportIn) -> str:
+    lines = [body.headline.strip(), ""]
+    for section in body.sections:
+        lines.extend([section.title.strip(), section.body.strip(), ""])
+    return "\n".join(lines).strip() + "\n"
+
+
+def build_docx_resume_export(body: CareerResumeExportIn) -> bytes:
+    from docx import Document as DocxDocument
+    document = DocxDocument()
+    document.add_heading(body.headline.strip(), level=0)
+    for section in body.sections:
+        document.add_heading(section.title.strip(), level=1)
+        for paragraph in section.body.splitlines():
+            if paragraph.strip():
+                document.add_paragraph(paragraph.strip())
+    buffer = BytesIO()
+    document.save(buffer)
+    return buffer.getvalue()
+
+
+def pdf_escape(value: str) -> str:
+    return value.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
+
+
+def build_simple_pdf_export(text: str) -> bytes:
+    lines = text.splitlines()[:42]
+    stream_lines = ["BT", "/F1 11 Tf", "72 760 Td"]
+    for index, line in enumerate(lines):
+        if index:
+            stream_lines.append("0 -16 Td")
+        stream_lines.append(f"({pdf_escape(line[:100])}) Tj")
+    stream_lines.append("ET")
+    stream = "\n".join(stream_lines).encode("utf-8")
+    objects = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>",
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+        b"<< /Length " + str(len(stream)).encode("ascii") + b" >>\nstream\n" + stream + b"\nendstream",
+    ]
+    output = bytearray(b"%PDF-1.4\n")
+    offsets = [0]
+    for number, obj in enumerate(objects, start=1):
+        offsets.append(len(output))
+        output.extend(f"{number} 0 obj\n".encode("ascii"))
+        output.extend(obj)
+        output.extend(b"\nendobj\n")
+    xref_offset = len(output)
+    output.extend(f"xref\n0 {len(objects) + 1}\n".encode("ascii"))
+    output.extend(b"0000000000 65535 f \n")
+    for offset in offsets[1:]:
+        output.extend(f"{offset:010d} 00000 n \n".encode("ascii"))
+    output.extend(
+        f"trailer\n<< /Size {len(objects) + 1} /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n".encode("ascii")
+    )
+    return bytes(output)
+
+
+def export_career_resume(body: CareerResumeExportIn) -> dict[str, Any]:
+    text = resume_export_text(body)
+    if body.format == "docx":
+        content = build_docx_resume_export(body)
+        mime_type = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+    else:
+        content = build_simple_pdf_export(text)
+        mime_type = "application/pdf"
+    return {
+        "filename": safe_export_filename(body.filename, body.format),
+        "mime_type": mime_type,
+        "format": body.format,
+        "content_base64": base64.b64encode(content).decode("ascii"),
+        "source_event_ids": body.source_event_ids or [],
+    }
+
+
+def career_pipeline_job_context(opportunity: dict[str, Any]) -> dict[str, Any]:
+    payload = opportunity.get("payload") or {}
+    return {
+        "job_id": opportunity.get("id"),
+        "source": opportunity.get("source"),
+        "title": opportunity.get("title"),
+        "company": opportunity.get("company"),
+        "location": opportunity.get("location"),
+        "url": opportunity.get("url"),
+        "jd_text": payload.get("jd_text") or payload.get("description") or " ".join(opportunity.get("requirements") or []),
+        "requirements": opportunity.get("requirements") or payload.get("requirements") or [],
+        "source_event_ids": opportunity.get("source_event_ids") or [],
+    }
+
+
+def career_pipeline_resume_context(profile: dict[str, Any], resume_version: dict[str, Any] | None) -> dict[str, Any]:
+    payload = profile.get("payload") or {}
+    resume_payload = (resume_version or {}).get("payload") or {}
+    return {
+        "resume_id": (resume_version or {}).get("base_resume_id") or payload.get("resume_id") or profile.get("id") or "career_profile_default",
+        "profile_name": payload.get("profile_name") or payload.get("name") or "User",
+        "headline": profile.get("headline") or payload.get("headline") or "",
+        "summary": payload.get("summary") or resume_payload.get("summary") or profile.get("headline") or "",
+        "skills": profile.get("skills") or payload.get("skills") or [],
+        "experience": payload.get("experience") or [],
+    }
+
+
+def build_career_detail(opportunity: dict[str, Any], profile: dict[str, Any] | None, resume_versions: list[dict[str, Any]], applications: list[dict[str, Any]]) -> dict[str, Any]:
+    profile = profile or {
+        "id": "career_profile_default",
+        "headline": "",
+        "target_roles": [],
+        "target_locations": [],
+        "skills": [],
+        "source_event_ids": [],
+        "payload": {},
+        "updated_at": "",
+    }
+    resume_version = resume_versions[0] if resume_versions else None
+    job_context = career_pipeline_job_context(opportunity)
+    resume_context = career_pipeline_resume_context(profile, resume_version)
+    source_event_ids = text_list(opportunity.get("source_event_ids")) + text_list(profile.get("source_event_ids"))
+    if resume_version:
+        source_event_ids += text_list(resume_version.get("source_event_ids"))
+    for application in applications:
+        source_event_ids += text_list(application.get("source_event_ids"))
+    source_event_ids = list(dict.fromkeys(source_event_ids))
+    contact = {
+        "name": (opportunity.get("payload") or {}).get("recruiter_name") or "Hiring Team",
+        "role": "Recruiter",
+        "company": opportunity.get("company") or "",
+        "channel": "linkedin",
+    }
+    pipeline_context = {
+        "job": job_context,
+        "resume": resume_context,
+        "career_profile": profile,
+        "source_event_ids": source_event_ids,
+    }
+    cover = run_core_pipeline(
+        f"根据 {opportunity.get('title') or '该岗位'} 生成 Cover Letter 草稿",
+        {**pipeline_context, "pipeline_id": "cover_letter_pipeline", "recipient": contact["name"], "channel": "gmail"},
+    )
+    outreach = run_core_pipeline(
+        f"给 {contact['name']} 生成求职外联草稿",
+        {**pipeline_context, "pipeline_id": "outreach_message_pipeline", "contact": contact},
+    )
+    interview = run_core_pipeline(
+        f"准备 {opportunity.get('title') or '该岗位'} 面试",
+        {**pipeline_context, "pipeline_id": "interview_prep_pipeline"},
+    )
+    payload = opportunity.get("payload") or {}
+    return {
+        "opportunity": opportunity,
+        "profile": profile,
+        "resume_versions": resume_versions,
+        "resume_draft": resume_version,
+        "applications": applications,
+        "application_history": applications,
+        "fit_summary": {
+            "fit_score": opportunity.get("fit_score"),
+            "matched_requirements": payload.get("matched_requirements") or payload.get("matched") or [],
+            "gap_requirements": payload.get("gap_requirements") or payload.get("gaps") or [],
+            "evidence_ids": source_event_ids,
+        },
+        "cover_letter_draft": (cover.get("output") or {}) if isinstance(cover, dict) else {},
+        "outreach_draft": (outreach.get("output") or {}) if isinstance(outreach, dict) else {},
+        "interview_prep": (interview.get("output") or {}) if isinstance(interview, dict) else {},
+        "generated_from": {
+            "pipelines": ["cover_letter_pipeline", "outreach_message_pipeline", "interview_prep_pipeline"],
+            "source_event_ids": source_event_ids,
+            "drafts_are_not_sent": True,
+        },
+    }
+
+
+def empty_career_board_response(
+    *,
+    status: Optional[str],
+    limit: int,
+    state: str = "ready",
+    message: str = "",
+    next_actions: Optional[list[str]] = None,
+) -> dict[str, Any]:
+    return {
+        "status": state,
+        "message": message,
+        "filters": {"status": status, "limit": limit},
+        "profiles": [],
+        "opportunities": [],
+        "resume_versions": [],
+        "career_resumes": [],
+        "applications": [],
+        "next_actions": next_actions or [],
+    }
+
+
+def is_demo_career_opportunity(row: Any) -> bool:
+    row_id = str(row[0] or "").strip().lower()
+    source = str(row[1] or "").strip().lower()
+    title = str(row[2] or "").strip().lower()
+    company = str(row[3] or "").strip().lower()
+    url = str(row[5] or "").strip().lower()
+    source_event_ids = row[9] or []
+    payload = row[10] if isinstance(row[10], dict) else {}
+    payload_text = json.dumps(payload, ensure_ascii=False, default=str).lower()
+    manual_demo_text = " ".join([row_id, title, company, url, payload_text])
+    if payload.get("demo") is True or payload.get("is_demo") is True:
+        return True
+    if source in {"manual", "demo", "sample", "test"} and not source_event_ids:
+        return True
+    if source in {"manual", "demo", "sample", "test"} and any(term in payload_text for term in ["manual_test", "demo", "sample"]):
+        return True
+    if source in {"manual", "demo", "sample", "test"} and any(
+        term in manual_demo_text
+        for term in [
+            "acceptance",
+            "example ai",
+            "example mobile",
+            "guard",
+            "manual_test",
+            "placeholder",
+            "sample",
+            "ui_fix",
+            "web_workbench",
+        ]
+    ):
+        return True
+    if any(term in url for term in ["example.com", "example.test", "localhost", "127.0.0.1"]):
+        return True
+    return False
+
+
+@app.get("/api/career/board")
+def career_board(
+    x_par_password: Optional[str] = Header(default=None),
+    status: Optional[str] = None,
+    limit: int = 50,
+    include_demo: bool = False,
+) -> dict[str, Any]:
+    require_password(x_par_password)
+    bounded_limit = max(1, min(limit, 100))
+    opportunity_where = "WHERE status = %s" if status else ""
+    opportunity_params: tuple[Any, ...] = (status, bounded_limit) if status else (bounded_limit,)
+    application_where = "WHERE status = %s" if status else ""
+    application_params: tuple[Any, ...] = (status, bounded_limit) if status else (bounded_limit,)
+    try:
+        with db() as conn:
+            profile_rows = conn.execute(
+                """
+                SELECT id, headline, target_roles, target_locations, skills, source_event_ids, payload, updated_at
+                FROM career_profiles
+                ORDER BY updated_at DESC
+                LIMIT %s
+                """,
+                (bounded_limit,),
+            ).fetchall()
+            opportunity_rows = conn.execute(
+                f"""
+                SELECT id, source, title, company, location, url, status, fit_score,
+                       requirements, source_event_ids, payload, created_at, updated_at
+                FROM job_opportunities
+                {opportunity_where}
+                ORDER BY updated_at DESC
+                LIMIT %s
+                """,
+                opportunity_params,
+            ).fetchall()
+            resume_rows = conn.execute(
+                """
+                SELECT id, base_resume_id, target_job_id, status, source_event_ids, payload, created_at, updated_at
+                FROM resume_versions
+                ORDER BY updated_at DESC
+                LIMIT %s
+                """,
+                (bounded_limit,),
+            ).fetchall()
+            base_resume_rows = conn.execute(
+                """
+                SELECT id, filename, file_type, status, source_event_ids, parsed_text, payload, created_at, updated_at
+                FROM career_resumes
+                WHERE status <> 'deleted'
+                ORDER BY CASE WHEN payload->>'is_default' = 'true' THEN 1 ELSE 0 END DESC,
+                         updated_at DESC
+                LIMIT %s
+                """,
+                (bounded_limit,),
+            ).fetchall()
+            application_rows = conn.execute(
+                f"""
+                SELECT id, job_id, status, stage, next_step, application_action,
+                       platform, source_event_ids, payload, created_at, updated_at
+                FROM job_applications
+                {application_where}
+                ORDER BY updated_at DESC
+                LIMIT %s
+                """,
+                application_params,
+            ).fetchall()
+    except (psycopg.errors.UndefinedTable, psycopg.errors.UndefinedColumn):
+        return empty_career_board_response(
+            status=status,
+            limit=bounded_limit,
+            state="schema_missing",
+            message="Career board tables are not available yet. Deploy the runtime schema before expecting persisted job data.",
+            next_actions=[
+                "deploy_runtime_api_schema",
+                "run_career_pipeline_writeback",
+                "reload_android_career_board",
+            ],
+        )
+    if not include_demo:
+        opportunity_rows = [
+            row
+            for row in opportunity_rows
+            if not is_demo_career_opportunity(row) and not is_low_value_career_opportunity(row)
+        ]
+    return {
+        "status": "ready",
+        "message": "",
+        "filters": {"status": status, "limit": bounded_limit, "include_demo": include_demo},
+        "profiles": [
+            {
+                "id": str(row[0]),
+                "headline": row[1],
+                "target_roles": [str(item) for item in row[2]],
+                "target_locations": [str(item) for item in row[3]],
+                "skills": [str(item) for item in row[4]],
+                "source_event_ids": [str(item) for item in row[5]],
+                "payload": row[6] or {},
+                "updated_at": isoformat_or_value(row[7]),
+            }
+            for row in profile_rows
+        ],
+        "opportunities": [
+            {
+                "id": str(row[0]),
+                "source": row[1],
+                "title": row[2],
+                "company": row[3],
+                "location": row[4],
+                "url": row[5],
+                "status": row[6],
+                "fit_score": row[7],
+                "requirements": row[8] or [],
+                "source_event_ids": [str(item) for item in row[9]],
+                "payload": row[10] or {},
+                "created_at": isoformat_or_value(row[11]),
+                "updated_at": isoformat_or_value(row[12]),
+            }
+            for row in opportunity_rows
+        ],
+        "resume_versions": [
+            {
+                "id": str(row[0]),
+                "base_resume_id": row[1],
+                "target_job_id": row[2],
+                "status": row[3],
+                "source_event_ids": [str(item) for item in row[4]],
+                "payload": row[5] or {},
+                "created_at": isoformat_or_value(row[6]),
+                "updated_at": isoformat_or_value(row[7]),
+            }
+            for row in resume_rows
+        ],
+        "career_resumes": [career_base_resume_from_row(row) for row in base_resume_rows],
+        "applications": [
+            {
+                "id": str(row[0]),
+                "job_id": row[1],
+                "status": row[2],
+                "stage": row[3],
+                "next_step": row[4],
+                "application_action": row[5],
+                "platform": row[6],
+                "source_event_ids": [str(item) for item in row[7]],
+                "payload": row[8] or {},
+                "created_at": isoformat_or_value(row[9]),
+                "updated_at": isoformat_or_value(row[10]),
+            }
+            for row in application_rows
+        ],
+    }
+
+
+@app.get("/api/career/offers")
+def career_offers(
+    x_par_password: Optional[str] = Header(default=None),
+    limit: int = 50,
+) -> dict[str, Any]:
+    require_password(x_par_password)
+    bounded_limit = max(1, min(limit, 100))
+    stages = ["interviewing", "offer"]
+    with db() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, job_id, status, stage, next_step, application_action,
+                   platform, source_event_ids, payload, created_at, updated_at
+            FROM job_applications
+            WHERE status = ANY(%s::TEXT[]) OR stage = ANY(%s::TEXT[])
+            ORDER BY updated_at DESC
+            LIMIT %s
+            """,
+            (stages, stages, bounded_limit),
+        ).fetchall()
+    return {
+        "filters": {"stages": stages, "limit": bounded_limit},
+        "offers": [career_application_from_row(row) for row in rows],
+    }
+
+
+@app.post("/api/career/ats/preview")
+def career_ats_preview(
+    body: CareerAtsPreviewIn,
+    x_par_password: Optional[str] = Header(default=None),
+) -> dict[str, Any]:
+    require_password(x_par_password)
+    url = body.url.strip()
+    if not public_ats_source_from_url(url):
+        raise HTTPException(status_code=400, detail="unsupported public ATS URL")
+    if body.text or body.html_text:
+        raw_text = (body.text or body.html_text or "").strip()
+        title = (body.title or (html_title(raw_text) if body.html_text else "")).strip()
+        text = raw_text
+        return build_public_ats_preview(url, title=title, text=text)
+    try:
+        page = fetch_public_ats_page(url)
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail=f"failed to fetch ATS page: {str(exc)[:180]}") from exc
+    return build_public_ats_preview(
+        page.get("url") or url,
+        title=(body.title or page.get("title") or "").strip(),
+        text=page.get("text") or "",
+    )
+
+
+@app.post("/api/career/ats/list-preview")
+def career_ats_list_preview(
+    body: CareerAtsListPreviewIn,
+    x_par_password: Optional[str] = Header(default=None),
+) -> dict[str, Any]:
+    require_password(x_par_password)
+    return build_public_ats_list_preview(body.url.strip(), limit=body.limit)
+
+
+@app.post("/api/career/profile/ingest")
+def career_profile_ingest(
+    body: CareerProfileIngestIn,
+    x_par_password: Optional[str] = Header(default=None),
+) -> dict[str, Any]:
+    require_password(x_par_password)
+    return build_career_profile_ingest(body)
+
+
+@app.post("/api/career/resumes/import")
+def career_resume_import(
+    body: CareerResumeFileImportIn,
+    x_par_password: Optional[str] = Header(default=None),
+) -> dict[str, Any]:
+    require_password(x_par_password)
+    return import_career_resume_file(body)
+
+
+@app.patch("/api/career/resumes/{resume_id}")
+def patch_career_resume(
+    resume_id: str,
+    body: CareerResumePatchIn,
+    x_par_password: Optional[str] = Header(default=None),
+) -> dict[str, Any]:
+    require_password(x_par_password)
+    payload_patch: dict[str, Any] = {}
+    next_status = body.status
+    with db() as conn:
+        if body.make_default:
+            conn.execute(
+                """
+                UPDATE career_resumes
+                SET payload = payload || %s::jsonb,
+                    updated_at = now()
+                WHERE id <> %s
+                  AND status <> 'deleted'
+                """,
+                (json.dumps({"is_default": False}, ensure_ascii=False), resume_id),
+            )
+            payload_patch["is_default"] = True
+            next_status = next_status or "active"
+        row = conn.execute(
+            """
+            UPDATE career_resumes
+            SET status = COALESCE(%s, status),
+                payload = payload || %s::jsonb,
+                updated_at = now()
+            WHERE id = %s
+              AND status <> 'deleted'
+            RETURNING id, filename, file_type, status, source_event_ids, parsed_text, payload, created_at, updated_at
+            """,
+            (
+                next_status,
+                json.dumps(payload_patch, ensure_ascii=False, default=str),
+                resume_id,
+            ),
+        ).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="career resume not found")
+    return career_base_resume_from_row(row)
+
+
+@app.delete("/api/career/resumes/{resume_id}")
+def delete_career_resume(
+    resume_id: str,
+    x_par_password: Optional[str] = Header(default=None),
+) -> dict[str, Any]:
+    require_password(x_par_password)
+    with db() as conn:
+        row = conn.execute(
+            """
+            UPDATE career_resumes
+            SET status = 'deleted',
+                payload = payload || %s::jsonb,
+                updated_at = now()
+            WHERE id = %s
+            RETURNING id, filename, file_type, status, source_event_ids, parsed_text, payload, created_at, updated_at
+            """,
+            (
+                json.dumps({"deleted_from": "workbench"}, ensure_ascii=False, default=str),
+                resume_id,
+            ),
+        ).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="career resume not found")
+    return career_base_resume_from_row(row)
+
+
+@app.post("/api/career/resumes/export")
+def career_resume_export(
+    body: CareerResumeExportIn,
+    x_par_password: Optional[str] = Header(default=None),
+) -> dict[str, Any]:
+    require_password(x_par_password)
+    return export_career_resume(body)
+
+
+@app.get("/api/career/opportunities/{job_id}")
+def career_opportunity_detail(
+    job_id: str,
+    x_par_password: Optional[str] = Header(default=None),
+) -> dict[str, Any]:
+    require_password(x_par_password)
+    with db() as conn:
+        opportunity_row = conn.execute(
+            """
+            SELECT id, source, title, company, location, url, status, fit_score,
+                   requirements, source_event_ids, payload, created_at, updated_at
+            FROM job_opportunities
+            WHERE id = %s
+            LIMIT 1
+            """,
+            (job_id,),
+        ).fetchone()
+        if not opportunity_row:
+            raise HTTPException(status_code=404, detail="career opportunity not found")
+        profile_row = conn.execute(
+            """
+            SELECT id, headline, target_roles, target_locations, skills, source_event_ids, payload, updated_at
+            FROM career_profiles
+            ORDER BY updated_at DESC
+            LIMIT 1
+            """,
+            (),
+        ).fetchone()
+        resume_rows = conn.execute(
+            """
+            SELECT id, base_resume_id, target_job_id, status, source_event_ids, payload, created_at, updated_at
+            FROM resume_versions
+            WHERE target_job_id = %s
+            ORDER BY updated_at DESC
+            LIMIT 20
+            """,
+            (job_id,),
+        ).fetchall()
+        application_rows = conn.execute(
+            """
+            SELECT id, job_id, status, stage, next_step, application_action,
+                   platform, source_event_ids, payload, created_at, updated_at
+            FROM job_applications
+            WHERE job_id = %s
+            ORDER BY updated_at DESC
+            LIMIT 20
+            """,
+            (job_id,),
+        ).fetchall()
+    return build_career_detail(
+        career_opportunity_from_row(opportunity_row),
+        career_profile_from_row(profile_row) if profile_row else None,
+        [career_resume_from_row(row) for row in resume_rows],
+        [career_application_from_row(row) for row in application_rows],
+    )
+
+
+@app.patch("/api/career/applications/{application_id}")
+def patch_career_application(
+    application_id: str,
+    body: CareerApplicationPatchIn,
+    x_par_password: Optional[str] = Header(default=None),
+) -> dict[str, Any]:
+    require_password(x_par_password)
+    payload = {"user_note": body.user_note} if body.user_note else {}
+    with db() as conn:
+        row = conn.execute(
+            """
+            UPDATE job_applications
+            SET status = COALESCE(%s, status),
+                stage = COALESCE(%s, stage),
+                next_step = COALESCE(%s, next_step),
+                payload = payload || %s::jsonb,
+                updated_at = now()
+            WHERE id = %s
+            RETURNING id, job_id, status, stage, next_step, application_action,
+                      platform, source_event_ids, payload, created_at, updated_at
+            """,
+            (
+                body.status,
+                body.stage,
+                body.next_step,
+                json.dumps(payload, ensure_ascii=False, default=str),
+                application_id,
+            ),
+        ).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="career application not found")
+    return {
+        "id": str(row[0]),
+        "job_id": row[1],
+        "status": row[2],
+        "stage": row[3],
+        "next_step": row[4],
+        "application_action": row[5],
+        "platform": row[6],
+        "source_event_ids": [str(item) for item in row[7]],
+        "payload": row[8] or {},
+        "created_at": isoformat_or_value(row[9]),
+        "updated_at": isoformat_or_value(row[10]),
+    }
+
+
 @app.get("/api/suggestions")
 def suggestions(x_par_password: Optional[str] = Header(default=None), limit: int = 20) -> list[dict[str, Any]]:
     require_password(x_par_password)
+    requested_limit = max(0, int(limit or 0))
+    if requested_limit == 0:
+        return []
+    prefilter_limit = min(max(requested_limit * 10, 50), 500)
     with db() as conn:
         rows = conn.execute(
             """
@@ -10361,7 +17576,7 @@ def suggestions(x_par_password: Optional[str] = Header(default=None), limit: int
             ORDER BY priority DESC, created_at DESC
             LIMIT %s
             """,
-            (limit,),
+            (prefilter_limit,),
         ).fetchall()
     rows_as_dicts = [
         {
@@ -10377,12 +17592,33 @@ def suggestions(x_par_password: Optional[str] = Header(default=None), limit: int
         }
         for row in rows
     ]
-    return filter_open_suggestions(rows_as_dicts)[:limit]
+    return filter_open_suggestions(rows_as_dicts)[:requested_limit]
 
 
 @app.get("/api/proactive/suggestions")
 def proactive_suggestions(x_par_password: Optional[str] = Header(default=None), limit: int = 20) -> dict[str, Any]:
     return {"items": suggestions(x_par_password=x_par_password, limit=limit)}
+
+
+def suggestion_action_chat_summary(result: dict[str, Any]) -> str:
+    route_result = result.get("route_result") or {}
+    pipeline_result = result.get("pipeline_result") or {}
+    local_result = result.get("local_result") or {}
+    pipeline = route_result.get("pipeline") or {}
+    pipeline_name = pipeline.get("name") or pipeline.get("id") or pipeline_result.get("pipeline_id")
+    guard = route_result.get("execution_guard") or pipeline_result.get("execution_guard") or {}
+    output = pipeline_result.get("output") or {}
+    route_request = output.get("route_request") or {}
+    resolved_slots = pipeline_result.get("resolved_slots") or {}
+    destination = route_request.get("destination") or resolved_slots.get("destination")
+    lines = [
+        f"已按建议进入：{pipeline_name}" if pipeline_name else "建议动作已记录。",
+        f"目的地：{destination}" if destination else "",
+        f"执行状态：{pipeline_result.get('status')}" if pipeline_result.get("status") else "",
+        "这个动作需要你最终确认后才会执行。" if guard.get("requires_confirmation") else "",
+        f"当前状态：{local_result.get('status')}" if local_result.get("status") else "",
+    ]
+    return "\n".join(line for line in lines if line) or "建议动作已处理。"
 
 
 @app.post("/api/proactive/suggestions/{suggestion_id}/action")
@@ -10416,23 +17652,50 @@ def proactive_suggestion_action(
             "feedback_recorded": True,
         }
         if route_request:
+            route_context = {
+                "suggestion_id": suggestion_id,
+                "source_event_ids": [suggestion["source_event_id"]] if suggestion.get("source_event_id") else [],
+                "action_id": body.action_id,
+                "suggestion": {
+                    "title": suggestion.get("title"),
+                    "body": suggestion.get("body"),
+                    "metadata": suggestion.get("metadata") or {},
+                },
+            }
             route_result = route_tool_request(
                 route_request,
-                {
-                    "suggestion_id": suggestion_id,
-                    "source_event_ids": [suggestion["source_event_id"]] if suggestion.get("source_event_id") else [],
-                    "action_id": body.action_id,
-                    "suggestion": {
-                        "title": suggestion.get("title"),
-                        "body": suggestion.get("body"),
-                        "metadata": suggestion.get("metadata") or {},
-                    },
-                },
+                route_context,
             )
             persist_task_route_trace(conn, route_result)
             response["route_result"] = route_result
+            pipeline_result = build_pipeline_execution_result(
+                request=route_request,
+                context=route_result.get("context") or route_context,
+                route_result=route_result,
+            )
+            persist_pipeline_execution_result(conn, pipeline_result)
+            response["pipeline_result"] = pipeline_result
         else:
             response["local_result"] = apply_suggestion_local_action(conn, suggestion_id, body)
+        chat_summary = suggestion_action_chat_summary(response)
+        response["chat_summary"] = chat_summary
+        try:
+            response["chat_turn"] = persist_assistant_turn(
+                conn,
+                redis_client(),
+                "assistant",
+                chat_summary,
+                conversation_id=body.conversation_id,
+                client_type="suggestion_action",
+                suggestion_id=suggestion_id,
+                tool_call_id=f"suggestion_action:{suggestion_id}:{body.action_id}:{feedback_id}",
+                memory_enqueue_policy="defer",
+            )
+            response["chat_turn_persisted"] = True
+        except Exception as exc:
+            response["chat_turn_persisted"] = False
+            response["chat_turn_error"] = "persist_failed"
+            print(f"suggestion action chat turn persist failed: {exc}", flush=True)
         return response
 
 
@@ -10557,6 +17820,8 @@ def event_trace(event_id: str, x_par_password: Optional[str] = Header(default=No
 @app.get("/api/chat/conversations/{conversation_id}/trace")
 def conversation_trace(conversation_id: str, x_par_password: Optional[str] = Header(default=None)) -> dict[str, Any]:
     require_password(x_par_password)
+    if not is_uuid_text(conversation_id):
+        raise HTTPException(status_code=400, detail="conversation_id must be a UUID")
     pattern = f"%{conversation_id}%"
     with db() as conn:
         conversation_row = conn.execute(
@@ -10579,7 +17844,8 @@ def conversation_trace(conversation_id: str, x_par_password: Optional[str] = Hea
             """,
             (conversation_id,),
         ).fetchall()
-        event_ids = [str(row[4]) for row in turn_rows if row[4]]
+        event_ids = uuid_texts_only([str(row[4]) for row in turn_rows if row[4]])
+        suggestion_ids = uuid_texts_only([str(row[5]) for row in turn_rows if row[5]])
         context_rows = conn.execute(
             """
             SELECT id, event_id, context_type, included_event_ids, included_memory_ids,
@@ -10598,7 +17864,7 @@ def conversation_trace(conversation_id: str, x_par_password: Optional[str] = Hea
                OR id = ANY(%s::UUID[])
             ORDER BY created_at DESC
             """,
-            (event_ids, [str(row[5]) for row in turn_rows if row[5]]),
+            (event_ids, suggestion_ids),
         ).fetchall()
         route_rows = conn.execute(
             """
@@ -10648,6 +17914,42 @@ def parse_metadata_datetime(value: Any) -> Optional[datetime]:
     return parsed
 
 
+LOW_VALUE_SUGGESTION_SOURCES = {"focus", "browser", "browser_focus", "browser_network", "browser_runtime", "chromium_runtime"}
+LOW_VALUE_SUGGESTION_EVENT_TYPES = {
+    "deep_focus",
+    "browser_focus_event",
+    "browser_network_event",
+    "runtime_network_hook",
+    "page_title",
+    "tab_focus",
+}
+
+
+def is_low_value_suggestion(item: dict[str, Any]) -> bool:
+    metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
+    source = str(metadata.get("source") or metadata.get("collector") or "").strip().lower()
+    event_type = str(metadata.get("event_type") or "").strip().lower()
+    entities = metadata.get("entities") if isinstance(metadata.get("entities"), dict) else {}
+    primary_label = str(entities.get("primary_label") or "").strip().lower()
+    labels = [str(label).strip().lower() for label in entities.get("labels", [])] if isinstance(entities.get("labels"), list) else []
+    text = f"{item.get('title') or ''}\n{item.get('body') or ''}".strip()
+    if re.search(r"\b\d+\s+notifications?\s+total\b", text, re.I):
+        return True
+    if source == "nomi_chat":
+        return True
+    if source in {"whatsapp", "telegram"} and event_type.endswith("snapshot"):
+        if re.search(r"可能需要跟进：\(\d+\)\s*(WhatsApp|Telegram)\s*。?\s*$", text, re.I):
+            return True
+    if source in {"gmail", "telegram", "linkedin"} and is_low_value_private_signal_text(text):
+        return True
+    if primary_label == "low_value" or (labels and set(labels).issubset({"low_value", "ordinary_chat"})):
+        return True
+    if source in LOW_VALUE_SUGGESTION_SOURCES or event_type in LOW_VALUE_SUGGESTION_EVENT_TYPES:
+        return True
+    body = str(item.get("body") or "")
+    return bool(re.search(r"\s[|｜]\s|https?://|Google Workspace|Gmail: Secure", body)) and source in {"", "focus"}
+
+
 def filter_open_suggestions(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     now = datetime.now(timezone.utc)
     filtered: list[dict[str, Any]] = []
@@ -10655,6 +17957,8 @@ def filter_open_suggestions(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     sorted_rows = sorted(rows, key=lambda item: (float(item.get("priority") or 0), item.get("created_at") or ""), reverse=True)
     for item in sorted_rows:
         metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
+        if is_low_value_suggestion(item):
+            continue
         expires_at = parse_metadata_datetime(metadata.get("expires_at"))
         if expires_at and expires_at <= now:
             continue
@@ -10666,8 +17970,89 @@ def filter_open_suggestions(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return filtered
 
 
+def _suggestion_url_status(raw_url: Any) -> tuple[str, str]:
+    url = str(raw_url or "").strip()
+    if not url:
+        return "", "missing"
+    parsed = urlparse(url)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return "", "invalid_url"
+    value = f"{parsed.netloc}{parsed.path}".lower()
+    placeholder_terms = (
+        "example.com",
+        "example.test",
+        "exampleai",
+        "example-ai",
+        "acme",
+        "localhost",
+        "127.0.0.1",
+    )
+    if any(term in value for term in placeholder_terms):
+        return "", "placeholder_or_test_url"
+    return url, "actionable"
+
+
+def _sanitize_suggestion_body_links(body: Any) -> str:
+    text = str(body or "")
+    if not text:
+        return ""
+    placeholder_seen = False
+
+    def replace_url(match: re.Match[str]) -> str:
+        nonlocal placeholder_seen
+        url = match.group(0).rstrip("。.,，)")
+        suffix = match.group(0)[len(url):]
+        actionable, status = _suggestion_url_status(url)
+        if actionable:
+            return match.group(0)
+        if status == "placeholder_or_test_url":
+            placeholder_seen = True
+            return f"链接待验证，暂不提供打开按钮{suffix}"
+        return match.group(0)
+
+    sanitized = re.sub(r"https?://[^\s]+", replace_url, text)
+    if placeholder_seen and "链接待验证" not in sanitized:
+        sanitized = f"{sanitized}\n链接：链接待验证，暂不提供打开按钮。"
+    return sanitized
+
+
+def _sanitize_suggestion_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
+    sanitized = dict(metadata)
+    actions = metadata.get("actions") if isinstance(metadata.get("actions"), list) else []
+    safe_actions: list[dict[str, Any]] = []
+    for raw_action in actions:
+        if not isinstance(raw_action, dict):
+            continue
+        action = dict(raw_action)
+        if action.get("id") == "open_job_url":
+            url, status = _suggestion_url_status(action.get("url"))
+            if not url:
+                action["url_validation_status"] = status
+                continue
+            action["url"] = url
+        safe_actions.append(action)
+    if actions:
+        sanitized["actions"] = safe_actions
+
+    recommended_jobs = metadata.get("recommended_jobs")
+    if isinstance(recommended_jobs, list):
+        safe_jobs: list[dict[str, Any]] = []
+        for raw_job in recommended_jobs:
+            if not isinstance(raw_job, dict):
+                continue
+            job = dict(raw_job)
+            url, status = _suggestion_url_status(job.get("url"))
+            job["url"] = url
+            if status != "actionable":
+                job["url_validation_status"] = status
+            safe_jobs.append(job)
+        sanitized["recommended_jobs"] = safe_jobs
+    return sanitized
+
+
 def suggestion_to_realtime_message(item: dict[str, Any]) -> dict[str, Any]:
-    metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
+    raw_metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
+    metadata = _sanitize_suggestion_metadata(raw_metadata)
     actions = metadata.get("actions") if isinstance(metadata.get("actions"), list) else []
     return {
         "type": "proactive_message",
@@ -10675,7 +18060,7 @@ def suggestion_to_realtime_message(item: dict[str, Any]) -> dict[str, Any]:
         "suggestion_id": str(item.get("id", "")),
         "source_event_id": str(item.get("source_event_id", "")),
         "title": item.get("title", ""),
-        "body": item.get("body", ""),
+        "body": _sanitize_suggestion_body_links(item.get("body", "")),
         "priority": item.get("priority", 0),
         "source": metadata.get("source") or metadata.get("collector") or "unknown",
         "metadata": metadata,

@@ -49,6 +49,10 @@ def stage(name: str, output: dict[str, Any], checks: dict[str, bool]) -> dict[st
     }
 
 
+def unwrap_jsonb(value: Any) -> Any:
+    return getattr(value, "obj", value)
+
+
 def compact_route(result: dict[str, Any]) -> dict[str, Any]:
     packet = result.get("openclaw_task_packet") or {}
     return {
@@ -1107,6 +1111,7 @@ def main_script() -> int:
             executed.append((sql, params))
 
     trace_id = main.persist_task_route_trace(TraceConn(), openclaw)
+    trace_packet = unwrap_jsonb(executed[0][1][8]) if executed else {}
     stages.append(
         stage(
             "task_route_trace_persistence_payload_is_reasonable",
@@ -1115,7 +1120,7 @@ def main_script() -> int:
                 "sql": executed[0][0] if executed else "",
                 "route_type": executed[0][1][2] if executed else None,
                 "capability_id": executed[0][1][3] if executed else None,
-                "packet_goal": (executed[0][1][8] or {}).get("goal") if executed else None,
+                "packet_goal": (trace_packet or {}).get("goal"),
             },
             {
                 "inserted_trace": bool(executed) and "INSERT INTO task_route_traces" in executed[0][0],
@@ -1123,7 +1128,7 @@ def main_script() -> int:
                 "route_type_openclaw": bool(executed) and executed[0][1][2] == "openclaw_tool",
                 "capability_matches": bool(executed) and executed[0][1][3] == "automation.browser.operate",
                 "packet_goal_preserved": bool(executed)
-                and (executed[0][1][8] or {}).get("goal") == "帮我去一个不支持 MCP 的网站填写报名表，但不要提交",
+                and (trace_packet or {}).get("goal") == "帮我去一个不支持 MCP 的网站填写报名表，但不要提交",
             },
         )
     )

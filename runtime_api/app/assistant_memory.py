@@ -4,6 +4,11 @@ import json
 import re
 from typing import Any, Callable
 
+try:
+    from app.memory_runtime.schema import memory_runtime_phase1_schema_sql
+except ModuleNotFoundError:  # pragma: no cover - local package import fallback
+    from runtime_api.app.memory_runtime.schema import memory_runtime_phase1_schema_sql
+
 
 SHORT_REPLY_MARKERS = {
     "需要",
@@ -140,6 +145,19 @@ def build_session_search_context(
         for task in active_tasks
         if not conversation_id or str(task.get("conversation_id") or conversation_id) == str(conversation_id)
     ]
+    referenced_task_titles = [
+        str(task.get("title") or task.get("summary") or task.get("description") or "").strip()
+        for task in scoped_tasks
+        if str(task.get("title") or task.get("summary") or task.get("description") or "").strip()
+    ][:3]
+    referenced_question = str(prior_question.get("content") or "").strip() if prior_question else ""
+    interpretation = ""
+    if short_reply and prior_question:
+        task_hint = f"；相关待办/任务：{'；'.join(referenced_task_titles)}" if referenced_task_titles else ""
+        interpretation = (
+            f"用户短回复“{current_clean}”是在回应上一轮 Nomi 提问："
+            f"{referenced_question}{task_hint}。回答时必须沿用这个指代，不要把短回复当成新的孤立问题。"
+        )
     return {
         "conversation_id": conversation_id,
         "included_turns": included,
@@ -149,6 +167,10 @@ def build_session_search_context(
             "is_short_reply": short_reply,
             "resolved": bool(short_reply and prior_question),
             "prior_question_turn_id": prior_question["turn_id"] if prior_question else None,
+            "referenced_assistant_question": referenced_question,
+            "referenced_task_titles": referenced_task_titles,
+            "user_reply": current_clean,
+            "interpretation": interpretation,
         },
         "token_budget": {"limit": token_budget, "used": used},
         "reason": (
@@ -218,4 +240,4 @@ def assistant_memory_schema_sql() -> list[str]:
         CREATE INDEX IF NOT EXISTS conversation_session_index_conversation_idx
         ON conversation_session_index(conversation_id, created_at DESC)
         """,
-    ]
+    ] + memory_runtime_phase1_schema_sql()

@@ -248,6 +248,110 @@ def default_tool_registry(
                 forbidden_actions=("send", "send_email", "delete"),
             ),
             CapabilityDefinition(
+                capability_id="career.linkedin.contact_search",
+                route_type="core_pipeline",
+                pipeline_id="linkedin_contact_search_pipeline",
+                keywords=(
+                    "linkedin 搜索",
+                    "领英搜索",
+                    "搜索 recruiter",
+                    "找 recruiter",
+                    "recruiter",
+                    "hiring manager",
+                    "talent acquisition",
+                    "招聘负责人",
+                    "找 hr",
+                    "找HR",
+                ),
+                preferred_adapter="browser",
+                alternative_adapters=("openclaw",),
+                required_toolkit="linkedin_browser",
+                permission="read_only",
+                confirmation_required=False,
+                reason=(
+                    "Search LinkedIn people results for likely recruiters or hiring managers in the managed browser. "
+                    "This is read-only navigation and must not connect, message, Apply, or Submit."
+                ),
+                forbidden_actions=("connect", "send_without_confirmation", "apply", "submit", "challenge_bypass"),
+            ),
+            CapabilityDefinition(
+                capability_id="career.job.recommend",
+                route_type="core_pipeline",
+                pipeline_id="job_recommendation_pipeline",
+                keywords=(
+                    "推荐岗位",
+                    "推荐职位",
+                    "筛选岗位",
+                    "筛选 jd",
+                    "适合我的岗位",
+                    "高匹配岗位",
+                    "岗位推荐",
+                    "jd推荐",
+                ),
+                preferred_adapter="browser",
+                alternative_adapters=("composio", "openclaw"),
+                required_toolkit="linkedin_browser",
+                permission="read_only",
+                confirmation_required=False,
+                reason=(
+                    "Recommend suitable jobs by collecting candidate JDs, scoring them against the user's resume, "
+                    "and pushing read-only recommendation cards to Nomi."
+                ),
+                forbidden_actions=("apply", "submit", "connect", "send_without_confirmation", "challenge_bypass"),
+            ),
+            CapabilityDefinition(
+                capability_id="career.outreach.draft",
+                route_type="core_pipeline",
+                pipeline_id="outreach_message_pipeline",
+                keywords=(
+                    "linkedin 给",
+                    "linkedin 发",
+                    "招聘负责人",
+                    "联系 hr",
+                    "联系hr",
+                    "面试官",
+                    "内推",
+                    "自我介绍",
+                    "私信",
+                ),
+                preferred_adapter="browser",
+                alternative_adapters=("openclaw", "composio"),
+                required_toolkit="linkedin_browser",
+                permission="external_message",
+                confirmation_required=True,
+                reason=(
+                    "Career outreach is drafted by the deterministic Job Agent pipeline. "
+                    "Nomi must not send LinkedIn/Gmail/WhatsApp outreach without final user confirmation."
+                ),
+                forbidden_actions=("send_without_confirmation", "delete", "block", "challenge_bypass"),
+            ),
+            CapabilityDefinition(
+                capability_id="career.application.submit",
+                route_type="core_pipeline",
+                pipeline_id="job_application_pipeline",
+                keywords=(
+                    "linkedin apply",
+                    "点击 linkedin apply",
+                    "点击 apply",
+                    "apply",
+                    "submit",
+                    "提交申请",
+                    "申请岗位",
+                    "批量投递",
+                    "投递",
+                ),
+                preferred_adapter="browser",
+                alternative_adapters=("openclaw",),
+                required_toolkit="linkedin_browser",
+                permission="external_execution",
+                confirmation_required=True,
+                reason=(
+                    "Job application automation requires browser connection plus delegated automation "
+                    "grant, explicit target manifest, grounded evidence, quota, and challenge stop conditions."
+                ),
+                forbidden_actions=("submit_without_delegated_grant", "implicit_target_submit", "challenge_bypass"),
+            ),
+            CapabilityDefinition(
                 capability_id="long_tail.browser_task",
                 route_type="openclaw_tool",
                 pipeline_id=None,

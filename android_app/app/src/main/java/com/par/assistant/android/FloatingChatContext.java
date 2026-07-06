@@ -5,6 +5,7 @@ import java.util.Collections;
 import java.util.List;
 
 final class FloatingChatContext {
+    private static final int DEFAULT_DELTA_TURN_LIMIT = 30;
     private final List<Turn> turns = new ArrayList<>();
 
     void addUser(String content) {
@@ -22,9 +23,17 @@ final class FloatingChatContext {
     }
 
     List<Turn> snapshotDelta(int maxChars) {
+        return snapshotDelta(maxChars, DEFAULT_DELTA_TURN_LIMIT);
+    }
+
+    List<Turn> snapshotDelta(int maxChars, int maxTurns) {
         int remaining = Math.max(0, maxChars);
+        int turnLimit = Math.max(0, maxTurns);
         ArrayList<Turn> selected = new ArrayList<>();
         for (int index = turns.size() - 1; index >= 0; index--) {
+            if (selected.size() >= turnLimit) {
+                break;
+            }
             Turn turn = turns.get(index);
             int cost = turn.role.length() + turn.content.length() + 8;
             if (!selected.isEmpty() && cost > remaining) {

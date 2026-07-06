@@ -149,6 +149,44 @@ class AssistantInboxGateway:
         }
         return event
 
+    def normalize_phone_duplex_turn(self, *, identity_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        sender = str(payload.get("from") or payload.get("caller") or "")
+        resolved = self.resolver.classify_sender(sender)
+        transcript = str(payload.get("transcript") or payload.get("text") or "").strip()
+        provider_call_id = str(payload.get("provider_call_id") or payload.get("call_id") or payload.get("id") or "")
+        conversation_id = "phone-call:" + provider_call_id if provider_call_id else "phone:" + str(resolved["sender_key"])
+        classification = self._message_classification(str(resolved["sender_class"]))
+        event = {
+            "event_id": "assistant-inbox-" + str(uuid4()),
+            "source_type": "assistant_phone",
+            "source_account_id": identity_id,
+            "event_type": "assistant_duplex_call_turn",
+            "identity_id": identity_id,
+            "conversation_id": conversation_id,
+            "external_message_id": provider_call_id,
+            "sender_key": resolved["sender_key"],
+            "sender": {
+                "phone_hash": resolved["sender_key"],
+                "contact_id": resolved.get("contact_id") or "",
+                "sender_class": resolved["sender_class"],
+            },
+            "recipient_identity_id": identity_id,
+            "normalized_text": transcript,
+            "normalized_payload": {
+                "from": sender,
+                "to": str(payload.get("to") or payload.get("recipient") or ""),
+                "provider_call_id": provider_call_id,
+                "turn_index": payload.get("turn_index"),
+                "body_text": transcript,
+                "raw_type": "phone_duplex_turn",
+            },
+            "classification": classification,
+            "suggestion_channel": self._suggestion_channel(classification),
+            "memory_scope": self._memory_scope(identity_id, resolved, classification),
+            "occurred_at": str(payload.get("timestamp") or payload.get("occurred_at") or self._now()),
+        }
+        return event
+
     def _message_classification(self, sender_class: str) -> str:
         if sender_class == "user":
             return "user_direct_command"

@@ -12,6 +12,7 @@ RUN apt-get update \
       fluxbox \
       novnc \
       websockify \
+      xdotool \
       x11vnc \
       xvfb \
     && rm -rf /var/lib/apt/lists/*

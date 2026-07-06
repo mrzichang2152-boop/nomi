@@ -1,16 +1,26 @@
 from __future__ import annotations
 
 import os
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Iterable, Protocol
 
 import httpx
 
-from app.model_client import QwenClient, model_request_timeout_seconds
+from app.model_client import (
+    ChatCompletionClient,
+    ModelClientConfig,
+    model_request_timeout_seconds,
+    openai_compatible_chat_url,
+)
 
 
 MODEL_UNAVAILABLE_MESSAGE = "模型服务暂时不可用，请稍后重试。"
+BEARER_RE = re.compile(r"\bBearer\s+[A-Za-z0-9._~+/=-]+", re.I)
+AUTHORIZATION_BEARER_RE = re.compile(r"\bAuthorization\s*[:=]\s*Bearer\s+[A-Za-z0-9._~+/=-]+", re.I)
+INLINE_SECRET_RE = re.compile(r"\b(token|secret|sessionid|session|password|passwd|auth|cookie|code)\s*[:=]\s*([^,\s&;]+)", re.I)
+URL_SECRET_RE = re.compile(r"([?&#])(access_token|id_token|refresh_token|state|token|code|secret|password)=([^&#\s]+)", re.I)
 
 
 @dataclass(frozen=True)
@@ -19,12 +29,17 @@ class ModelProviderConfig:
     display_name: str
     base_url: str
     model: str
+    provider_type: str = "openai_compatible"
+    api_key: str = field(default="", repr=False)
+    auth_header_format: str = "raw"
     priority: int = 100
     enabled: bool = True
     supports_streaming: bool = True
     supports_tool_calling: bool = False
     context_window_tokens: int = 256000
     default_max_output_tokens: int = 8192
+    reasoning_effort: str = "none"
+    enable_thinking: bool | None = None
     privacy_tier: str = "private_cloud"
     task_classes: tuple[str, ...] = ("chat", "classification", "slot_extraction", "summarization")
 
@@ -72,6 +87,15 @@ class ModelGatewayError(RuntimeError):
         }
 
 
+def redact_model_error_text(value: Any) -> str:
+    text = str(value or "")
+    text = AUTHORIZATION_BEARER_RE.sub("Authorization=Bearer REDACTED", text)
+    text = BEARER_RE.sub("Bearer REDACTED", text)
+    text = URL_SECRET_RE.sub(r"\1\2=REDACTED", text)
+    text = INLINE_SECRET_RE.sub(lambda match: f"{match.group(1)}=REDACTED", text)
+    return text[:500]
+
+
 class ChatProvider(Protocol):
     config: ModelProviderConfig
 
@@ -85,7 +109,18 @@ class ChatProvider(Protocol):
 class QwenHTTPProvider:
     def __init__(self, config: ModelProviderConfig) -> None:
         self.config = config
-        self._client = QwenClient(config.base_url, config.model)
+        self._client = ChatCompletionClient(
+            ModelClientConfig(
+                provider_type=config.provider_type,
+                base_url=config.base_url,
+                model=config.model,
+                api_key=config.api_key,
+                auth_header_format=config.auth_header_format,
+                max_output_tokens=config.default_max_output_tokens,
+                reasoning_effort=config.reasoning_effort,
+                enable_thinking=config.enable_thinking,
+            )
+        )
 
     async def chat(self, messages: list[dict[str, str]], temperature: float = 0.4) -> str:
         return await self._client.chat(messages, temperature=temperature)
@@ -95,9 +130,12 @@ class QwenHTTPProvider:
             yield chunk
 
     async def health_check(self) -> dict[str, Any]:
-        models_url = f"{self.config.base_url.rstrip('/')}/v1/models"
+        models_url = openai_compatible_chat_url(self.config.base_url).rsplit("/chat/completions", 1)[0] + "/models"
+        headers: dict[str, str] = {}
+        if self.config.api_key.strip():
+            headers["Authorization"] = self.config.api_key
         async with httpx.AsyncClient() as client:
-            response = await client.get(models_url, timeout=min(model_request_timeout_seconds(), 10.0))
+            response = await client.get(models_url, headers=headers or None, timeout=min(model_request_timeout_seconds(), 10.0))
             response.raise_for_status()
         return {"status": "healthy", "url": models_url}
 
@@ -209,7 +247,7 @@ class ModelGateway:
         error_type = classify_model_error(exc)
         state.failure_count += 1
         state.last_error_type = error_type
-        state.last_error = str(exc)[:500]
+        state.last_error = redact_model_error_text(exc)
         state.last_failure_at = self._now()
         if state.failure_count >= self.failure_threshold:
             state.state = "open"
@@ -229,6 +267,8 @@ class ModelGateway:
             "display_name": provider.config.display_name,
             "base_url": provider.config.base_url,
             "model": provider.config.model,
+            "provider_type": provider.config.provider_type,
+            "api_key_configured": bool(provider.config.api_key.strip()),
             "priority": provider.config.priority,
             "enabled": provider.config.enabled,
             "state": state.state,
@@ -280,34 +320,62 @@ def default_model_gateway() -> ModelGateway:
     return ModelGateway(default_model_providers())
 
 
+def env_optional_bool(name: str, default: bool | None = None) -> bool | None:
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def default_enable_thinking_for_model(model: str, env_name: str) -> bool | None:
+    configured = env_optional_bool(env_name)
+    if configured is not None:
+        return configured
+    return False if "qwen" in str(model or "").lower() else None
+
+
 def default_model_providers() -> list[QwenHTTPProvider]:
+    primary_model = os.getenv("MODEL_NAME", "gpt-5.4-mini")
     primary = QwenHTTPProvider(
         ModelProviderConfig(
-            provider_id=os.getenv("MODEL_PROVIDER_ID", "qwen36_primary"),
-            display_name=os.getenv("MODEL_PROVIDER_NAME", "Qwen 3.6 private endpoint"),
-            base_url=os.getenv("MODEL_BASE_URL", "http://localhost:9161").rstrip("/"),
-            model=os.getenv("MODEL_NAME", "qwen3.6"),
+            provider_id=os.getenv("MODEL_PROVIDER_ID", "4sapi_primary"),
+            display_name=os.getenv("MODEL_PROVIDER_NAME", "4sapi GPT-5.4 mini"),
+            base_url=os.getenv("MODEL_BASE_URL", "https://4sapi.com/v1").rstrip("/"),
+            model=primary_model,
+            provider_type=os.getenv("MODEL_PROVIDER_TYPE", "openai_compatible"),
+            api_key=os.getenv("MODEL_API_KEY", "").strip(),
+            auth_header_format=os.getenv("MODEL_AUTH_HEADER_FORMAT", "raw"),
             priority=10,
             enabled=os.getenv("MODEL_PROVIDER_ENABLED", "true").lower() not in {"0", "false", "no"},
             supports_streaming=True,
             context_window_tokens=int(os.getenv("MODEL_CONTEXT_WINDOW_TOKENS", "256000")),
-            privacy_tier=os.getenv("MODEL_PRIVACY_TIER", "private_cloud"),
+            default_max_output_tokens=int(os.getenv("MODEL_MAX_OUTPUT_TOKENS", "8192")),
+            reasoning_effort=os.getenv("QWEN_REASONING_EFFORT", "none").strip().lower(),
+            enable_thinking=default_enable_thinking_for_model(primary_model, "MODEL_ENABLE_THINKING"),
+            privacy_tier=os.getenv("MODEL_PRIVACY_TIER", "external_api"),
         )
     )
     providers = [primary]
     fallback_url = os.getenv("MODEL_FALLBACK_BASE_URL", "").strip()
     if fallback_url:
+        fallback_model = os.getenv("MODEL_FALLBACK_NAME", os.getenv("MODEL_NAME", "gpt-5.4-mini"))
         providers.append(
             QwenHTTPProvider(
                 ModelProviderConfig(
                     provider_id=os.getenv("MODEL_FALLBACK_PROVIDER_ID", "fallback_model"),
                     display_name=os.getenv("MODEL_FALLBACK_PROVIDER_NAME", "Fallback model endpoint"),
                     base_url=fallback_url.rstrip("/"),
-                    model=os.getenv("MODEL_FALLBACK_NAME", os.getenv("MODEL_NAME", "qwen3.6")),
+                    model=fallback_model,
+                    provider_type=os.getenv("MODEL_FALLBACK_PROVIDER_TYPE", os.getenv("MODEL_PROVIDER_TYPE", "openai_compatible")),
+                    api_key=os.getenv("MODEL_FALLBACK_API_KEY", "").strip(),
+                    auth_header_format=os.getenv("MODEL_FALLBACK_AUTH_HEADER_FORMAT", os.getenv("MODEL_AUTH_HEADER_FORMAT", "raw")),
                     priority=20,
                     enabled=os.getenv("MODEL_FALLBACK_ENABLED", "true").lower() not in {"0", "false", "no"},
                     supports_streaming=True,
                     context_window_tokens=int(os.getenv("MODEL_FALLBACK_CONTEXT_WINDOW_TOKENS", "256000")),
+                    default_max_output_tokens=int(os.getenv("MODEL_FALLBACK_MAX_OUTPUT_TOKENS", os.getenv("MODEL_MAX_OUTPUT_TOKENS", "8192"))),
+                    reasoning_effort=os.getenv("MODEL_FALLBACK_REASONING_EFFORT", os.getenv("QWEN_REASONING_EFFORT", "none")).strip().lower(),
+                    enable_thinking=default_enable_thinking_for_model(fallback_model, "MODEL_FALLBACK_ENABLE_THINKING"),
                     privacy_tier=os.getenv("MODEL_FALLBACK_PRIVACY_TIER", "private_cloud"),
                 )
             )
