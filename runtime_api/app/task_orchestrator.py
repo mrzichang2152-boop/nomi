@@ -16,8 +16,22 @@ class TaskOrchestrator:
         self.task_by_idempotency: dict[str, str] = {}
         self.steps: dict[str, dict[str, Any]] = {}
         self.notifications: dict[str, dict[str, Any]] = {}
+        self.artifacts: dict[str, dict[str, Any]] = {}
+        self.evidence_links: dict[str, dict[str, Any]] = {}
 
-    def create_task_run(self, task_type: str, idempotency_key: str, steps: list[str]) -> dict[str, Any]:
+    def create_task_run(
+        self,
+        task_type: str,
+        idempotency_key: str,
+        steps: list[str],
+        *,
+        source_event_ids: list[str] | None = None,
+        pipeline_id: str = "",
+        route_type: str = "",
+        payload: dict[str, Any] | None = None,
+        risk_permission: str = "",
+        requires_user_confirmation: bool = False,
+    ) -> dict[str, Any]:
         if idempotency_key in self.task_by_idempotency:
             return self.task_runs[self.task_by_idempotency[idempotency_key]]
         task_run_id = f"task_{uuid.uuid4().hex}"
@@ -25,7 +39,14 @@ class TaskOrchestrator:
             "task_run_id": task_run_id,
             "task_type": task_type,
             "idempotency_key": idempotency_key,
+            "source_event_ids": list(source_event_ids or []),
+            "pipeline_id": pipeline_id,
+            "route_type": route_type,
             "status": "queued",
+            "risk_permission": risk_permission,
+            "requires_user_confirmation": requires_user_confirmation,
+            "final_user_visible_summary": "",
+            "payload": dict(payload or {}),
             "created_at": self.now(),
             "updated_at": self.now(),
         }
@@ -48,6 +69,59 @@ class TaskOrchestrator:
                 "updated_at": self.now(),
             }
         return task
+
+    def create_artifact(
+        self,
+        *,
+        task_run_id: str,
+        artifact_type: str,
+        filename: str,
+        mime_type: str,
+        storage_path: str,
+        source_evidence_ids: list[str] | None = None,
+        verification_status: str = "pending",
+    ) -> dict[str, Any]:
+        artifact_id = f"artifact_{uuid.uuid4().hex}"
+        artifact = {
+            "artifact_id": artifact_id,
+            "task_run_id": task_run_id,
+            "artifact_type": artifact_type,
+            "filename": filename,
+            "mime_type": mime_type,
+            "storage_path": storage_path,
+            "version": 1,
+            "source_evidence_ids": list(source_evidence_ids or []),
+            "verification_status": verification_status,
+            "created_at": self.now(),
+        }
+        self.artifacts[artifact_id] = artifact
+        return dict(artifact)
+
+    def link_evidence(
+        self,
+        *,
+        task_run_id: str,
+        evidence_id: str,
+        evidence_type: str,
+        source: str,
+        contact_or_actor: str = "",
+        used_for: str = "",
+        confidence: float = 0.0,
+    ) -> dict[str, Any]:
+        link_id = f"evidence_link_{uuid.uuid4().hex}"
+        link = {
+            "evidence_link_id": link_id,
+            "task_run_id": task_run_id,
+            "evidence_id": evidence_id,
+            "evidence_type": evidence_type,
+            "source": source,
+            "contact_or_actor": contact_or_actor,
+            "used_for": used_for,
+            "confidence": confidence,
+            "created_at": self.now(),
+        }
+        self.evidence_links[link_id] = link
+        return dict(link)
 
     def acquire_next_step(self, worker_id: str, lease_seconds: int = 30) -> dict[str, Any] | None:
         now = self.now()
@@ -181,6 +255,33 @@ def task_orchestrator_schema_sql() -> list[str]:
         )
         """,
         """
+        CREATE TABLE IF NOT EXISTS task_artifacts (
+          artifact_id TEXT PRIMARY KEY,
+          task_run_id TEXT NOT NULL REFERENCES task_runs(task_run_id) ON DELETE CASCADE,
+          artifact_type TEXT NOT NULL DEFAULT '',
+          filename TEXT NOT NULL DEFAULT '',
+          mime_type TEXT NOT NULL DEFAULT '',
+          storage_path TEXT NOT NULL DEFAULT '',
+          version INTEGER NOT NULL DEFAULT 1,
+          source_evidence_ids TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[],
+          verification_status TEXT NOT NULL DEFAULT 'pending',
+          created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS task_evidence_links (
+          evidence_link_id TEXT PRIMARY KEY,
+          task_run_id TEXT NOT NULL REFERENCES task_runs(task_run_id) ON DELETE CASCADE,
+          evidence_id TEXT NOT NULL DEFAULT '',
+          evidence_type TEXT NOT NULL DEFAULT '',
+          source TEXT NOT NULL DEFAULT '',
+          contact_or_actor TEXT NOT NULL DEFAULT '',
+          used_for TEXT NOT NULL DEFAULT '',
+          confidence DOUBLE PRECISION NOT NULL DEFAULT 0,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        )
+        """,
+        """
         CREATE UNIQUE INDEX IF NOT EXISTS task_runs_idempotency_idx
         ON task_runs(idempotency_key)
         """,
@@ -191,5 +292,13 @@ def task_orchestrator_schema_sql() -> list[str]:
         """
         CREATE INDEX IF NOT EXISTS notification_outbox_replay_idx
         ON notification_outbox(channel, delivery_status, created_at)
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS task_artifacts_task_idx
+        ON task_artifacts(task_run_id, created_at DESC)
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS task_evidence_links_task_idx
+        ON task_evidence_links(task_run_id, created_at DESC)
         """,
     ]

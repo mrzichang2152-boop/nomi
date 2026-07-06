@@ -39,6 +39,7 @@ from app.assistant_identity.phone_adapter import PhoneCallInstructionBuilder, Ph
 from app.assistant_identity.registry import AssistantIdentityRegistry
 from app.assistant_identity.schema import assistant_identity_schema_sql
 from app.assistant_memory import assistant_memory_schema_sql, build_session_search_context
+from app.artifact_tasks import artifact_label, artifact_task_answer, build_artifact_task_payload, route_artifact_task
 from app.auth import is_authorized
 from app.chat_router import ChatContextRoute, context_fetch_limits, route_chat_context
 from app.context_parallel import retrieve_chat_context_parallel
@@ -14557,6 +14558,271 @@ def maybe_queue_linkedin_job_search_for_chat(message: str, career_context: dict[
     }
 
 
+def artifact_pipeline_id(artifact_type: str) -> str:
+    return {
+        "pptx": "ppt_creation_pipeline",
+        "docx": "document_creation_pipeline",
+        "xlsx": "spreadsheet_creation_pipeline",
+        "markdown": "markdown_artifact_pipeline",
+    }.get(artifact_type, "artifact_creation_pipeline")
+
+
+def artifact_task_title(message: str, artifact_type: str) -> str:
+    label = artifact_label(artifact_type)
+    entity_match = re.search(r"([\u4e00-\u9fa5]{1,3}总)", message or "")
+    if entity_match:
+        return f"依据{entity_match.group(1)}资料生成 {label}"
+    return f"生成{label}产物"
+
+
+def persist_artifact_task_run(
+    conn: psycopg.Connection,
+    *,
+    conversation_id: str,
+    source_message_event_id: str,
+    message: str,
+    client_request_id: Optional[str],
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    route = payload.get("route") if isinstance(payload.get("route"), dict) else {}
+    artifact_type = str(route.get("artifact_type") or "artifact")
+    evidence_items = [
+        item for item in (payload.get("evidence_pack", {}).get("items") or []) if isinstance(item, dict)
+    ]
+    source_event_ids = [str(item.get("evidence_id")) for item in evidence_items if item.get("evidence_id")]
+    normalized_request_id = normalize_client_request_id(client_request_id)
+    if normalized_request_id:
+        idempotency_key = f"artifact_task:{normalized_request_id}"
+    else:
+        idempotency_hash = hashlib.sha256(
+            json.dumps(
+                {
+                    "conversation_id": conversation_id,
+                    "source_message_event_id": source_message_event_id,
+                    "message": message,
+                    "source_event_ids": source_event_ids,
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            ).encode("utf-8")
+        ).hexdigest()[:32]
+        idempotency_key = f"artifact_task:{idempotency_hash}"
+    task_run_id = f"task_{uuid.uuid4().hex}"
+    pipeline_id = artifact_pipeline_id(artifact_type)
+    status = "queued" if evidence_items else "waiting_user"
+    title = artifact_task_title(message, artifact_type)
+    inserted_cursor = conn.execute(
+        """
+        INSERT INTO task_runs (
+          task_run_id, task_type, source_event_ids, pipeline_id, route_type, status,
+          idempotency_key, risk_permission, requires_user_confirmation,
+          final_user_visible_summary, payload
+        )
+        VALUES (%s, %s, %s::TEXT[], %s, %s, %s, %s, %s, %s, %s, %s)
+        ON CONFLICT (idempotency_key) DO NOTHING
+        """,
+        (
+            task_run_id,
+            "artifact_creation",
+            source_event_ids,
+            pipeline_id,
+            "artifact_task",
+            status,
+            idempotency_key,
+            "local_artifact_only",
+            False,
+            title,
+            jsonb_param(payload),
+        ),
+    )
+    inserted = getattr(inserted_cursor, "rowcount", 0) != 0
+    row = conn.execute(
+        """
+        SELECT task_run_id, task_type, source_event_ids, pipeline_id, route_type, status,
+               risk_permission, requires_user_confirmation, final_user_visible_summary, payload
+        FROM task_runs
+        WHERE idempotency_key = %s
+        LIMIT 1
+        """,
+        (idempotency_key,),
+    ).fetchone()
+    if not row:
+        raise RuntimeError("artifact task was not persisted")
+    stored_task_run_id = str(row[0])
+    if inserted:
+        for step_order, step_name in enumerate(payload.get("steps") or []):
+            conn.execute(
+                """
+                INSERT INTO task_steps (
+                  task_step_id, task_run_id, step_name, step_order, status, input_json
+                )
+                VALUES (%s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    f"step_{uuid.uuid4().hex}",
+                    stored_task_run_id,
+                    str(step_name),
+                    step_order,
+                    "queued",
+                    jsonb_param({"message": message, "artifact_type": artifact_type}),
+                ),
+            )
+        for evidence in evidence_items:
+            conn.execute(
+                """
+                INSERT INTO task_evidence_links (
+                  evidence_link_id, task_run_id, evidence_id, evidence_type, source,
+                  contact_or_actor, used_for, confidence
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    f"evidence_link_{uuid.uuid4().hex}",
+                    stored_task_run_id,
+                    str(evidence.get("evidence_id") or ""),
+                    str(evidence.get("source_type") or ""),
+                    str(evidence.get("source") or ""),
+                    str(evidence.get("actor") or ""),
+                    "artifact_evidence",
+                    float(evidence.get("confidence") or 0),
+                ),
+            )
+    stored_payload = row[9] if isinstance(row[9], dict) else payload
+    return {
+        "task_run_id": stored_task_run_id,
+        "task_type": str(row[1] or ""),
+        "artifact_type": artifact_type,
+        "pipeline_id": str(row[3] or ""),
+        "route_type": str(row[4] or ""),
+        "status": str(row[5] or ""),
+        "risk_permission": str(row[6] or ""),
+        "requires_user_confirmation": bool(row[7]),
+        "title": str(row[8] or title),
+        "source_event_ids": [str(item) for item in (row[2] or [])],
+        "payload": stored_payload,
+    }
+
+
+@app.get("/api/tasks/{task_id}/artifacts")
+def get_task_artifacts(task_id: str, x_par_password: Optional[str] = Header(default=None)) -> dict[str, Any]:
+    require_password(x_par_password)
+    with db() as conn:
+        rows = conn.execute(
+            """
+            SELECT artifact_id, task_run_id, artifact_type, filename, mime_type, storage_path,
+                   version, source_evidence_ids, verification_status, created_at
+            FROM task_artifacts
+            WHERE task_run_id = %s
+            ORDER BY created_at ASC, version ASC
+            """,
+            (task_id,),
+        ).fetchall()
+    return {
+        "task_run_id": task_id,
+        "artifacts": [
+            {
+                "artifact_id": str(row[0]),
+                "task_run_id": str(row[1]),
+                "artifact_type": str(row[2] or ""),
+                "filename": str(row[3] or ""),
+                "mime_type": str(row[4] or ""),
+                "storage_path": str(row[5] or ""),
+                "version": int(row[6] or 1),
+                "source_evidence_ids": [str(item) for item in (row[7] or [])],
+                "verification_status": str(row[8] or ""),
+                "created_at": isoformat_or_value(row[9]),
+            }
+            for row in rows
+        ],
+    }
+
+
+@app.get("/api/tasks/{task_id}")
+def get_task(task_id: str, x_par_password: Optional[str] = Header(default=None)) -> dict[str, Any]:
+    require_password(x_par_password)
+    with db() as conn:
+        task_row = conn.execute(
+            """
+            SELECT task_run_id, task_type, source_event_ids, pipeline_id, route_type, status,
+                   risk_permission, requires_user_confirmation, final_user_visible_summary,
+                   payload, created_at, updated_at
+            FROM task_runs
+            WHERE task_run_id = %s
+            LIMIT 1
+            """,
+            (task_id,),
+        ).fetchone()
+        if not task_row:
+            raise HTTPException(status_code=404, detail="task_not_found")
+        step_rows = conn.execute(
+            """
+            SELECT task_step_id, step_name, step_order, status, input_json, output_json,
+                   reasoning_summary, attempt_count, updated_at
+            FROM task_steps
+            WHERE task_run_id = %s
+            ORDER BY step_order ASC, updated_at ASC
+            """,
+            (task_id,),
+        ).fetchall()
+        evidence_rows = conn.execute(
+            """
+            SELECT evidence_link_id, evidence_id, evidence_type, source, contact_or_actor,
+                   used_for, confidence, created_at
+            FROM task_evidence_links
+            WHERE task_run_id = %s
+            ORDER BY created_at ASC
+            """,
+            (task_id,),
+        ).fetchall()
+    payload = task_row[9] if isinstance(task_row[9], dict) else {}
+    route = payload.get("route") if isinstance(payload.get("route"), dict) else {}
+    artifact_type = str(route.get("artifact_type") or "")
+    return {
+        "task": {
+            "task_run_id": str(task_row[0]),
+            "task_type": str(task_row[1] or ""),
+            "artifact_type": artifact_type,
+            "source_event_ids": [str(item) for item in (task_row[2] or [])],
+            "pipeline_id": str(task_row[3] or ""),
+            "route_type": str(task_row[4] or ""),
+            "status": str(task_row[5] or ""),
+            "risk_permission": str(task_row[6] or ""),
+            "requires_user_confirmation": bool(task_row[7]),
+            "title": str(task_row[8] or ""),
+            "payload": payload,
+            "created_at": isoformat_or_value(task_row[10]),
+            "updated_at": isoformat_or_value(task_row[11]),
+        },
+        "steps": [
+            {
+                "task_step_id": str(row[0]),
+                "step_name": str(row[1] or ""),
+                "step_order": int(row[2] or 0),
+                "status": str(row[3] or ""),
+                "input_json": row[4] or {},
+                "output_json": row[5] or {},
+                "reasoning_summary": str(row[6] or ""),
+                "attempt_count": int(row[7] or 0),
+                "updated_at": isoformat_or_value(row[8]),
+            }
+            for row in step_rows
+        ],
+        "evidence_links": [
+            {
+                "evidence_link_id": str(row[0]),
+                "evidence_id": str(row[1] or ""),
+                "evidence_type": str(row[2] or ""),
+                "source": str(row[3] or ""),
+                "contact_or_actor": str(row[4] or ""),
+                "used_for": str(row[5] or ""),
+                "confidence": float(row[6] or 0),
+                "created_at": isoformat_or_value(row[7]),
+            }
+            for row in evidence_rows
+        ],
+    }
+
+
 @app.post("/api/chat")
 async def chat(body: ChatIn, x_par_password: Optional[str] = Header(default=None)) -> dict[str, Any]:
     require_password(x_par_password)
@@ -14595,6 +14861,144 @@ async def chat(body: ChatIn, x_par_password: Optional[str] = Header(default=None
                 "sections": [],
                 "excluded": [],
                 "warnings": ["duplicate_client_request_reused_cached_assistant_answer"],
+            },
+        }
+    artifact_route = route_artifact_task(body.message)
+    if artifact_route.get("requires_task_run"):
+        artifact_context_start_ms = monotonic_ms()
+        request_scope = infer_request_scope(body.message, body.ui_state)
+        source_context = dedupe_context_items(
+            normalize_ui_state_source_context(body.ui_state, request_scope)
+            + retrieve_current_source_context(body.message, request_scope, limit=20)
+        )
+        memory_context = retrieve_context(
+            body.message,
+            min(max(body.limit, 12), 30),
+            request_scope=request_scope,
+        )
+        artifact_payload = build_artifact_task_payload(
+            body.message,
+            source_context=source_context,
+            memory_context=memory_context,
+        )
+        context_retrieval_ms = elapsed_ms(artifact_context_start_ms)
+        task_persist_start_ms = monotonic_ms()
+        with db() as conn:
+            task = persist_artifact_task_run(
+                conn,
+                conversation_id=user_turn["conversation_id"],
+                source_message_event_id=user_turn["event_id"],
+                message=body.message,
+                client_request_id=body.client_request_id,
+                payload=artifact_payload,
+            )
+        task_persist_ms = elapsed_ms(task_persist_start_ms)
+        answer = artifact_task_answer(task, artifact_payload)
+        assistant_persist_start_ms = monotonic_ms()
+        with db() as conn:
+            assistant_turn = persist_assistant_turn(
+                conn,
+                redis_obj,
+                role="assistant",
+                content=answer,
+                conversation_id=user_turn["conversation_id"],
+                client_type=body.client_type,
+                tool_call_id=assistant_turn_idempotency_key(body.client_request_id, "assistant"),
+            )
+        assistant_persist_ms = elapsed_ms(assistant_persist_start_ms)
+        evidence_ids = [
+            str(item.get("evidence_id"))
+            for item in artifact_payload.get("evidence_pack", {}).get("items", [])
+            if isinstance(item, dict) and item.get("evidence_id")
+        ]
+        artifact_context_pack = {
+            "current_request": [{"role": "user", "content": body.message, "event_id": user_turn["event_id"]}],
+            "source_context": source_context,
+            "memory_context": memory_context,
+            "task_context": [task],
+            "included_event_ids": [user_turn["event_id"], *evidence_ids],
+            "included_memory_ids": [
+                str(item.get("memory_id"))
+                for item in memory_context
+                if isinstance(item, dict) and item.get("memory_id")
+            ],
+            "included_agenda_ids": [],
+            "task_route": artifact_payload.get("route") or {},
+            "context_plan": artifact_payload.get("context_plan") or {},
+            "evidence_pack": artifact_payload.get("evidence_pack") or {},
+            "artifact_evidence_count": len(evidence_ids),
+            "reason": str(artifact_route.get("reason") or "artifact task route"),
+            "warnings": [],
+            "sections": [],
+            "excluded": [],
+            "token_budget": {},
+            "retrieval_modes": {"task_route": "artifact_task", "source": "current_source_context", "memory": "scoped_recall"},
+            "scope_filters_applied": request_scope,
+            "final_model_answer_event_id": assistant_turn["event_id"],
+            "final_model_answer_turn_id": assistant_turn["turn_id"],
+            "latency_trace": {
+                "total_ms": elapsed_ms(total_start_ms),
+                "initial_persist_ms": initial_persist_ms,
+                "context_retrieval_ms": context_retrieval_ms,
+                "model_ms": 0,
+                "task_persist_ms": task_persist_ms,
+                "assistant_persist_ms": assistant_persist_ms,
+            },
+        }
+        artifact_context_pack["fusion_summary"] = context_fusion_summary(artifact_context_pack)
+        with db() as conn:
+            route_trace_id = safe_persist_context_route_trace(
+                conn,
+                event_id=user_turn["event_id"],
+                conversation_id=user_turn["conversation_id"],
+                route_decision={
+                    "intent": "artifact_creation",
+                    "reason": artifact_context_pack["reason"],
+                    "task_route": artifact_payload.get("route") or {},
+                },
+                fetch_limits={"source": 20, "memory": min(max(body.limit, 12), 30)},
+                fetch_latency={"context_retrieval_ms": context_retrieval_ms},
+                context_pack=artifact_context_pack,
+            )
+            if route_trace_id:
+                artifact_context_pack["context_route_trace_id"] = route_trace_id
+            persist_context_snapshot(conn, user_turn["event_id"], "artifact_task", artifact_context_pack)
+        return {
+            "answer": answer,
+            "sources": decorate_context_sources(memory_context),
+            "conversation_id": user_turn["conversation_id"],
+            "client_request_id": normalize_client_request_id(body.client_request_id),
+            "task": {
+                "task_run_id": task.get("task_run_id"),
+                "task_type": task.get("task_type"),
+                "artifact_type": task.get("artifact_type"),
+                "pipeline_id": task.get("pipeline_id"),
+                "route_type": task.get("route_type"),
+                "status": task.get("status"),
+                "title": task.get("title"),
+                "source_event_ids": task.get("source_event_ids") or [],
+            },
+            "context_pack": {
+                "included_event_ids": artifact_context_pack["included_event_ids"],
+                "included_memory_ids": artifact_context_pack.get("included_memory_ids", []),
+                "included_agenda_ids": [],
+                "assistant_dialogue_count": 0,
+                "agenda_context_count": 0,
+                "memory_context_count": len(memory_context),
+                "source_context_count": len(source_context),
+                "task_context_count": 1,
+                "token_budget": {},
+                "sections": [],
+                "excluded": [],
+                "warnings": [],
+                "context_route_trace_id": artifact_context_pack.get("context_route_trace_id"),
+                "retrieval_modes": artifact_context_pack.get("retrieval_modes", {}),
+                "fusion_summary": artifact_context_pack.get("fusion_summary", {}),
+                "scope_filters_applied": request_scope,
+                "task_route": artifact_context_pack["task_route"],
+                "artifact_evidence_count": artifact_context_pack["artifact_evidence_count"],
+                "reason": artifact_context_pack["reason"],
+                "latency_trace": artifact_context_pack.get("latency_trace", {}),
             },
         }
     request_scope = infer_request_scope(body.message, body.ui_state)

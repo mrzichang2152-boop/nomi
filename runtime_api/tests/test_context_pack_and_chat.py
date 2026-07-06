@@ -3151,6 +3151,124 @@ def test_chat_messages_alias_uses_same_chat_pipeline(monkeypatch):
     assert body["context_pack"]["included_event_ids"] == ["event-user"]
 
 
+def test_chat_endpoint_routes_ppt_artifact_request_to_task_without_model(monkeypatch):
+    monkeypatch.setenv("APP_PASSWORD", "secret")
+    from app import main
+
+    persisted_turns = []
+    persisted_tasks = []
+    snapshots = []
+
+    def fake_persist_turn(conn, redis_client, role, content, conversation_id=None, client_type="web", **kwargs):
+        persisted_turns.append(
+            {
+                "role": role,
+                "content": content,
+                "conversation_id": conversation_id,
+                "client_request_id": kwargs.get("client_request_id"),
+            }
+        )
+        return {
+            "conversation_id": conversation_id or "conv-artifact-1",
+            "turn_id": f"turn-{role}",
+            "event_id": f"event-{role}",
+        }
+
+    def fake_current_source_context(*args, **kwargs):
+        return [
+            {
+                "event_id": "evt_whatsapp_wang_1",
+                "source": "whatsapp",
+                "actor": "王总",
+                "timestamp": "2026-07-06T10:30:00+08:00",
+                "content": "王总：本次客户汇报重点是上线计划、预算和风险。",
+            }
+        ]
+
+    def fake_persist_artifact_task_run(
+        conn,
+        *,
+        conversation_id,
+        source_message_event_id,
+        message,
+        client_request_id,
+        payload,
+    ):
+        assert conversation_id == "conv-artifact-1"
+        assert source_message_event_id == "event-user"
+        assert client_request_id == "artifact-req-1"
+        assert payload["route"]["task_type"] == "artifact_creation"
+        task = {
+            "task_run_id": "task_artifact_1",
+            "task_type": "artifact_creation",
+            "artifact_type": payload["route"]["artifact_type"],
+            "pipeline_id": "ppt_creation_pipeline",
+            "route_type": "artifact_task",
+            "status": "waiting_user",
+            "title": "依据王总资料生成 PPT",
+            "source_event_ids": [item["evidence_id"] for item in payload["evidence_pack"]["items"]],
+            "payload": payload,
+        }
+        persisted_tasks.append(task)
+        return task
+
+    class Conn:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return None
+
+    class GatewayShouldNotRun:
+        async def chat(self, *args, **kwargs):
+            raise AssertionError("artifact task requests must not use normal chat generation")
+
+    monkeypatch.setattr(main, "db", lambda: Conn())
+    monkeypatch.setattr(main, "redis_client", lambda: object())
+    monkeypatch.setattr(main, "find_cached_assistant_response", lambda *args, **kwargs: None, raising=False)
+    monkeypatch.setattr(main, "persist_assistant_turn", fake_persist_turn, raising=False)
+    monkeypatch.setattr(main, "retrieve_current_source_context", fake_current_source_context, raising=False)
+    monkeypatch.setattr(main, "retrieve_context", lambda *args, **kwargs: [], raising=False)
+    monkeypatch.setattr(main, "retrieve_assistant_dialogue_context", lambda *args, **kwargs: [], raising=False)
+    monkeypatch.setattr(main, "retrieve_active_agenda_context", lambda *args, **kwargs: [], raising=False)
+    monkeypatch.setattr(main, "persist_artifact_task_run", fake_persist_artifact_task_run, raising=False)
+    monkeypatch.setattr(
+        main,
+        "persist_context_snapshot",
+        lambda conn, event_id, route_type, context_pack: snapshots.append(
+            (event_id, route_type, context_pack)
+        ),
+        raising=False,
+    )
+    monkeypatch.setattr(main, "safe_persist_context_route_trace", lambda *args, **kwargs: None, raising=False)
+    monkeypatch.setattr(main, "model_gateway", lambda: GatewayShouldNotRun())
+
+    response = TestClient(main.app).post(
+        "/api/chat",
+        headers={"x-par-password": "secret"},
+        json={
+            "message": "帮我依据刚刚王总给的资料，写一份 PPT",
+            "conversation_id": "conv-artifact-1",
+            "client_request_id": "artifact-req-1",
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["task"]["task_run_id"] == "task_artifact_1"
+    assert body["task"]["task_type"] == "artifact_creation"
+    assert body["task"]["artifact_type"] == "pptx"
+    assert body["task"]["status"] == "waiting_user"
+    assert body["context_pack"]["task_route"]["message_kind"] == "task_request"
+    assert body["context_pack"]["task_route"]["task_type"] == "artifact_creation"
+    assert body["context_pack"]["artifact_evidence_count"] == 1
+    assert "PPT" in body["answer"]
+    assert "编造" not in body["answer"]
+    assert persisted_turns[-1]["role"] == "assistant"
+    assert persisted_tasks[0]["source_event_ids"] == ["evt_whatsapp_wang_1"]
+    assert snapshots[-1][1] == "artifact_task"
+
+
 def test_chat_history_endpoint_restores_latest_conversation_when_client_has_no_id(monkeypatch):
     monkeypatch.setenv("APP_PASSWORD", "secret")
     from datetime import datetime, timezone

@@ -65,4 +65,47 @@ def test_task_orchestrator_schema_sql_creates_task_and_outbox_tables():
     assert "CREATE TABLE IF NOT EXISTS task_runs" in combined
     assert "CREATE TABLE IF NOT EXISTS task_steps" in combined
     assert "CREATE TABLE IF NOT EXISTS notification_outbox" in combined
+    assert "CREATE TABLE IF NOT EXISTS task_artifacts" in combined
+    assert "CREATE TABLE IF NOT EXISTS task_evidence_links" in combined
     assert "task_runs_idempotency_idx" in combined
+    assert "task_artifacts_task_idx" in combined
+    assert "task_evidence_links_task_idx" in combined
+
+
+def test_create_artifact_task_run_preserves_route_payload_and_source_evidence():
+    from app.task_orchestrator import TaskOrchestrator
+
+    orchestrator = TaskOrchestrator()
+
+    task = orchestrator.create_task_run(
+        task_type="artifact_creation",
+        idempotency_key="conv-1:msg-1:artifact",
+        steps=["interpret_request", "gather_evidence"],
+        pipeline_id="ppt_creation_pipeline",
+        route_type="artifact_task",
+        source_event_ids=["evt_whatsapp_1"],
+        payload={
+            "artifact_type": "pptx",
+            "context_plan": {"needed_context": [{"entity_hint": "王总"}]},
+        },
+        risk_permission="local_artifact_generation",
+        requires_user_confirmation=False,
+    )
+
+    assert task["task_type"] == "artifact_creation"
+    assert task["pipeline_id"] == "ppt_creation_pipeline"
+    assert task["route_type"] == "artifact_task"
+    assert task["source_event_ids"] == ["evt_whatsapp_1"]
+    assert task["payload"]["artifact_type"] == "pptx"
+    assert task["risk_permission"] == "local_artifact_generation"
+    assert task["requires_user_confirmation"] is False
+
+    duplicate = orchestrator.create_task_run(
+        task_type="artifact_creation",
+        idempotency_key="conv-1:msg-1:artifact",
+        steps=["interpret_request"],
+        payload={"artifact_type": "docx"},
+    )
+
+    assert duplicate["task_run_id"] == task["task_run_id"]
+    assert duplicate["payload"]["artifact_type"] == "pptx"
