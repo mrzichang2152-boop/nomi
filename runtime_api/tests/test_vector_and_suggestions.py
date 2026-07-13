@@ -94,6 +94,7 @@ def test_lifespan_does_not_block_or_fail_on_embedding_warmup(monkeypatch):
         "ensure_assistant_identity_schema",
         "ensure_memory_governance_schema",
         "ensure_assistant_context_schema",
+        "ensure_attachment_schema",
         "ensure_curated_assistant_memory_schema",
         "ensure_proactive_feedback_schema",
         "ensure_task_routing_schema",

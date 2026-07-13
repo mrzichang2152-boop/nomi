@@ -38,6 +38,7 @@ from app.assistant_identity.outbound import OutboundMessagePipeline
 from app.assistant_identity.phone_adapter import PhoneCallInstructionBuilder, PhoneDuplexTurnHandler, PhoneWebhookVerifier
 from app.assistant_identity.registry import AssistantIdentityRegistry
 from app.assistant_identity.schema import assistant_identity_schema_sql
+from app.attachments.schema import attachment_schema_sql
 from app.assistant_memory import assistant_memory_schema_sql, build_session_search_context
 from app.artifact_tasks import artifact_label, artifact_task_answer, build_artifact_task_payload, route_artifact_task
 from app.auth import is_authorized
@@ -250,6 +251,7 @@ async def lifespan(app: FastAPI):
     ensure_assistant_identity_schema()
     ensure_memory_governance_schema()
     ensure_assistant_context_schema()
+    ensure_attachment_schema()
     ensure_curated_assistant_memory_schema()
     ensure_proactive_feedback_schema()
     ensure_task_routing_schema()
@@ -7141,6 +7143,12 @@ def ensure_model_gateway_schema() -> None:
 def ensure_ios_live_activity_schema() -> None:
     with db() as conn:
         for sql in ios_live_activity_schema_sql():
+            conn.execute(sql)
+
+
+def ensure_attachment_schema() -> None:
+    with db() as conn:
+        for sql in attachment_schema_sql():
             conn.execute(sql)
 
 
