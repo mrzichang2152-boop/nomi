@@ -13,6 +13,7 @@ import android.graphics.Color;
 import android.graphics.Insets;
 import android.graphics.PixelFormat;
 import android.graphics.Rect;
+import android.util.Size;
 import android.graphics.drawable.GradientDrawable;
 import android.net.Uri;
 import android.os.Build;
@@ -20,6 +21,7 @@ import android.os.Bundle;
 import android.os.IBinder;
 import android.os.SystemClock;
 import android.text.Layout;
+import android.text.TextUtils;
 import android.view.Gravity;
 import android.view.MotionEvent;
 import android.view.View;
@@ -31,6 +33,7 @@ import android.view.inputmethod.InputMethodManager;
 import android.widget.Button;
 import android.widget.EditText;
 import android.widget.ImageButton;
+import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.TextView;
@@ -40,21 +43,36 @@ import com.par.assistant.core.ServerConfig;
 import com.par.assistant.core.SuggestionDeduper;
 
 import java.util.List;
+import java.util.ArrayList;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.Set;
 
 public final class FloatingBallService extends Service {
     static final String ACTION_SHOW_ACCOUNTS = "com.par.assistant.android.SHOW_ACCOUNTS";
     static final String ACTION_SHOW_EXTERNAL_AUTH_CLOSE = "com.par.assistant.android.SHOW_EXTERNAL_AUTH_CLOSE";
+    static final String ACTION_ATTACHMENTS_SELECTED = "com.par.assistant.android.ATTACHMENTS_SELECTED";
+    static final String ACTION_ATTACHMENTS_CANCELLED = "com.par.assistant.android.ATTACHMENTS_CANCELLED";
     static final String EXTRA_AUTH_MESSAGE = "com.par.assistant.android.AUTH_MESSAGE";
+    static final String EXTRA_ATTACHMENT_URIS = "com.par.assistant.android.ATTACHMENT_URIS";
+    static final String EXTRA_ATTACHMENT_FILENAMES = "com.par.assistant.android.ATTACHMENT_FILENAMES";
+    static final String EXTRA_ATTACHMENT_MIME_TYPES = "com.par.assistant.android.ATTACHMENT_MIME_TYPES";
+    static final String EXTRA_ATTACHMENT_BYTE_SIZES = "com.par.assistant.android.ATTACHMENT_BYTE_SIZES";
     private static final String CHANNEL_ID = "par-floating-ball";
     private static final int NOTIFICATION_ID = 1001;
     private static final long STREAMING_CHAT_FALLBACK_TIMEOUT_MS =
             StreamingChatFallbackPolicy.FIRST_DELTA_FALLBACK_TIMEOUT_MS;
 
     private final ExecutorService executor = Executors.newSingleThreadExecutor();
+    private final ExecutorService attachmentExecutor = Executors.newSingleThreadExecutor();
+    private final ExecutorService thumbnailExecutor = Executors.newSingleThreadExecutor();
+    private final Map<String, AtomicBoolean> uploadCancellations = new ConcurrentHashMap<>();
+    private final Map<String, android.graphics.Bitmap> thumbnailCache = new ConcurrentHashMap<>();
+    private final Set<String> thumbnailRequests = ConcurrentHashMap.newKeySet();
     private WindowManager windowManager;
     private NomiAvatarView ballView;
     private TextView bubbleView;
@@ -105,6 +123,12 @@ public final class FloatingBallService extends Service {
     private int panelDefaultY;
     private int panelDefaultHeight;
     private boolean panelInputFocused;
+    private FloatingAttachmentController attachmentController;
+    private LinearLayout attachmentTrayView;
+    private EditText composerInput;
+    private Button composerSendButton;
+    private List<String> streamingRequestAttachmentIds;
+    private static FloatingAttachmentController.Snapshot retainedAttachmentSnapshot;
     private static final AccountChannel[] ACCOUNT_CHANNELS = new AccountChannel[] {
             new AccountChannel("gmail", "Gmail", "邮件、订单、验证码提醒、邮件正文快照", true),
             new AccountChannel("whatsapp", "WhatsApp Web", "聊天预览、打开会话历史、新消息监听", true),
@@ -121,6 +145,8 @@ public final class FloatingBallService extends Service {
     public void onCreate() {
         super.onCreate();
         activeConversationId = ConfigPrefs.conversationId(this);
+        attachmentController = createAttachmentController(retainedAttachmentSnapshot);
+        retainedAttachmentSnapshot = null;
         windowManager = (WindowManager) getSystemService(WINDOW_SERVICE);
         startNomiForeground(false);
         showBall();
@@ -139,13 +165,24 @@ public final class FloatingBallService extends Service {
             if (ballView == null) showBall();
             showExternalAuthCloseButton();
         }
+        if (intent != null && ACTION_ATTACHMENTS_SELECTED.equals(intent.getAction())) {
+            receiveSelectedAttachments(intent);
+        }
+        if (intent != null && ACTION_ATTACHMENTS_CANCELLED.equals(intent.getAction())) {
+            attachmentController.cancelPicker();
+            restoreComposerAfterPicker();
+        }
         return START_STICKY;
     }
 
     @Override
     public void onDestroy() {
+        if (attachmentController != null) retainedAttachmentSnapshot = attachmentController.snapshot();
         if (poller != null) poller.stop();
         if (realtimeClient != null) realtimeClient.stop();
+        for (AtomicBoolean cancellation : uploadCancellations.values()) cancellation.set(true);
+        attachmentExecutor.shutdownNow();
+        thumbnailExecutor.shutdownNow();
         stopVoiceSession(true);
         removeView(ballView);
         removeView(bubbleView);
@@ -157,6 +194,112 @@ public final class FloatingBallService extends Service {
     @Override
     public IBinder onBind(Intent intent) {
         return null;
+    }
+
+    private FloatingAttachmentController createAttachmentController(FloatingAttachmentController.Snapshot snapshot) {
+        FloatingAttachmentController.Gateway gateway = new FloatingAttachmentController.Gateway() {
+            @Override
+            public ChatAttachment upload(AttachmentDraft draft, FloatingAttachmentController.Progress progress) throws Exception {
+                AtomicBoolean cancellation = new AtomicBoolean(false);
+                uploadCancellations.put(draft.clientUploadId, cancellation);
+                AttachmentUploadRequestBody body = AttachmentUploadRequestBody.forUri(
+                        getContentResolver(),
+                        Uri.parse(draft.uri),
+                        draft.mimeType,
+                        draft.byteSize,
+                        (written, total) -> {
+                            progress.onProgress(written, total);
+                            runOnMain(FloatingBallService.this::renderAttachmentTray);
+                        },
+                        cancellation::get
+                );
+                try {
+                    return api().uploadAttachment(draft, body);
+                } finally {
+                    uploadCancellations.remove(draft.clientUploadId, cancellation);
+                }
+            }
+
+            @Override
+            public ChatAttachment status(String attachmentId) throws Exception {
+                return api().attachmentStatus(attachmentId);
+            }
+
+            @Override
+            public ChatAttachment retry(String attachmentId) throws Exception {
+                return api().retryAttachment(attachmentId);
+            }
+
+            @Override
+            public void delete(String attachmentId) throws Exception {
+                api().deleteAttachment(attachmentId);
+            }
+        };
+        return snapshot == null
+                ? new FloatingAttachmentController(gateway, Thread::sleep)
+                : new FloatingAttachmentController(gateway, Thread::sleep, snapshot);
+    }
+
+    @SuppressWarnings("unchecked")
+    private void receiveSelectedAttachments(Intent intent) {
+        ArrayList<String> uris = intent.getStringArrayListExtra(EXTRA_ATTACHMENT_URIS);
+        ArrayList<String> filenames = intent.getStringArrayListExtra(EXTRA_ATTACHMENT_FILENAMES);
+        ArrayList<String> mimeTypes = intent.getStringArrayListExtra(EXTRA_ATTACHMENT_MIME_TYPES);
+        Object rawSizes = intent.getSerializableExtra(EXTRA_ATTACHMENT_BYTE_SIZES);
+        List<Long> sizes = rawSizes instanceof List ? (List<Long>) rawSizes : List.of();
+        int count = uris == null ? 0 : uris.size();
+        for (int index = 0; index < count; index++) {
+            String filename = filenames != null && index < filenames.size() ? filenames.get(index) : "attachment";
+            String mimeType = mimeTypes != null && index < mimeTypes.size() ? mimeTypes.get(index) : "application/octet-stream";
+            long byteSize = index < sizes.size() && sizes.get(index) != null ? sizes.get(index) : -1L;
+            try {
+                attachmentController.add(AttachmentDraft.create(
+                        uris.get(index),
+                        filename,
+                        mimeType,
+                        byteSize,
+                        UUID.randomUUID().toString()
+                ));
+            } catch (IllegalArgumentException error) {
+                if (responseView != null) responseView.setText(error.getMessage());
+            }
+        }
+        attachmentController.completePicker();
+        renderAttachmentTray();
+        restoreComposerAfterPicker();
+        uploadAttachmentsAsync();
+    }
+
+    private void openAttachmentPicker() {
+        attachmentController.beginPicker(panelInputFocused);
+        if (panelView != null) panelView.setVisibility(View.GONE);
+        startActivity(AttachmentPickerActivity.intent(this));
+    }
+
+    private void restoreComposerAfterPicker() {
+        if (panelView != null) panelView.setVisibility(View.VISIBLE);
+        if (composerInput != null && attachmentController.shouldRestoreKeyboard()) {
+            showKeyboard(composerInput);
+        }
+    }
+
+    private void uploadAttachmentsAsync() {
+        updateAttachmentSendState(false);
+        attachmentExecutor.execute(() -> {
+            try {
+                attachmentController.prepareForSend();
+                runOnMain(() -> {
+                    renderAttachmentTray();
+                    updateAttachmentSendState(true);
+                });
+            } catch (Exception error) {
+                runOnMain(() -> {
+                    renderAttachmentTray();
+                    updateAttachmentSendState(false);
+                    if (responseView != null) responseView.setText("附件处理失败：" + error.getMessage());
+                });
+            }
+        });
     }
 
     private void showBall() {
@@ -265,6 +408,7 @@ public final class FloatingBallService extends Service {
         addChatMessage("Nomi", "我在这里。你可以直接发消息，也可以点右上角查看日程或进入完整 App。");
 
         EditText input = new EditText(this);
+        composerInput = input;
         input.setHint("和 Nomi 说点什么");
         input.setSingleLine(false);
         input.setMinLines(1);
@@ -284,18 +428,40 @@ public final class FloatingBallService extends Service {
         chatScrollView.setOnClickListener(view -> hideKeyboard(input));
         chatHistoryView.setClickable(true);
         chatHistoryView.setOnClickListener(view -> hideKeyboard(input));
+
+        attachmentTrayView = new LinearLayout(this);
+        attachmentTrayView.setOrientation(LinearLayout.VERTICAL);
+        chatContentView.addView(attachmentTrayView, new LinearLayout.LayoutParams(-1, -2));
+
         LinearLayout composer = new LinearLayout(this);
         composer.setOrientation(LinearLayout.HORIZONTAL);
         composer.setGravity(Gravity.CENTER_VERTICAL);
+
+        ImageButton attach = iconButton(android.R.drawable.ic_menu_add, "添加附件");
+        attach.setOnClickListener(view -> openAttachmentPicker());
+        LinearLayout.LayoutParams attachParams = new LinearLayout.LayoutParams(dp(42), dp(48));
+        attachParams.setMargins(0, 0, dp(6), 0);
+        composer.addView(attach, attachParams);
         composer.addView(input, new LinearLayout.LayoutParams(0, dp(48), 1));
 
         Button send = new Button(this);
+        composerSendButton = send;
         send.setText("发送");
         send.setFocusable(false);
         send.setFocusableInTouchMode(false);
         stylePrimaryButton(send);
         send.setOnClickListener(view -> {
             String text = input.getText().toString();
+            if (!attachmentController.canSend(text)) {
+                if (responseView != null) {
+                    responseView.setText(
+                            attachmentController.drafts().isEmpty()
+                                    ? "请输入消息或选择附件。"
+                                    : "请等待附件处理完成，或重试/移除失败附件。"
+                    );
+                }
+                return;
+            }
             input.setText("");
             input.requestFocus();
             showKeyboard(input);
@@ -312,6 +478,8 @@ public final class FloatingBallService extends Service {
         responseView.setText("");
         responseView.setTextColor(Color.rgb(71, 85, 105));
         chatContentView.addView(responseView);
+        renderAttachmentTray();
+        updateAttachmentSendState(attachmentController.drafts().stream().allMatch(AttachmentDraft::isReady));
         panelView.addView(chatContentView, new LinearLayout.LayoutParams(-1, 0, 1));
 
         settingsContentView = new LinearLayout(this);
@@ -340,20 +508,152 @@ public final class FloatingBallService extends Service {
         loadRemoteChatHistory();
     }
 
+    private void renderAttachmentTray() {
+        if (attachmentTrayView == null || attachmentController == null) return;
+        attachmentTrayView.removeAllViews();
+        for (AttachmentDraft draft : attachmentController.drafts()) {
+            LinearLayout row = new LinearLayout(this);
+            row.setOrientation(LinearLayout.HORIZONTAL);
+            row.setGravity(Gravity.CENTER_VERTICAL);
+            row.setPadding(dp(8), dp(6), dp(6), dp(6));
+            row.setBackground(rounded(Color.rgb(248, 250, 252), Color.rgb(226, 232, 240), 10));
+
+            ImageView kind = new ImageView(this);
+            kind.setContentDescription(draft.mimeType.startsWith("image/") ? "图片附件预览" : "文档附件");
+            kind.setBackground(rounded(Color.rgb(241, 245, 249), 0, 10));
+            kind.setPadding(dp(6), dp(6), dp(6), dp(6));
+            kind.setScaleType(ImageView.ScaleType.CENTER_CROP);
+            android.graphics.Bitmap cachedThumbnail = thumbnailCache.get(draft.clientUploadId);
+            if (cachedThumbnail != null) {
+                kind.setImageBitmap(cachedThumbnail);
+            } else if (draft.isReady()
+                    && draft.mimeType.startsWith("image/")
+                    && Build.VERSION.SDK_INT >= 29
+                    && thumbnailRequests.add(draft.clientUploadId)) {
+                thumbnailExecutor.execute(() -> {
+                    try {
+                        android.graphics.Bitmap thumbnail = getContentResolver().loadThumbnail(
+                                Uri.parse(draft.uri),
+                                new Size(dp(40), dp(40)),
+                                null
+                        );
+                        thumbnailCache.put(draft.clientUploadId, thumbnail);
+                        runOnMain(() -> kind.setImageBitmap(thumbnail));
+                    } catch (Exception ignored) {
+                        runOnMain(() -> kind.setImageResource(android.R.drawable.ic_menu_gallery));
+                    }
+                });
+            } else {
+                kind.setImageResource(draft.mimeType.startsWith("image/")
+                        ? android.R.drawable.ic_menu_gallery
+                        : android.R.drawable.ic_menu_save);
+            }
+            row.addView(kind, new LinearLayout.LayoutParams(dp(36), dp(36)));
+
+            LinearLayout labels = new LinearLayout(this);
+            labels.setOrientation(LinearLayout.VERTICAL);
+            TextView filename = new TextView(this);
+            filename.setText(draft.filename);
+            filename.setTextSize(12);
+            filename.setTextColor(Color.rgb(15, 23, 42));
+            filename.setMaxLines(2);
+            filename.setEllipsize(TextUtils.TruncateAt.END);
+            TextView status = new TextView(this);
+            status.setText(attachmentStatusText(draft));
+            status.setTextSize(11);
+            status.setTextColor(draft.isFailed() ? Color.rgb(185, 28, 28) : Color.rgb(71, 85, 105));
+            labels.addView(filename);
+            labels.addView(status);
+            LinearLayout.LayoutParams labelsParams = new LinearLayout.LayoutParams(0, -2, 1);
+            labelsParams.setMargins(dp(8), 0, dp(4), 0);
+            row.addView(labels, labelsParams);
+
+            if (draft.isFailed()) {
+                ImageButton retry = iconButton(android.R.drawable.ic_popup_sync, "重试附件");
+                retry.setOnClickListener(view -> retryAttachment(draft.clientUploadId));
+                row.addView(retry, new LinearLayout.LayoutParams(dp(36), dp(36)));
+            }
+            ImageButton remove = iconButton(android.R.drawable.ic_menu_close_clear_cancel, "移除附件");
+            remove.setOnClickListener(view -> removeAttachment(draft.clientUploadId));
+            row.addView(remove, new LinearLayout.LayoutParams(dp(36), dp(36)));
+
+            LinearLayout.LayoutParams rowParams = new LinearLayout.LayoutParams(-1, -2);
+            rowParams.setMargins(0, 0, 0, dp(6));
+            attachmentTrayView.addView(row, rowParams);
+        }
+    }
+
+    private String attachmentStatusText(AttachmentDraft draft) {
+        if (draft.isReady()) return "已就绪";
+        if (draft.isFailed()) return "失败：" + draft.errorMessage();
+        if (draft.progressPercent() > 0) return "上传中 " + draft.progressPercent() + "%";
+        if (draft.remote() != null) return "处理中";
+        return "等待上传";
+    }
+
+    private void updateAttachmentSendState(boolean uploadsReady) {
+        if (composerSendButton == null) return;
+        boolean enabled = attachmentController == null || attachmentController.drafts().isEmpty() || uploadsReady;
+        composerSendButton.setEnabled(enabled);
+        composerSendButton.setAlpha(enabled ? 1.0f : 0.55f);
+    }
+
+    private void retryAttachment(String clientUploadId) {
+        attachmentExecutor.execute(() -> {
+            try {
+                attachmentController.retry(clientUploadId);
+                runOnMain(this::renderAttachmentTray);
+                uploadAttachmentsAsync();
+            } catch (Exception error) {
+                runOnMain(() -> {
+                    renderAttachmentTray();
+                    if (responseView != null) responseView.setText("附件重试失败：" + error.getMessage());
+                });
+            }
+        });
+    }
+
+    private void removeAttachment(String clientUploadId) {
+        attachmentController.cancel(clientUploadId);
+        AtomicBoolean cancellation = uploadCancellations.get(clientUploadId);
+        if (cancellation != null) cancellation.set(true);
+        thumbnailCache.remove(clientUploadId);
+        thumbnailRequests.remove(clientUploadId);
+        attachmentExecutor.execute(() -> {
+            attachmentController.remove(clientUploadId);
+            runOnMain(() -> {
+                renderAttachmentTray();
+                updateAttachmentSendState(true);
+            });
+        });
+    }
+
     private void sendMessage(String text) {
-        if (text == null || text.trim().isEmpty()) return;
-        String trimmed = text.trim();
+        List<String> attachmentIds = attachmentController == null ? List.of() : attachmentController.readyAttachmentIds();
+        if ((text == null || text.trim().isEmpty()) && attachmentIds.isEmpty()) return;
+        String trimmed = text == null ? "" : text.trim();
+        String displayMessage = attachmentDisplayMessage(trimmed, attachmentController == null ? List.of() : attachmentController.drafts());
         List<FloatingChatContext.Turn> clientContext = chatContext.snapshotDelta(12000);
-        addChatMessage("你", trimmed);
-        chatContext.addUser(trimmed);
+        addChatMessage("你", displayMessage);
+        chatContext.addUser(displayMessage);
         TextView pending = addChatMessage("Nomi", "正在思考...");
         responseView.setText("");
         String conversationId = activeConversationId;
         String clientRequestId = "android-" + UUID.randomUUID();
-        if (trySendStreamingChat(trimmed, conversationId, clientContext, pending, clientRequestId)) {
+        if (trySendStreamingChat(trimmed, conversationId, clientContext, pending, clientRequestId, attachmentIds)) {
             return;
         }
-        sendHttpChat(trimmed, conversationId, clientContext, pending, clientRequestId);
+        sendHttpChat(trimmed, conversationId, clientContext, pending, clientRequestId, attachmentIds);
+    }
+
+    private String attachmentDisplayMessage(String message, List<AttachmentDraft> drafts) {
+        if (drafts == null || drafts.isEmpty()) return message;
+        StringBuilder names = new StringBuilder();
+        for (AttachmentDraft draft : drafts) {
+            if (names.length() > 0) names.append("、");
+            names.append(draft.filename);
+        }
+        return message.isEmpty() ? "附件：" + names : message + "\n附件：" + names;
     }
 
     private void sendHttpChat(String trimmed, String conversationId, List<FloatingChatContext.Turn> clientContext, TextView pending) {
@@ -367,9 +667,20 @@ public final class FloatingBallService extends Service {
             TextView pending,
             String clientRequestId
     ) {
+        sendHttpChat(trimmed, conversationId, clientContext, pending, clientRequestId, List.of());
+    }
+
+    private void sendHttpChat(
+            String trimmed,
+            String conversationId,
+            List<FloatingChatContext.Turn> clientContext,
+            TextView pending,
+            String clientRequestId,
+            List<String> attachmentIds
+    ) {
         executor.execute(() -> {
             try {
-                ChatResult result = api().chat(trimmed, conversationId, clientContext, clientRequestId);
+                ChatResult result = api().chat(trimmed, conversationId, clientContext, clientRequestId, attachmentIds);
                 runOnMain(() -> {
                     if (!result.conversationId.trim().isEmpty()) {
                         rememberActiveConversationId(result.conversationId);
@@ -377,6 +688,7 @@ public final class FloatingBallService extends Service {
                     String answer = result.answer.isEmpty() ? "已发送，但没有返回内容。" : result.answer;
                     pending.setText(messageText("Nomi", answer));
                     chatContext.addAssistant(answer);
+                    clearSentAttachments();
                 });
             } catch (Exception error) {
                 runOnMain(() -> pending.setText(messageText("Nomi", "发送失败：" + error.getMessage())));
@@ -389,7 +701,8 @@ public final class FloatingBallService extends Service {
             String conversationId,
             List<FloatingChatContext.Turn> clientContext,
             TextView pending,
-            String clientRequestId
+            String clientRequestId,
+            List<String> attachmentIds
     ) {
         if (realtimeClient == null || streamingPendingView != null) {
             return false;
@@ -399,10 +712,18 @@ public final class FloatingBallService extends Service {
         streamingRequestConversationId = conversationId;
         streamingRequestContext = clientContext;
         streamingRequestClientRequestId = clientRequestId;
+        streamingRequestAttachmentIds = attachmentIds == null ? List.of() : List.copyOf(attachmentIds);
         streamingRequestStartedAtMs = SystemClock.elapsedRealtime();
         streamingAnswerBuffer.setLength(0);
         try {
-            boolean sent = realtimeClient.sendChatMessage(message, conversationId, 12, "android", clientRequestId);
+            boolean sent = realtimeClient.sendChatMessage(
+                    message,
+                    conversationId,
+                    12,
+                    "android",
+                    clientRequestId,
+                    streamingRequestAttachmentIds
+            );
             if (!sent) {
                 clearStreamingChatState();
             }
@@ -447,6 +768,7 @@ public final class FloatingBallService extends Service {
         }
         streamingPendingView.setText(messageText("Nomi", finalAnswer));
         chatContext.addAssistant(finalAnswer);
+        clearSentAttachments();
         clearStreamingChatState();
     }
 
@@ -463,6 +785,7 @@ public final class FloatingBallService extends Service {
         String conversationId = streamingRequestConversationId;
         List<FloatingChatContext.Turn> clientContext = streamingRequestContext;
         String clientRequestId = streamingRequestClientRequestId;
+        List<String> attachmentIds = streamingRequestAttachmentIds;
         if (pending == null || message == null || message.trim().isEmpty()) {
             clearStreamingChatState();
             return;
@@ -474,7 +797,8 @@ public final class FloatingBallService extends Service {
                 conversationId,
                 clientContext == null ? List.of() : clientContext,
                 pending,
-                clientRequestId == null ? "" : clientRequestId
+                clientRequestId == null ? "" : clientRequestId,
+                attachmentIds == null ? List.of() : attachmentIds
         );
     }
 
@@ -484,8 +808,16 @@ public final class FloatingBallService extends Service {
         streamingRequestConversationId = null;
         streamingRequestContext = null;
         streamingRequestClientRequestId = null;
+        streamingRequestAttachmentIds = null;
         streamingRequestStartedAtMs = 0L;
         streamingAnswerBuffer.setLength(0);
+    }
+
+    private void clearSentAttachments() {
+        if (attachmentController == null) return;
+        attachmentController.clearAfterSend();
+        renderAttachmentTray();
+        updateAttachmentSendState(true);
     }
 
     private void startVoiceInput() {
@@ -744,6 +1076,9 @@ public final class FloatingBallService extends Service {
         settingsStatusView = null;
         chatHistoryView = null;
         chatScrollView = null;
+        attachmentTrayView = null;
+        composerInput = null;
+        composerSendButton = null;
         voicePanelMessageView = null;
     }
 

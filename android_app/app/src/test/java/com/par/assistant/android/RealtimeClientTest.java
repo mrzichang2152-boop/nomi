@@ -7,6 +7,8 @@ import static org.junit.Assert.assertNull;
 import org.junit.Test;
 import org.json.JSONObject;
 
+import java.util.List;
+
 public final class RealtimeClientTest {
     @Test
     public void parsesProactiveSuggestionIdAndKeepsRawJsonForWorkspaceDeepLink() throws Exception {
@@ -139,5 +141,23 @@ public final class RealtimeClientTest {
         assertEquals(24, json.getInt("limit"));
         assertEquals("android", json.getString("client_type"));
         assertEquals("android-request-1", json.getString("client_request_id"));
+    }
+
+    @Test
+    public void buildsAttachmentOnlyStreamingPayloadWithOrderedIdsAndSameRequestId() throws Exception {
+        String payload = RealtimeClient.chatMessagePayload(
+                "",
+                "conv-a",
+                24,
+                "android",
+                "android-request-a",
+                List.of("attachment-1", "attachment-2")
+        );
+
+        JSONObject json = new JSONObject(payload);
+        assertEquals("", json.getString("message"));
+        assertEquals("android-request-a", json.getString("client_request_id"));
+        assertEquals("attachment-1", json.getJSONArray("attachment_ids").getString(0));
+        assertEquals("attachment-2", json.getJSONArray("attachment_ids").getString(1));
     }
 }

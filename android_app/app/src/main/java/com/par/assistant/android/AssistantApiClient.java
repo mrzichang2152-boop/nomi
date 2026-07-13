@@ -13,6 +13,7 @@ import java.util.Map;
 import java.util.concurrent.TimeUnit;
 
 import okhttp3.MediaType;
+import okhttp3.MultipartBody;
 import okhttp3.OkHttpClient;
 import okhttp3.Request;
 import okhttp3.RequestBody;
@@ -71,6 +72,16 @@ final class AssistantApiClient {
             List<FloatingChatContext.Turn> clientContext,
             String clientRequestId
     ) throws Exception {
+        return chat(message, conversationId, clientContext, clientRequestId, List.of());
+    }
+
+    ChatResult chat(
+            String message,
+            String conversationId,
+            List<FloatingChatContext.Turn> clientContext,
+            String clientRequestId,
+            List<String> attachmentIds
+    ) throws Exception {
         JSONObject body = new JSONObject()
                 .put("message", message)
                 .put("client_type", "android");
@@ -89,10 +100,69 @@ final class AssistantApiClient {
             );
         }
         body.put("client_context_delta", context);
+        JSONArray attachments = new JSONArray();
+        if (attachmentIds != null) {
+            for (String attachmentId : attachmentIds) {
+                if (attachmentId != null && !attachmentId.trim().isEmpty()) {
+                    attachments.put(attachmentId.trim());
+                }
+            }
+        }
+        body.put("attachment_ids", attachments);
         JSONObject json = requestChatWithTransientRetry(body);
         return new ChatResult(
                 json.optString("answer", json.optString("message", "")),
                 json.optString("conversation_id", conversationId == null ? "" : conversationId)
+        );
+    }
+
+    ChatAttachment uploadAttachment(AttachmentDraft draft, RequestBody fileBody) throws Exception {
+        if (draft == null) throw new IllegalArgumentException("attachment draft is required");
+        if (fileBody == null) throw new IllegalArgumentException("attachment body is required");
+        MultipartBody multipart = new MultipartBody.Builder()
+                .setType(MultipartBody.FORM)
+                .addFormDataPart("client_upload_id", draft.clientUploadId)
+                .addFormDataPart("file", draft.filename, fileBody)
+                .build();
+        Request request = authenticatedRequestBuilder("/api/chat/attachments")
+                .post(multipart)
+                .build();
+        return parseAttachment(executeJson(request), draft.clientUploadId);
+    }
+
+    ChatAttachment attachmentStatus(String attachmentId) throws Exception {
+        String id = requiredAttachmentId(attachmentId);
+        return parseAttachment(request("GET", "/api/chat/attachments/" + id, null, true), "");
+    }
+
+    ChatAttachment retryAttachment(String attachmentId) throws Exception {
+        String id = requiredAttachmentId(attachmentId);
+        return parseAttachment(request("POST", "/api/chat/attachments/" + id + "/retry", null, true), "");
+    }
+
+    void deleteAttachment(String attachmentId) throws Exception {
+        String id = requiredAttachmentId(attachmentId);
+        requestText("DELETE", "/api/chat/attachments/" + id, null, true);
+    }
+
+    private String requiredAttachmentId(String attachmentId) {
+        String id = attachmentId == null ? "" : attachmentId.trim();
+        if (id.isEmpty()) throw new IllegalArgumentException("attachment id is required");
+        return id;
+    }
+
+    private ChatAttachment parseAttachment(JSONObject json, String clientUploadId) {
+        return new ChatAttachment(
+                json.optString("attachment_id"),
+                clientUploadId,
+                json.optString("filename"),
+                json.optString("mime_type"),
+                json.optLong("byte_size", 0L),
+                json.optString("status"),
+                json.optString("kind"),
+                json.optString("preview_url"),
+                json.optString("content_url"),
+                json.optString("error_message", json.optString("error_code"))
         );
     }
 
@@ -567,7 +637,21 @@ final class AssistantApiClient {
         } else {
             builder.method(method, RequestBody.create(new byte[0], JSON));
         }
-        Response response = httpClient.newCall(builder.build()).execute();
+        return executeText(builder.build());
+    }
+
+    private Request.Builder authenticatedRequestBuilder(String path) {
+        return new Request.Builder()
+                .url(config.baseUrl() + path)
+                .header("x-par-password", config.password());
+    }
+
+    private JSONObject executeJson(Request request) throws Exception {
+        return new JSONObject(executeText(request));
+    }
+
+    private String executeText(Request request) throws Exception {
+        Response response = httpClient.newCall(request).execute();
         int code = response.code();
         String text = response.body() == null ? "" : response.body().string();
         response.close();

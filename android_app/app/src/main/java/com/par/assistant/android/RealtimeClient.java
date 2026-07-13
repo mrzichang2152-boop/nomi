@@ -6,7 +6,10 @@ import com.par.assistant.core.ServerConfig;
 import android.os.Handler;
 import android.os.Looper;
 
+import org.json.JSONArray;
 import org.json.JSONObject;
+
+import java.util.List;
 
 
 import okhttp3.OkHttpClient;
@@ -92,11 +95,24 @@ final class RealtimeClient {
     }
 
     boolean sendChatMessage(String message, String conversationId, int limit, String clientType, String clientRequestId) {
+        return sendChatMessage(message, conversationId, limit, clientType, clientRequestId, List.of());
+    }
+
+    boolean sendChatMessage(
+            String message,
+            String conversationId,
+            int limit,
+            String clientType,
+            String clientRequestId,
+            List<String> attachmentIds
+    ) {
         WebSocket currentSocket = socket;
-        if (!connectionState.isOpen(currentSocket) || message == null || message.trim().isEmpty()) {
+        boolean hasMessage = message != null && !message.trim().isEmpty();
+        boolean hasAttachments = attachmentIds != null && !attachmentIds.isEmpty();
+        if (!connectionState.isOpen(currentSocket) || (!hasMessage && !hasAttachments)) {
             return false;
         }
-        return currentSocket.send(chatMessagePayload(message, conversationId, limit, clientType, clientRequestId));
+        return currentSocket.send(chatMessagePayload(message, conversationId, limit, clientType, clientRequestId, attachmentIds));
     }
 
     private void scheduleReconnect() {
@@ -226,6 +242,17 @@ final class RealtimeClient {
     }
 
     static String chatMessagePayload(String message, String conversationId, int limit, String clientType, String clientRequestId) {
+        return chatMessagePayload(message, conversationId, limit, clientType, clientRequestId, List.of());
+    }
+
+    static String chatMessagePayload(
+            String message,
+            String conversationId,
+            int limit,
+            String clientType,
+            String clientRequestId,
+            List<String> attachmentIds
+    ) {
         int boundedLimit = Math.max(1, Math.min(80, limit));
         String normalizedClient = clientType == null || clientType.trim().isEmpty()
                 ? "android"
@@ -242,6 +269,15 @@ final class RealtimeClient {
             if (clientRequestId != null && !clientRequestId.trim().isEmpty()) {
                 json.put("client_request_id", clientRequestId.trim());
             }
+            JSONArray attachments = new JSONArray();
+            if (attachmentIds != null) {
+                for (String attachmentId : attachmentIds) {
+                    if (attachmentId != null && !attachmentId.trim().isEmpty()) {
+                        attachments.put(attachmentId.trim());
+                    }
+                }
+            }
+            json.put("attachment_ids", attachments);
             return json.toString();
         } catch (Exception error) {
             throw new IllegalStateException("实时聊天消息构造失败", error);

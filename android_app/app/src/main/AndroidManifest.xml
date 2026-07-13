@@ -23,6 +23,10 @@
             android:exported="false"
             android:theme="@style/TransparentPermissionTheme" />
         <activity
+            android:name=".AttachmentPickerActivity"
+            android:exported="false"
+            android:theme="@style/TransparentPermissionTheme" />
+        <activity
             android:name=".ComposioCallbackActivity"
             android:exported="true"
             android:noHistory="true">
