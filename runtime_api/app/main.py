@@ -38,7 +38,9 @@ from app.assistant_identity.outbound import OutboundMessagePipeline
 from app.assistant_identity.phone_adapter import PhoneCallInstructionBuilder, PhoneDuplexTurnHandler, PhoneWebhookVerifier
 from app.assistant_identity.registry import AssistantIdentityRegistry
 from app.assistant_identity.schema import assistant_identity_schema_sql
+from app.attachments.router import create_attachment_router
 from app.attachments.schema import attachment_schema_sql
+from app.attachments.service import RedisAttachmentQueue
 from app.assistant_memory import assistant_memory_schema_sql, build_session_search_context
 from app.artifact_tasks import artifact_label, artifact_task_answer, build_artifact_task_payload, route_artifact_task
 from app.auth import is_authorized
@@ -95,6 +97,7 @@ COMPOSIO_USER_ID = os.getenv("COMPOSIO_USER_ID", "nomi_owner").strip() or "nomi_
 COMPOSIO_CALLBACK_URL = os.getenv("COMPOSIO_CALLBACK_URL", "").strip()
 REALTIME_CHANNEL = os.getenv("REALTIME_CHANNEL", "par:realtime")
 STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
+NOMI_ATTACHMENT_ROOT = os.getenv("NOMI_ATTACHMENT_ROOT", "/app/data/attachments")
 ENABLE_DAILY_MAINTENANCE = os.getenv("ENABLE_DAILY_MAINTENANCE", "true").lower() == "true"
 DAILY_MAINTENANCE_HOUR_UTC = int(os.getenv("DAILY_MAINTENANCE_HOUR_UTC", "19"))
 RAW_RETENTION_DAYS = int(os.getenv("RAW_RETENTION_DAYS", "30"))
@@ -1219,6 +1222,16 @@ def protect_private_payload(value: dict[str, Any]) -> dict[str, Any]:
 def require_password(x_par_password: Optional[str]) -> None:
     if not is_authorized(x_par_password):
         raise HTTPException(status_code=401, detail="invalid password")
+
+
+app.include_router(
+    create_attachment_router(
+        connection_factory=db,
+        password_guard=require_password,
+        storage=NOMI_ATTACHMENT_ROOT,
+        queue=RedisAttachmentQueue(redis_client),
+    )
+)
 
 
 def long_tail_runner() -> LongTailGraphRunner:

@@ -24,7 +24,7 @@
 | 支持格式与拒绝格式 | 检测层代码与自动化完成，解析内容未完成 | `test_attachment_detection.py` 覆盖 11 种允许格式及伪装可执行文件、旧 Office、脚本、损坏/加密容器、ZIP traversal/bomb、图片像素上限 | 无 | 尚未在 Worker 中调用检测层；正文与视觉衍生物待 Task 4、5 | 无 | Task 4、5、17 |
 | 私有流式存储 | 代码与自动化完成，未部署 | `test_attachment_storage.py` 核对 256 KiB 分块、SHA-256、越限立即中止、断连清理、`fsync` 后原子替换、随机磁盘名、路径逃逸拒绝 | 无 | 尚未接上传 API 和真实挂载卷 | 云环境部署待 Task 16 | Task 3、16、17 |
 | 四表数据模型 | 代码与自动化完成，未部署 | runtime/fresh-install schema 契约测试通过；后端全量 903 passed | 无 | 尚未在真实 PostgreSQL 执行迁移并核对约束 | 云环境部署待 Task 16 | Task 16、17 |
-| 上传与草稿幂等 | 未开始 | 无 | 无 | 没有 multipart 上传 API | 无 | Task 3 |
+| 上传与草稿幂等 | 代码与自动化完成，未部署 | `test_attachment_api.py` 10 条用例验证鉴权、multipart、202 草稿、安全响应、24 小时过期、断连/越限/拒绝、相同字节幂等及不同字节 409；后端全量 950 passed | 无 | 尚未在真实 PostgreSQL、Redis、挂载卷和客户端上传中验收 | 云环境部署待 Task 16 | Task 10-12、16、17 |
 | 状态、预览、原件、重试、删除 API | 未开始 | 无 | 无 | 端点未建立 | 无 | Task 6 |
 | 有界异步解析 Worker | 未开始 | 无 | 无 | 没有队列、并发门禁和超时隔离 | 无 | Task 4 |
 | 图片/PDF/Office/表格/文本解析 | 未开始 | 无 | 无 | 没有统一解析结果与 locator | 无 | Task 5 |
