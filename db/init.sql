@@ -227,6 +227,26 @@ CREATE TABLE IF NOT EXISTS assistant_turn_attachments (
 CREATE INDEX IF NOT EXISTS assistant_turn_attachments_attachment_idx
 ON assistant_turn_attachments(attachment_id, turn_id);
 
+CREATE TABLE IF NOT EXISTS attachment_cleanup_outbox (
+  id UUID PRIMARY KEY,
+  attachment_id UUID NOT NULL,
+  storage_relative_path TEXT NOT NULL,
+  reason TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending',
+  attempt_count INTEGER NOT NULL DEFAULT 0,
+  available_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  completed_at TIMESTAMPTZ,
+  error_code TEXT,
+  UNIQUE (attachment_id, storage_relative_path),
+  CHECK (status IN ('pending', 'processing', 'completed')),
+  CHECK (attempt_count >= 0)
+);
+
+CREATE INDEX IF NOT EXISTS attachment_cleanup_outbox_pending_idx
+ON attachment_cleanup_outbox(status, available_at, created_at)
+WHERE status IN ('pending', 'processing');
+
 CREATE TABLE IF NOT EXISTS context_snapshots (
   id UUID PRIMARY KEY,
   event_id UUID REFERENCES events(event_id) ON DELETE CASCADE,

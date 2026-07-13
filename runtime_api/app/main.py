@@ -39,6 +39,11 @@ from app.assistant_identity.phone_adapter import PhoneCallInstructionBuilder, Ph
 from app.assistant_identity.registry import AssistantIdentityRegistry
 from app.assistant_identity.schema import assistant_identity_schema_sql
 from app.attachments.router import create_attachment_router
+from app.attachments.repository import (
+    delete_conversation_with_attachment_cleanup,
+    load_public_attachments_for_turns,
+    load_retryable_user_turn,
+)
 from app.attachments.schema import attachment_schema_sql
 from app.attachments.service import (
     AttachmentSubmissionError,
@@ -353,6 +358,10 @@ class ChatIn(BaseModel):
     client_context: list[dict[str, Any]] = Field(default_factory=list)
     client_context_delta: list[dict[str, Any]] = Field(default_factory=list)
     ui_state: dict[str, Any] = Field(default_factory=dict)
+
+
+class AssistantRetryIn(BaseModel):
+    client_type: str = Field(default="web", max_length=40)
 
 
 def chat_context_candidate_limit(requested_limit: int) -> int:
@@ -10858,6 +10867,35 @@ def find_cached_assistant_response(conn: psycopg.Connection, client_request_id: 
     }
 
 
+def assistant_retry_tool_call_id(user_turn_id: uuid.UUID) -> str:
+    return f"attachment-retry:{user_turn_id}:assistant"
+
+
+def find_cached_assistant_retry(
+    conn: psycopg.Connection,
+    user_turn_id: uuid.UUID,
+) -> Optional[dict[str, str]]:
+    row = conn.execute(
+        """
+        SELECT id, conversation_id, event_id, content
+        FROM assistant_turns
+        WHERE tool_call_id = %s AND role = 'assistant'
+          AND finalized_at IS NOT NULL
+        ORDER BY created_at ASC
+        LIMIT 1
+        """,
+        (assistant_retry_tool_call_id(user_turn_id),),
+    ).fetchone()
+    if row is None:
+        return None
+    return {
+        "assistant_turn_id": str(row[0]),
+        "conversation_id": str(row[1]),
+        "event_id": str(row[2]),
+        "answer": str(row[3] or ""),
+    }
+
+
 @app.post("/event")
 def create_event(event: EventIn) -> dict[str, str]:
     ts = event.timestamp or datetime.now(timezone.utc)
@@ -15327,11 +15365,38 @@ def chat_history(
             """,
             (conversation_uuid, limit),
         ).fetchall()
+        attachments_by_turn = load_public_attachments_for_turns(
+            conn,
+            [uuid.UUID(str(row[0])) for row in rows if str(row[2]) == "user"],
+        )
+    messages = [row_to_assistant_turn(row) for row in rows]
+    for message in messages:
+        attachments = attachments_by_turn.get(message["id"])
+        if attachments:
+            message["attachments"] = attachments
     return {
         "conversation_id": str(conversation_uuid),
-        "messages": [row_to_assistant_turn(row) for row in rows],
+        "messages": messages,
     }
 
+
+
+@app.delete("/api/chat/conversations/{conversation_id}")
+def delete_chat_conversation(
+    conversation_id: uuid.UUID,
+    x_par_password: Optional[str] = Header(default=None),
+) -> dict[str, Any]:
+    require_password(x_par_password)
+    with db() as conn:
+        result = delete_conversation_with_attachment_cleanup(conn, conversation_id)
+    if not result.deleted:
+        raise HTTPException(status_code=404, detail="conversation not found")
+    return {
+        "conversation_id": str(result.conversation_id),
+        "status": "deleted",
+        "deleted_attachment_count": result.deleted_attachment_count,
+        "cleanup_path_count": result.cleanup_path_count,
+    }
 
 MODEL_CONTEXT_TOP_LEVEL_KEYS = (
     "context_pack_id",
@@ -15945,6 +16010,79 @@ def build_chat_messages(message: str, context: list[dict[str, Any]] | dict[str, 
             "content": f"个人上下文 JSON:\n{context_text}\n\n用户问题:\n{message}",
         },
     ]
+
+
+@app.post("/api/chat/turns/{user_turn_id}/retry")
+async def retry_assistant_for_user_turn(
+    user_turn_id: uuid.UUID,
+    body: AssistantRetryIn,
+    x_par_password: Optional[str] = Header(default=None),
+) -> dict[str, Any]:
+    require_password(x_par_password)
+    with db() as conn:
+        target = load_retryable_user_turn(conn, user_turn_id)
+        if target is None:
+            raise HTTPException(status_code=404, detail="user turn not found")
+        cached = find_cached_assistant_retry(conn, target.user_turn_id)
+    attachment_ids = [str(item["attachment_id"]) for item in target.attachments]
+    if cached is not None:
+        return {
+            "answer": cached["answer"],
+            "conversation_id": cached["conversation_id"],
+            "user_turn_id": str(target.user_turn_id),
+            "assistant_turn_id": cached["assistant_turn_id"],
+            "attachment_ids": attachment_ids,
+            "duplicate": True,
+        }
+    retry_context = {
+        "current_request": [
+            {
+                "role": "user",
+                "content": target.content,
+                "event_id": str(target.event_id),
+            }
+        ],
+        "source_context": [
+            {
+                "source": "attachment",
+                "source_id": str(item["attachment_id"]),
+                "title": str(item["filename"]),
+                "summary": (
+                    f"用户附件，类型 {item['kind']}，状态 {item['status']}。"
+                    "附件正文证据将在附件检索阶段加载。"
+                ),
+            }
+            for item in target.attachments
+        ],
+        "reason": "retry_existing_user_turn",
+    }
+    try:
+        answer_result = await model_gateway().chat(build_chat_messages(target.content, retry_context))
+    except ModelGatewayError as exc:
+        raise HTTPException(status_code=503, detail=exc.to_payload()) from exc
+    except httpx.TimeoutException as exc:
+        raise HTTPException(
+            status_code=503,
+            detail={"status": "model_timeout", "message": "模型响应超时，请重试。"},
+        ) from exc
+    with db() as conn:
+        assistant_turn = persist_assistant_turn(
+            conn,
+            redis_client(),
+            role="assistant",
+            content=answer_result.text,
+            conversation_id=str(target.conversation_id),
+            client_type=body.client_type,
+            tool_call_id=assistant_retry_tool_call_id(target.user_turn_id),
+        )
+    return {
+        "answer": answer_result.text,
+        "conversation_id": str(target.conversation_id),
+        "user_turn_id": str(target.user_turn_id),
+        "assistant_turn_id": str(assistant_turn["turn_id"]),
+        "attachment_ids": attachment_ids,
+        "duplicate": False,
+    }
 
 
 @app.websocket("/ws")

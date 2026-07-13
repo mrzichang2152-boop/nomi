@@ -3330,6 +3330,9 @@ def test_chat_history_endpoint_restores_latest_conversation_when_client_has_no_i
                         ),
                     ]
                 )
+            if "FROM assistant_turn_attachments" in compact_sql:
+                assert params == ([uuid.UUID("22222222-2222-2222-2222-222222222222")],)
+                return Cursor([])
             raise AssertionError(f"unexpected SQL: {compact_sql}")
 
     monkeypatch.setattr(main, "db", lambda: Conn())
@@ -3341,8 +3344,13 @@ def test_chat_history_endpoint_restores_latest_conversation_when_client_has_no_i
 
     assert response.status_code == 200
     body = response.json()
+    assert body["messages"][0]["id"] == "22222222-2222-2222-2222-222222222222"
+    assert body["messages"][0]["created_at"] == "2026-05-29T08:00:00+00:00"
+    assert body["messages"][1]["id"] == "44444444-4444-4444-4444-444444444444"
+    assert body["messages"][1]["created_at"] == "2026-05-29T08:00:05+00:00"
     assert body["conversation_id"] == str(conversation_id)
     assert [message["role"] for message in body["messages"]] == ["user", "assistant"]
     assert body["messages"][0]["content"] == "需要"
     assert body["messages"][1]["content"] == "好的，我会继续核对成本与利润率。"
+    assert sum("FROM assistant_turn_attachments" in sql for sql, _ in executed) == 1
     assert any("SELECT conversation_id FROM assistant_turns" in sql for sql, _ in executed)

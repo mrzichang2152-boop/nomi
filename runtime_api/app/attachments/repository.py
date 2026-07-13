@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import threading
 from dataclasses import dataclass, replace
-from datetime import datetime
+from datetime import datetime, timedelta
+from pathlib import PurePosixPath
 from typing import Callable, ContextManager, Optional, Protocol, Sequence
 from uuid import UUID, uuid4
 
@@ -44,6 +45,219 @@ class AttachmentDerivativeRecord:
     storage_relative_path: str
     byte_size: int
     processing_version: str
+
+
+@dataclass(frozen=True)
+class RetryableUserTurn:
+    user_turn_id: UUID
+    conversation_id: UUID
+    content: str
+    event_id: UUID
+    created_at: datetime
+    attachments: tuple[dict[str, object], ...]
+
+
+@dataclass(frozen=True)
+class ConversationDeletionResult:
+    conversation_id: UUID
+    deleted: bool
+    deleted_attachment_count: int
+    cleanup_path_count: int
+
+
+@dataclass(frozen=True)
+class AttachmentCleanupOutboxRecord:
+    outbox_id: UUID
+    attachment_id: UUID
+    storage_relative_path: str
+    attempt_count: int
+
+
+def public_attachment_kind(parser_kind: Optional[str]) -> str:
+    return {
+        "image": "image",
+        "pdf": "pdf",
+        "docx": "document",
+        "pptx": "presentation",
+        "xlsx": "spreadsheet",
+        "csv": "text",
+        "txt": "text",
+        "md": "text",
+    }.get(str(parser_kind or ""), "file")
+
+
+def load_public_attachments_for_turns(
+    conn: object,
+    turn_ids: Sequence[UUID],
+) -> dict[str, list[dict[str, object]]]:
+    ordered_turn_ids = [UUID(str(turn_id)) for turn_id in turn_ids]
+    if not ordered_turn_ids:
+        return {}
+    rows = conn.execute(
+        """
+        SELECT ata.turn_id, ata.ordinal, attachment.id, attachment.safe_filename,
+               attachment.detected_mime_type, attachment.declared_mime_type,
+               attachment.byte_size, attachment.status, attachment.lifecycle,
+               attachment.parser_kind
+        FROM assistant_turn_attachments ata
+        JOIN chat_attachments attachment ON attachment.id = ata.attachment_id
+        WHERE ata.turn_id = ANY(%s)
+        ORDER BY ata.turn_id, ata.ordinal
+        """,
+        (ordered_turn_ids,),
+    ).fetchall()
+    result: dict[str, list[dict[str, object]]] = {}
+    for row in rows:
+        turn_id = str(row[0])
+        attachment_id = str(row[2])
+        parser_kind = str(row[9] or "")
+        result.setdefault(turn_id, []).append(
+            {
+                "attachment_id": attachment_id,
+                "filename": str(row[3]),
+                "mime_type": str(row[4] or row[5] or "application/octet-stream"),
+                "byte_size": int(row[6] or 0),
+                "status": str(row[7]),
+                "kind": public_attachment_kind(parser_kind),
+                "preview_url": (
+                    f"/api/chat/attachments/{attachment_id}/preview"
+                    if parser_kind == "image" and str(row[7]) == "ready"
+                    else None
+                ),
+                "content_url": f"/api/chat/attachments/{attachment_id}/content",
+            }
+        )
+    return result
+
+
+def load_retryable_user_turn(conn: object, user_turn_id: UUID) -> Optional[RetryableUserTurn]:
+    normalized_turn_id = UUID(str(user_turn_id))
+    row = conn.execute(
+        """
+        SELECT id, conversation_id, role, content, event_id, created_at
+        FROM assistant_turns
+        WHERE id = %s AND role = 'user'
+        FOR UPDATE
+        """,
+        (normalized_turn_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    attachments = load_public_attachments_for_turns(conn, [normalized_turn_id]).get(
+        str(normalized_turn_id),
+        [],
+    )
+    return RetryableUserTurn(
+        user_turn_id=UUID(str(row[0])),
+        conversation_id=UUID(str(row[1])),
+        content=str(row[3]),
+        event_id=UUID(str(row[4])),
+        created_at=row[5],
+        attachments=tuple(attachments),
+    )
+
+
+def _validated_cleanup_path(value: object) -> str:
+    text = str(value or "").strip().replace("\\", "/")
+    path = PurePosixPath(text)
+    if not text or path.is_absolute() or ".." in path.parts:
+        raise ValueError("invalid_attachment_cleanup_path")
+    return path.as_posix()
+
+
+def delete_conversation_with_attachment_cleanup(
+    conn: object,
+    conversation_id: UUID,
+) -> ConversationDeletionResult:
+    normalized_conversation_id = UUID(str(conversation_id))
+    conversation = conn.execute(
+        """
+        SELECT c.id
+        FROM assistant_conversations c
+        WHERE c.id = %s
+        FOR UPDATE
+        """,
+        (normalized_conversation_id,),
+    ).fetchone()
+    if conversation is None:
+        return ConversationDeletionResult(
+            conversation_id=normalized_conversation_id,
+            deleted=False,
+            deleted_attachment_count=0,
+            cleanup_path_count=0,
+        )
+    attachment_rows = conn.execute(
+        """
+        SELECT attachment.id
+        FROM chat_attachments attachment
+        WHERE attachment.id IN (
+          SELECT relation.attachment_id
+          FROM assistant_turn_attachments relation
+          JOIN assistant_turns turn_row ON turn_row.id = relation.turn_id
+          WHERE turn_row.conversation_id = %s
+        )
+        ORDER BY attachment.id
+        FOR UPDATE
+        """,
+        (normalized_conversation_id,),
+    ).fetchall()
+    attachment_ids = [UUID(str(row[0])) for row in attachment_rows]
+    rows = conn.execute(
+        """
+        SELECT DISTINCT files.attachment_id, files.storage_relative_path
+        FROM (
+          SELECT attachment.id AS attachment_id, attachment.storage_relative_path
+          FROM assistant_turn_attachments relation
+          JOIN assistant_turns turn_row ON turn_row.id = relation.turn_id
+          JOIN chat_attachments attachment ON attachment.id = relation.attachment_id
+          WHERE turn_row.conversation_id = %s
+          UNION ALL
+          SELECT attachment.id AS attachment_id, derivative.storage_relative_path
+          FROM assistant_turn_attachments relation
+          JOIN assistant_turns turn_row ON turn_row.id = relation.turn_id
+          JOIN chat_attachments attachment ON attachment.id = relation.attachment_id
+          JOIN chat_attachment_derivatives derivative ON derivative.attachment_id = attachment.id
+          WHERE turn_row.conversation_id = %s
+            AND derivative.storage_relative_path IS NOT NULL
+        ) files
+        WHERE files.storage_relative_path IS NOT NULL
+        ORDER BY files.attachment_id, files.storage_relative_path
+        """,
+        (normalized_conversation_id, normalized_conversation_id),
+    ).fetchall()
+    cleanup_items = [
+        (UUID(str(attachment_id)), _validated_cleanup_path(storage_relative_path))
+        for attachment_id, storage_relative_path in rows
+    ]
+    for attachment_id, storage_relative_path in cleanup_items:
+        conn.execute(
+            """
+            INSERT INTO attachment_cleanup_outbox
+              (id, attachment_id, storage_relative_path, reason, status)
+            VALUES (%s, %s, %s, 'conversation_deleted', 'pending')
+            ON CONFLICT (attachment_id, storage_relative_path) DO NOTHING
+            """,
+            (uuid4(), attachment_id, storage_relative_path),
+        )
+    deleted_attachment_count = 0
+    if attachment_ids:
+        deleted_attachment_count = int(
+            conn.execute(
+                "DELETE FROM chat_attachments WHERE id = ANY(%s)",
+                (attachment_ids,),
+            ).rowcount
+            or 0
+        )
+    deleted_row = conn.execute(
+        "DELETE FROM assistant_conversations WHERE id = %s RETURNING id",
+        (normalized_conversation_id,),
+    ).fetchone()
+    return ConversationDeletionResult(
+        conversation_id=normalized_conversation_id,
+        deleted=deleted_row is not None,
+        deleted_attachment_count=deleted_attachment_count,
+        cleanup_path_count=len(cleanup_items),
+    )
 
 
 class AttachmentRepository(Protocol):
@@ -121,6 +335,26 @@ class AttachmentRepository(Protocol):
         kind: str,
         processing_version: str,
     ) -> Optional[AttachmentDerivativeRecord]:
+        ...
+
+    def claim_cleanup_outbox(
+        self,
+        *,
+        now: datetime,
+        lease_seconds: int,
+    ) -> Optional[AttachmentCleanupOutboxRecord]:
+        ...
+
+    def complete_cleanup_outbox(self, outbox_id: UUID, *, completed_at: datetime) -> None:
+        ...
+
+    def retry_cleanup_outbox(
+        self,
+        outbox_id: UUID,
+        *,
+        available_at: datetime,
+        error_code: str,
+    ) -> None:
         ...
 
 
@@ -770,6 +1004,73 @@ class PostgresAttachmentRepository:
         paths.extend(row[0] for row in derivatives if row and row[0])
         return tuple(dict.fromkeys(paths))
 
+    def claim_cleanup_outbox(
+        self,
+        *,
+        now: datetime,
+        lease_seconds: int,
+    ) -> Optional[AttachmentCleanupOutboxRecord]:
+        lease_until = now + timedelta(seconds=max(1, int(lease_seconds)))
+        with self.connection_factory() as connection:
+            row = connection.execute(
+                """
+                WITH candidate AS (
+                  SELECT id
+                  FROM attachment_cleanup_outbox
+                  WHERE status IN ('pending', 'processing')
+                    AND available_at <= %s
+                  ORDER BY created_at, id
+                  FOR UPDATE SKIP LOCKED
+                  LIMIT 1
+                )
+                UPDATE attachment_cleanup_outbox outbox
+                SET status = 'processing', attempt_count = outbox.attempt_count + 1,
+                    available_at = %s, error_code = NULL
+                FROM candidate
+                WHERE outbox.id = candidate.id
+                RETURNING outbox.id, outbox.attachment_id,
+                          outbox.storage_relative_path, outbox.attempt_count
+                """,
+                (now, lease_until),
+            ).fetchone()
+        if row is None:
+            return None
+        return AttachmentCleanupOutboxRecord(
+            outbox_id=UUID(str(row[0])),
+            attachment_id=UUID(str(row[1])),
+            storage_relative_path=str(row[2]),
+            attempt_count=int(row[3] or 0),
+        )
+
+    def complete_cleanup_outbox(self, outbox_id: UUID, *, completed_at: datetime) -> None:
+        with self.connection_factory() as connection:
+            connection.execute(
+                """
+                UPDATE attachment_cleanup_outbox
+                SET status = 'completed', completed_at = %s,
+                    available_at = %s, error_code = NULL
+                WHERE id = %s AND status = 'processing'
+                """,
+                (completed_at, completed_at, outbox_id),
+            )
+
+    def retry_cleanup_outbox(
+        self,
+        outbox_id: UUID,
+        *,
+        available_at: datetime,
+        error_code: str,
+    ) -> None:
+        with self.connection_factory() as connection:
+            connection.execute(
+                """
+                UPDATE attachment_cleanup_outbox
+                SET status = 'pending', available_at = %s, error_code = %s
+                WHERE id = %s AND status = 'processing'
+                """,
+                (available_at, str(error_code)[:120], outbox_id),
+            )
+
     def get_derivative(
         self,
         attachment_id: UUID,
@@ -803,9 +1104,16 @@ class PostgresAttachmentRepository:
 
 
 __all__ = [
+    "AttachmentCleanupOutboxRecord",
     "AttachmentDerivativeRecord",
     "AttachmentRecord",
     "AttachmentRepository",
+    "ConversationDeletionResult",
     "InMemoryAttachmentRepository",
     "PostgresAttachmentRepository",
+    "RetryableUserTurn",
+    "delete_conversation_with_attachment_cleanup",
+    "load_public_attachments_for_turns",
+    "load_retryable_user_turn",
+    "public_attachment_kind",
 ]

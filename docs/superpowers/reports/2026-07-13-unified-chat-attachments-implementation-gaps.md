@@ -25,6 +25,10 @@
 | Task 7 附件聚焦测试 | `python3 -m pytest -q runtime_api/tests/test_attachment_*.py` | 通过，118 tests | 17 条绑定测试覆盖纯附件、混合输入、顺序、总量、状态、非法 ID、回滚、并发和请求复用 |
 | Task 7 传输一致性测试 | `python3 -m pytest -q runtime_api/tests/test_attachment_chat_binding.py runtime_api/tests/test_realtime_ws.py -k attachment` | 通过，20 tests | HTTP/WS 传递相同有序附件集合，返回相同安全错误码 |
 | Task 7 隔离暂存快照 | `git checkout-index` 后运行附件测试与后端全量测试 | 附件 20 tests 通过；全量 2 failed、796 passed | 两个失败为 `test_chat_response_uses_explicit_memory_layer_fetchers` 和 `test_context_pack_pipeline_retrieves_local_memory_agenda_and_turns`；Task 7 前 `HEAD` 快照同样为这两个失败（2 failed、776 passed），确认不是附件提交引入。当前脏工作区的既有上下文改动下后端全量为 1015 passed，不能将那些无关改动混入本检查点 |
+| Task 8 聚焦测试 | `python3 -m pytest -q runtime_api/tests/test_attachment_history_and_retry.py runtime_api/tests/test_context_pack_and_chat.py -k 'history or retry or conversation_deletion or outbox'` | 通过，11 tests | 核对批量历史元数据、稳定消息 ID、只装饰用户消息、失败后原 user turn 保留、幂等重试、会话删除与 outbox |
+| Task 8 schema/worker 组合测试 | `python3 -m pytest -q runtime_api/tests/test_attachment_history_and_retry.py runtime_api/tests/test_attachment_worker.py runtime_api/tests/test_attachment_schema.py` | 通过，26 tests | 核对 cleanup outbox fresh/runtime schema、租约领取、物理删除完成和失败重排 |
+| Task 8 当前工作区后端全量 | `python3 -m pytest -q runtime_api/tests` | 通过，1025 tests | 在包含既有 OpenCode、Web Search、Android 等未提交改动的当前工作区执行；提交前另做隔离暂存快照 |
+| Task 8 隔离暂存快照 | `git checkout-index` 后运行 Task 8 聚焦测试与后端全量测试 | 聚焦 11 tests 通过；全量 2 failed、806 passed | 两个失败仍为 `test_chat_response_uses_explicit_memory_layer_fetchers` 和 `test_context_pack_pipeline_retrieves_local_memory_agenda_and_turns`，与 Task 7 前后的暂存 `HEAD` 基线相同；Task 8 新增行为均通过 |
 | 工作区 | `git status --short` | 脏工作区 | 存在既有 OpenCode、Web Search、Android 等改动；不得重置或整体暂存 |
 
 ## 规格覆盖状态
@@ -40,7 +44,7 @@
 | 有界异步解析 Worker | 代码与自动化完成，未部署 | `test_attachment_worker.py` 14 条用例验证版本去重、stale-version 隔离、状态迁移、分类并发、超时、安全失败、租约/崩溃恢复、可重试两阶段清理、孤儿临时文件及 attached 排除；Compose 约束 CPU 0.75、内存 768MB、非 root、只读根目录和共享私有卷 | 无 | Redis/PostgreSQL 真实进程与资源峰值尚未验收 | 云环境部署待 Task 16 | Task 16、17 |
 | 图片/PDF/Office/表格/文本解析 | 轻量解析与语义自动化完成，未部署 | 14 组 parser 测试验证 EXIF 旋转、GIF 去重帧、数字/扫描 PDF 与按页渲染、DOCX 标题/表格/链接、31 张 PPTX 备注、XLSX 公式+缓存值、长 CSV、UTF-8/GB18030、Markdown 代码块；worker 在同一 DB 事务保存 manifest/chunks/derivatives 后才置 ready | 无 | Office 版式渲染、图表视觉理解和 visual-result 的生产缓存读写随 Task 9/10 接入；尚无云端真实性能数据 | 无 | Task 9、10、16、17 |
 | 消息原子绑定和幂等 | 代码与自动化完成，未部署 | 同一事务 `FOR UPDATE` 锁定草稿，完整校验后写 user turn、有序关系并置为 attached；非法集合零写入；并发同草稿仅一个成功；相同 `client_request_id` 复用原 turn，载荷变化返回 409；HTTP/WS 错误码一致 | 无 | 尚未在真实 PostgreSQL 隔离级别、Redis 和双客户端并发下验收 | 云环境部署待 Task 16 | Task 16、17 |
-| 历史、失败重试和会话删除 | 未开始 | 无 | 无 | 历史无附件，失败重试未复用 user turn | 无 | Task 8 |
+| 历史、失败重试和会话删除 | 代码与自动化完成，未部署 | 历史按本批 user turn 一次查询有序附件元数据；assistant 消息不输出空附件；重试复用原 user turn 和附件绑定并以稳定 key 防重复；删除在数据库事务内先写相对路径 outbox，再级联删除，worker 租约消费且失败退避重排；Task 8 聚焦 11 tests、组合 26 tests、当前工作区全量 1025 tests 通过 | 无 | 重试当前只重建原消息和附件元数据；附件正文/视觉证据选择由 Task 9 接入。真实 PostgreSQL outbox、worker 崩溃恢复和客户端重试尚未验收 | 云环境部署待 Task 16 | Task 9、16、17 |
 | 全文/混合检索/逐页检查 | 未开始 | 无 | 无 | 附件证据不进入上下文 | 无 | Task 9 |
 | 视觉升级和最多 6 项限制 | 未开始 | 无 | 无 | 未选择和渲染视觉证据 | 无 | Task 9、10 |
 | 256K 上下文与附件 64K 配额 | 未开始 | 无 | 无 | 没有附件预算与排除 trace | 无 | Task 9 |

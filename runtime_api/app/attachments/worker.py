@@ -241,6 +241,46 @@ class AttachmentWorker:
         return WorkerRunResult(final.attachment_id, final.status, parse_result=persisted_result)
 
 
+class AttachmentOutboxCleaner:
+    def __init__(
+        self,
+        *,
+        repository: AttachmentRepository,
+        storage_root: Path,
+        lease_seconds: int = 120,
+    ) -> None:
+        self.repository = repository
+        self.storage_root = Path(storage_root)
+        self.lease_seconds = max(1, int(lease_seconds))
+
+    def run_next(self, *, now: Optional[datetime] = None) -> Optional[str]:
+        active_now = now or datetime.now(timezone.utc)
+        item = self.repository.claim_cleanup_outbox(
+            now=active_now,
+            lease_seconds=self.lease_seconds,
+        )
+        if item is None:
+            return None
+        try:
+            resolve_storage_path(
+                self.storage_root,
+                item.storage_relative_path,
+            ).unlink(missing_ok=True)
+        except (AttachmentRejected, OSError):
+            retry_delay = min(3600, 2 ** min(max(1, item.attempt_count), 10))
+            self.repository.retry_cleanup_outbox(
+                item.outbox_id,
+                available_at=active_now + timedelta(seconds=retry_delay),
+                error_code="physical_delete_failed",
+            )
+            return "retry_scheduled"
+        self.repository.complete_cleanup_outbox(
+            item.outbox_id,
+            completed_at=active_now,
+        )
+        return "completed"
+
+
 class DraftCleaner:
     def __init__(
         self,
@@ -295,6 +335,7 @@ class DraftCleaner:
 
 
 __all__ = [
+    "AttachmentOutboxCleaner",
     "AttachmentParser",
     "AttachmentWorker",
     "AttachmentWorkerConfig",

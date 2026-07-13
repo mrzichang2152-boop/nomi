@@ -13,7 +13,13 @@ import redis
 from app.attachments.queue import RedisAttachmentQueue
 from app.attachments.repository import PostgresAttachmentRepository
 from app.attachments.schema import ensure_attachment_schema
-from app.attachments.worker import AttachmentParser, AttachmentWorker, AttachmentWorkerConfig, DraftCleaner
+from app.attachments.worker import (
+    AttachmentOutboxCleaner,
+    AttachmentParser,
+    AttachmentWorker,
+    AttachmentWorkerConfig,
+    DraftCleaner,
+)
 
 
 def _connection_factory():
@@ -44,6 +50,7 @@ def run() -> None:
     redis_client = redis.Redis.from_url(os.environ["REDIS_URL"], decode_responses=True)
     queue = RedisAttachmentQueue(redis_client)
     cleaner = DraftCleaner(repository=repository, storage_root=storage_root)
+    outbox_cleaner = AttachmentOutboxCleaner(repository=repository, storage_root=storage_root)
 
     parser = _load_parser()
     if parser is None:
@@ -75,10 +82,22 @@ def run() -> None:
         queue.recover_expired()
         if now_monotonic - last_cleanup >= cleanup_interval:
             report = cleaner.cleanup()
+            outbox_completed = 0
+            outbox_retried = 0
+            for _ in range(100):
+                outbox_status = outbox_cleaner.run_next()
+                if outbox_status is None:
+                    break
+                if outbox_status == "completed":
+                    outbox_completed += 1
+                elif outbox_status == "retry_scheduled":
+                    outbox_retried += 1
             _event(
                 "attachment_cleanup_finished",
                 deleted_count=len(report.deleted_attachment_ids),
                 removed_orphan_parts=report.removed_orphan_parts,
+                outbox_completed=outbox_completed,
+                outbox_retried=outbox_retried,
             )
             last_cleanup = now_monotonic
         result = worker.run_next()
