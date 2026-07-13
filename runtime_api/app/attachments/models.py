@@ -38,6 +38,37 @@ class AttachmentErrorCode(str, Enum):
     ATTACHMENT_ALREADY_ATTACHED = "attachment_already_attached"
 
 
+SAFE_ATTACHMENT_ERROR_MESSAGES: dict[AttachmentErrorCode, str] = {
+    AttachmentErrorCode.UNSUPPORTED_TYPE: "暂不支持这种文件格式。",
+    AttachmentErrorCode.TOO_LARGE: "文件大小超过允许上限。",
+    AttachmentErrorCode.COMPLEXITY_LIMIT: "文件结构过于复杂，无法安全处理。",
+    AttachmentErrorCode.ENCRYPTED: "文件已加密，暂时无法读取。",
+    AttachmentErrorCode.CORRUPT: "文件已损坏或内容不完整。",
+    AttachmentErrorCode.STORAGE_FAILED: "文件存储失败，请重试。",
+    AttachmentErrorCode.PARSE_FAILED: "文件内容解析失败。",
+    AttachmentErrorCode.PARSE_TIMEOUT: "文件处理超时，请重试。",
+    AttachmentErrorCode.VISION_UNAVAILABLE: "图片理解服务暂时不可用。",
+    AttachmentErrorCode.ATTACHMENT_NOT_READY: "文件仍在处理中，请稍后重试。",
+    AttachmentErrorCode.ATTACHMENT_EXPIRED: "文件草稿已过期，请重新上传。",
+    AttachmentErrorCode.ATTACHMENT_ALREADY_ATTACHED: "文件已经发送，不能重复使用。",
+}
+
+
+class AttachmentRejected(ValueError):
+    def __init__(
+        self,
+        code: Union[AttachmentErrorCode, str],
+        *,
+        safe_message: Optional[str] = None,
+        internal_detail: Optional[str] = None,
+    ) -> None:
+        normalized_code = AttachmentErrorCode(code)
+        self.code = normalized_code.value
+        self.safe_message = safe_message or SAFE_ATTACHMENT_ERROR_MESSAGES[normalized_code]
+        self.internal_detail = internal_detail
+        super().__init__(self.safe_message)
+
+
 ALLOWED_TRANSITIONS: dict[AttachmentStatus, frozenset[AttachmentStatus]] = {
     AttachmentStatus.RECEIVING: frozenset(
         {AttachmentStatus.STORED, AttachmentStatus.REJECTED, AttachmentStatus.FAILED}

@@ -13,3 +13,8 @@ websockets==13.1
 python-docx==1.1.2
 pypdf==5.1.0
 h2==4.1.0
+python-multipart==0.0.20
+Pillow==11.3.0
+pypdfium2==5.3.0
+openpyxl==3.1.2
+charset-normalizer==3.4.4
