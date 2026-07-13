@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import threading
 import uuid
@@ -7,7 +8,7 @@ from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Optional, Protocol
+from typing import Any, Callable, Optional, Protocol
 from uuid import UUID
 
 from app.attachments.models import (
@@ -19,6 +20,8 @@ from app.attachments.parsers.common import ParseResult, ParsedDerivative
 from app.attachments.queue import QueueItem
 from app.attachments.repository import AttachmentRecord, AttachmentRepository
 from app.attachments.storage import resolve_storage_path
+from app.attachments.retrieval import process_full_inspection_batch
+from app.attachments.citations import citation_label
 
 
 @dataclass(frozen=True)
@@ -32,6 +35,215 @@ class WorkerRunResult:
 class CleanupReport:
     deleted_attachment_ids: list[UUID]
     removed_orphan_parts: int
+
+
+@dataclass(frozen=True)
+class ClaimedFullInspectionBatch:
+    task_run_id: str
+    task_step_id: str
+    batch_index: int
+    payload: dict[str, object]
+
+
+@dataclass(frozen=True)
+class FullInspectionWorkerResult:
+    task_run_id: str
+    task_step_id: str
+    status: str
+    coverage_status: str
+    progress: dict[str, int]
+
+
+class FullInspectionRepository(Protocol):
+    def claim_next(self, worker_id: str, lease_seconds: int) -> Optional[ClaimedFullInspectionBatch]:
+        ...
+
+    def persist_progress(
+        self,
+        claim: ClaimedFullInspectionBatch,
+        updated_payload: dict[str, object],
+    ) -> None:
+        ...
+
+
+class AttachmentFullInspectionWorker:
+    def __init__(
+        self,
+        *,
+        repository: FullInspectionRepository,
+        inspector: Callable[[dict[str, object]], dict[str, object]],
+        worker_id: str,
+        lease_seconds: int = 180,
+    ) -> None:
+        self.repository = repository
+        self.inspector = inspector
+        self.worker_id = str(worker_id)
+        self.lease_seconds = max(1, int(lease_seconds))
+
+    def run_next(self) -> Optional[FullInspectionWorkerResult]:
+        claim = self.repository.claim_next(self.worker_id, self.lease_seconds)
+        if claim is None:
+            return None
+        updated = process_full_inspection_batch(
+            claim.payload,
+            self.inspector,
+            batch_index=claim.batch_index,
+        )
+        self.repository.persist_progress(claim, updated)
+        progress = updated.get("progress") if isinstance(updated.get("progress"), dict) else {}
+        return FullInspectionWorkerResult(
+            task_run_id=claim.task_run_id,
+            task_step_id=claim.task_step_id,
+            status=str(updated.get("status") or "running"),
+            coverage_status=str(updated.get("coverage_status") or "running"),
+            progress={str(key): int(value or 0) for key, value in progress.items()},
+        )
+
+
+class PostgresFullInspectionRepository:
+    def __init__(self, connection_factory: Callable[[], Any]) -> None:
+        self.connection_factory = connection_factory
+
+    def claim_next(self, worker_id: str, lease_seconds: int) -> Optional[ClaimedFullInspectionBatch]:
+        with self.connection_factory() as conn:
+            row = conn.execute(
+                """
+                SELECT task.task_run_id, task.payload, step.task_step_id, step.step_order
+                FROM task_runs task
+                JOIN task_steps step ON step.task_run_id = task.task_run_id
+                WHERE task.task_type = 'attachment_full_inspection'
+                  AND task.status IN ('queued', 'running')
+                  AND (
+                    step.status = 'queued'
+                    OR (step.status = 'running' AND step.lease_expires_at < now())
+                  )
+                ORDER BY task.created_at ASC, step.step_order ASC
+                FOR UPDATE OF step SKIP LOCKED
+                LIMIT 1
+                """
+            ).fetchone()
+            if row is None:
+                return None
+            task_run_id = str(row[0])
+            payload = row[1] if isinstance(row[1], dict) else {}
+            task_step_id = str(row[2])
+            batch_index = int(row[3] or 0)
+            conn.execute(
+                """
+                UPDATE task_steps
+                SET status = 'running', lease_owner = %s,
+                    lease_expires_at = now() + (%s * interval '1 second'),
+                    attempt_count = attempt_count + 1, updated_at = now()
+                WHERE task_step_id = %s
+                """,
+                (str(worker_id), max(1, int(lease_seconds)), task_step_id),
+            )
+            conn.execute(
+                """
+                UPDATE task_runs
+                SET status = 'running', updated_at = now()
+                WHERE task_run_id = %s
+                """,
+                (task_run_id,),
+            )
+        return ClaimedFullInspectionBatch(
+            task_run_id=task_run_id,
+            task_step_id=task_step_id,
+            batch_index=batch_index,
+            payload=dict(payload),
+        )
+
+    def persist_progress(
+        self,
+        claim: ClaimedFullInspectionBatch,
+        updated_payload: dict[str, object],
+    ) -> None:
+        task_status = str(updated_payload.get("status") or "running")
+        final_summary = str(updated_payload.get("final_summary") or "")
+        completed = [
+            item
+            for item in (updated_payload.get("completed_locators") or [])
+            if isinstance(item, dict)
+        ]
+        failed = [
+            item
+            for item in (updated_payload.get("failed_locators") or [])
+            if isinstance(item, dict)
+        ]
+        batch_output = {
+            "batch_index": claim.batch_index,
+            "progress": updated_payload.get("progress") or {},
+            "completed_locators": [item for item in completed if item.get("output")],
+            "failed_locators": [item for item in failed if item.get("error")],
+            "coverage_status": updated_payload.get("coverage_status") or "running",
+        }
+        with self.connection_factory() as conn:
+            conn.execute(
+                """
+                UPDATE task_steps
+                SET status = 'completed', output_json = %s::jsonb,
+                    reasoning_summary = %s, error_type = '',
+                    lease_owner = '', lease_expires_at = NULL, updated_at = now()
+                WHERE task_step_id = %s AND task_run_id = %s
+                """,
+                (
+                    json.dumps(batch_output, ensure_ascii=False, default=str),
+                    f"检查批次 {claim.batch_index + 1} 已完成。",
+                    claim.task_step_id,
+                    claim.task_run_id,
+                ),
+            )
+            conn.execute(
+                """
+                UPDATE task_runs
+                SET status = %s, payload = %s::jsonb,
+                    final_user_visible_summary = %s, updated_at = now()
+                WHERE task_run_id = %s
+                """,
+                (
+                    task_status,
+                    json.dumps(updated_payload, ensure_ascii=False, default=str),
+                    final_summary or "正在逐页检查附件。",
+                    claim.task_run_id,
+                ),
+            )
+
+
+class DatabaseAttachmentLocatorInspector:
+    def __init__(self, connection_factory: Callable[[], Any]) -> None:
+        self.connection_factory = connection_factory
+
+    def __call__(self, locator_item: dict[str, object]) -> dict[str, object]:
+        attachment_id = UUID(str(locator_item.get("attachment_id") or ""))
+        locator = locator_item.get("locator") if isinstance(locator_item.get("locator"), dict) else {}
+        with self.connection_factory() as conn:
+            row = conn.execute(
+                """
+                SELECT chunk.text, chunk.locator, attachment.parser_kind, attachment.safe_filename
+                FROM chat_attachment_chunks chunk
+                JOIN chat_attachments attachment ON attachment.id = chunk.attachment_id
+                WHERE chunk.attachment_id = %s
+                  AND chunk.processing_version = attachment.processing_version
+                  AND chunk.locator = %s::jsonb
+                  AND attachment.status = 'ready'
+                  AND attachment.lifecycle = 'attached'
+                LIMIT 1
+                """,
+                (attachment_id, json.dumps(locator, ensure_ascii=False, default=str)),
+            ).fetchone()
+        if row is None:
+            raise LookupError("attachment_locator_not_found")
+        content = str(row[0] or "").strip()
+        if not content:
+            raise ValueError("attachment_locator_has_no_text")
+        stored_locator = row[1] if isinstance(row[1], dict) else dict(locator)
+        kind = str(row[2] or locator_item.get("kind") or "file")
+        filename = str(row[3] or locator_item.get("filename") or "附件")
+        return {
+            "content": content,
+            "locator": stored_locator,
+            "citation_label": citation_label(filename, kind, stored_locator),
+        }
 
 
 @dataclass(frozen=True)

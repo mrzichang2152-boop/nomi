@@ -29,6 +29,12 @@
 | Task 8 schema/worker 组合测试 | `python3 -m pytest -q runtime_api/tests/test_attachment_history_and_retry.py runtime_api/tests/test_attachment_worker.py runtime_api/tests/test_attachment_schema.py` | 通过，26 tests | 核对 cleanup outbox fresh/runtime schema、租约领取、物理删除完成和失败重排 |
 | Task 8 当前工作区后端全量 | `python3 -m pytest -q runtime_api/tests` | 通过，1025 tests | 在包含既有 OpenCode、Web Search、Android 等未提交改动的当前工作区执行；提交前另做隔离暂存快照 |
 | Task 8 隔离暂存快照 | `git checkout-index` 后运行 Task 8 聚焦测试与后端全量测试 | 聚焦 11 tests 通过；全量 2 failed、806 passed | 两个失败仍为 `test_chat_response_uses_explicit_memory_layer_fetchers` 和 `test_context_pack_pipeline_retrieves_local_memory_agenda_and_turns`，与 Task 7 前后的暂存 `HEAD` 基线相同；Task 8 新增行为均通过 |
+| Task 9 附件检索与聊天接线 | `python3 -m pytest -q runtime_api/tests/test_attachment_chat_context.py runtime_api/tests/test_attachment_retrieval.py runtime_api/tests/test_chat_router.py runtime_api/tests/test_parallel_context_retrieval.py` | 通过，74 tests | 核对全文/混合证据规划、64K 配额、每附件最低配额、视觉升级、稳定 locator/citation、近 15 轮附件引用、并行 fetcher、逐页任务短路模型和引用白名单 |
+| Task 9 附件/聊天组合回归 | 附件 API、模型、存储、worker、parser、历史、检索、context、HTTP/WS 组合测试 | 通过，192 tests | 核对 Task 9 没有破坏既有上传、解析、历史、重试、上下文和实时链路 |
+| Task 9 当前工作区后端全量 | `python3 -m pytest -q runtime_api/tests` | 通过，1058 tests | 当前脏工作区完整回归；提交前仍需单独验证隔离暂存快照 |
+| Task 9 隔离检查点聚焦回归 | `python3 -m pytest -q runtime_api/tests/test_attachment_chat_context.py runtime_api/tests/test_attachment_retrieval.py runtime_api/tests/test_chat_router.py runtime_api/tests/test_parallel_context_retrieval.py` | 通过，69 tests | 在 Task 8 干净提交上只叠加 Task 9 代码执行；不依赖工作区中未提交的 Web Search/OpenCode 改动 |
+| Task 9 隔离检查点附件/聊天组合回归 | `python3 -m pytest -q runtime_api/tests/test_attachment*.py runtime_api/tests/test_chat_router.py runtime_api/tests/test_parallel_context_retrieval.py runtime_api/tests/test_context_pack_and_chat.py runtime_api/tests/test_realtime_ws.py` | 通过，278 tests | 上传、解析、生命周期、历史、HTTP/WS、上下文与新证据规划组合回归均通过 |
+| Task 9 隔离检查点后端全量 | `python3 -m pytest -q runtime_api/tests` | 2 failed、839 passed | 失败仍为 `test_chat_response_uses_explicit_memory_layer_fetchers` 与 `test_context_pack_pipeline_retrieves_local_memory_agenda_and_turns`，和 Task 7/8 隔离基线相同；Task 9 未新增失败 |
 | 工作区 | `git status --short` | 脏工作区 | 存在既有 OpenCode、Web Search、Android 等改动；不得重置或整体暂存 |
 
 ## 规格覆盖状态
@@ -45,11 +51,11 @@
 | 图片/PDF/Office/表格/文本解析 | 轻量解析与语义自动化完成，未部署 | 14 组 parser 测试验证 EXIF 旋转、GIF 去重帧、数字/扫描 PDF 与按页渲染、DOCX 标题/表格/链接、31 张 PPTX 备注、XLSX 公式+缓存值、长 CSV、UTF-8/GB18030、Markdown 代码块；worker 在同一 DB 事务保存 manifest/chunks/derivatives 后才置 ready | 无 | Office 版式渲染、图表视觉理解和 visual-result 的生产缓存读写随 Task 9/10 接入；尚无云端真实性能数据 | 无 | Task 9、10、16、17 |
 | 消息原子绑定和幂等 | 代码与自动化完成，未部署 | 同一事务 `FOR UPDATE` 锁定草稿，完整校验后写 user turn、有序关系并置为 attached；非法集合零写入；并发同草稿仅一个成功；相同 `client_request_id` 复用原 turn，载荷变化返回 409；HTTP/WS 错误码一致 | 无 | 尚未在真实 PostgreSQL 隔离级别、Redis 和双客户端并发下验收 | 云环境部署待 Task 16 | Task 16、17 |
 | 历史、失败重试和会话删除 | 代码与自动化完成，未部署 | 历史按本批 user turn 一次查询有序附件元数据；assistant 消息不输出空附件；重试复用原 user turn 和附件绑定并以稳定 key 防重复；删除在数据库事务内先写相对路径 outbox，再级联删除，worker 租约消费且失败退避重排；Task 8 聚焦 11 tests、组合 26 tests、当前工作区全量 1025 tests 通过 | 无 | 重试当前只重建原消息和附件元数据；附件正文/视觉证据选择由 Task 9 接入。真实 PostgreSQL outbox、worker 崩溃恢复和客户端重试尚未验收 | 云环境部署待 Task 16 | Task 9、16、17 |
-| 全文/混合检索/逐页检查 | 未开始 | 无 | 无 | 附件证据不进入上下文 | 无 | Task 9 |
-| 视觉升级和最多 6 项限制 | 未开始 | 无 | 无 | 未选择和渲染视觉证据 | 无 | Task 9、10 |
-| 256K 上下文与附件 64K 配额 | 未开始 | 无 | 无 | 没有附件预算与排除 trace | 无 | Task 9 |
+| 全文/混合检索/逐页检查 | 代码与自动化完成，未部署 | 小附件全文、PDF>20/PPTX>30 或 >24K 混合检索；按附件最低配额后全局重排；显式逐页请求持久化 `attachment_full_inspection`，worker 用 lease 和 `SKIP LOCKED` 分批推进，终态明确失败/未处理 locator；真实 `/api/chat` 已接并行附件 fetcher | 无 | 尚未在真实 PostgreSQL/Redis 跑逐页任务、观察崩溃恢复和客户端任务轮询 | 云环境部署待 Task 16 | Task 10、16、17 |
+| 视觉升级和最多 6 项限制 | 证据选择代码与自动化完成，模型视觉调用未开始 | 低文本密度、图片/图表、视觉问题和文本不足会进入 visual evidence；稳定排序且最多 6 项，超限写 `visual_limit` exclusion | 无 | Task 10 尚未把私有衍生图像编码成 Qwen 结构化 `image_url` 请求，也未做真实视觉理解 | 无 | Task 10、16、17 |
+| 256K 上下文与附件 64K 配额 | 代码与自动化完成，未部署 | attachment section 独立上限 64K，并受 256K 总预算、已保留上下文和输出预算共同限制；保留既有最近 15 轮上下文；排除原因进入 evidence plan | 无 | 尚未用真实长 PDF/PPTX 测 token 估算、首 token 和内存峰值 | 云环境部署待 Task 16 | Task 10、16、17 |
 | Qwen 结构化多模态与非 thinking | 未开始 | 无 | 无 | 当前消息 content 会被字符串化 | 无 | Task 10 |
-| 稳定引用与覆盖声明 | 未开始 | 无 | 无 | 回答无法证明读取位置 | 无 | Task 9、17 |
+| 稳定引用与覆盖声明 | 代码与自动化完成，未部署 | PDF 页、PPTX 张、DOCX 章节、XLSX sheet/range、图片和文本行号有稳定 label；答案只能引用本轮选中 label，未选页引用会被移除并产生 validation trace；partial coverage 明确未覆盖位置 | 无 | 尚未用真实 Qwen 输出验证引用服从率；逐页终态摘要尚未在双客户端展示验收 | 云环境部署待 Task 16 | Task 10、16、17 |
 | 长期记忆来源 | 未开始 | 无 | 无 | 未保存 attachment/turn/locator/version 来源 | 无 | Task 15 |
 | Web 完整 App 交互 | 未开始 | 无 | 无 | 无选择器、托盘、状态卡和附件历史 | 无 | Task 11、12 |
 | Android 悬浮窗交互 | 未开始 | 无 | 无 | 无原生选择、流式上传和托盘 | 无 | Task 13 |

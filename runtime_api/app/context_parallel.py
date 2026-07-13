@@ -27,13 +27,14 @@ def retrieve_chat_context_parallel(route: ChatContextRoute, fetchers: Fetchers) 
         "agenda": route.needs_agenda,
         "tasks": route.needs_tasks,
         "external_tool_state": getattr(route, "needs_external_tool_state", False),
+        "attachments": getattr(route, "needs_attachments", False),
     }
     result: dict[str, Any] = {key: [] for key in enabled}
     latency: dict[str, int] = {f"{key}_ms": 0 for key in enabled}
     active = {key: fetchers[key] for key, should_run in enabled.items() if should_run and key in fetchers}
 
     if active:
-        with ThreadPoolExecutor(max_workers=min(9, len(active))) as executor:
+        with ThreadPoolExecutor(max_workers=min(10, len(active))) as executor:
             future_to_key = {}
             starts: dict[str, float] = {}
             for key, fetcher in active.items():

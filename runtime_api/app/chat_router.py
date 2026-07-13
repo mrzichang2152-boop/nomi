@@ -19,6 +19,7 @@ class ChatContextRoute:
     needs_memory_rag: bool = False
     needs_timeline: bool = False
     needs_external_tool_state: bool = False
+    needs_attachments: bool = False
     confidence: float = 1.0
     reason: str = ""
     entities: tuple[dict[str, Any], ...] = ()
@@ -55,6 +56,7 @@ class ChatContextRoute:
                 "agenda": self.needs_agenda,
                 "tasks": self.needs_tasks,
                 "external_tool_state": self.needs_external_tool_state,
+                "attachments": self.needs_attachments,
             },
             "entities": list(self.entities),
             "scope": dict(self.scope),
@@ -186,6 +188,7 @@ def _route_from_semantic_decision(decision: dict[str, Any]) -> ChatContextRoute 
         needs_memory_rag=bool(needs.get("memory_rag", False)),
         needs_timeline=bool(needs.get("timeline", False)),
         needs_external_tool_state=bool(needs.get("external_tool_state", False)),
+        needs_attachments=bool(needs.get("attachments", False)),
         confidence=confidence,
         reason=str(decision.get("reason") or "semantic_router"),
         entities=normalized_entities,

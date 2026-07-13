@@ -5,7 +5,7 @@ import os
 import socket
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import psycopg
 import redis
@@ -14,12 +14,16 @@ from app.attachments.queue import RedisAttachmentQueue
 from app.attachments.repository import PostgresAttachmentRepository
 from app.attachments.schema import ensure_attachment_schema
 from app.attachments.worker import (
+    AttachmentFullInspectionWorker,
     AttachmentOutboxCleaner,
     AttachmentParser,
     AttachmentWorker,
     AttachmentWorkerConfig,
+    DatabaseAttachmentLocatorInspector,
     DraftCleaner,
+    PostgresFullInspectionRepository,
 )
+from app.task_orchestrator import task_orchestrator_schema_sql
 
 
 def _connection_factory():
@@ -38,6 +42,19 @@ def _event(name: str, **details: object) -> None:
     print(json.dumps({"event": name, **details}, ensure_ascii=False, default=str), flush=True)
 
 
+def _ensure_task_schema() -> None:
+    with _connection_factory() as conn:
+        for statement in task_orchestrator_schema_sql():
+            conn.execute(statement)
+
+
+def run_worker_cycle(
+    attachment_worker: Any,
+    full_inspection_worker: Any,
+) -> tuple[Any, Any]:
+    return attachment_worker.run_next(), full_inspection_worker.run_next()
+
+
 def run() -> None:
     config = AttachmentWorkerConfig.from_env()
     storage_root = Path(os.getenv("NOMI_ATTACHMENT_ROOT", "/app/data/attachments"))
@@ -46,6 +63,7 @@ def run() -> None:
     worker_id = os.getenv("ATTACHMENT_WORKER_ID", f"{socket.gethostname()}:{os.getpid()}")
 
     ensure_attachment_schema(_connection_factory)
+    _ensure_task_schema()
     repository = PostgresAttachmentRepository(_connection_factory)
     redis_client = redis.Redis.from_url(os.environ["REDIS_URL"], decode_responses=True)
     queue = RedisAttachmentQueue(redis_client)
@@ -66,6 +84,12 @@ def run() -> None:
         parser=parser,
         config=config,
         worker_id=worker_id,
+    )
+    full_inspection_worker = AttachmentFullInspectionWorker(
+        repository=PostgresFullInspectionRepository(_connection_factory),
+        inspector=DatabaseAttachmentLocatorInspector(_connection_factory),
+        worker_id=f"{worker_id}:full-inspection",
+        lease_seconds=config.lease_seconds,
     )
     _event(
         "attachment_worker_started",
@@ -100,15 +124,25 @@ def run() -> None:
                 outbox_retried=outbox_retried,
             )
             last_cleanup = now_monotonic
-        result = worker.run_next()
-        if result is None:
+        result, inspection_result = run_worker_cycle(worker, full_inspection_worker)
+        if result is None and inspection_result is None:
             time.sleep(poll_seconds)
             continue
-        _event(
-            "attachment_job_finished",
-            attachment_id=result.attachment_id,
-            status=result.status,
-        )
+        if result is not None:
+            _event(
+                "attachment_job_finished",
+                attachment_id=result.attachment_id,
+                status=result.status,
+            )
+        if inspection_result is not None:
+            _event(
+                "attachment_full_inspection_batch_finished",
+                task_run_id=inspection_result.task_run_id,
+                task_step_id=inspection_result.task_step_id,
+                status=inspection_result.status,
+                coverage_status=inspection_result.coverage_status,
+                progress=inspection_result.progress,
+            )
 
 
 if __name__ == "__main__":
