@@ -40,7 +40,11 @@ from app.assistant_identity.registry import AssistantIdentityRegistry
 from app.assistant_identity.schema import assistant_identity_schema_sql
 from app.attachments.router import create_attachment_router
 from app.attachments.schema import attachment_schema_sql
-from app.attachments.service import RedisAttachmentQueue
+from app.attachments.service import (
+    AttachmentSubmissionError,
+    AttachmentSubmissionService,
+    RedisAttachmentQueue,
+)
 from app.assistant_memory import assistant_memory_schema_sql, build_session_search_context
 from app.artifact_tasks import artifact_label, artifact_task_answer, build_artifact_task_payload, route_artifact_task
 from app.auth import is_authorized
@@ -306,6 +310,7 @@ _ASSISTANT_OUTBOUND_PIPELINE = OutboundMessagePipeline()
 _ASSISTANT_IDENTITY_REGISTRY = AssistantIdentityRegistry()
 _ASSISTANT_INBOX_EVENTS: list[dict[str, Any]] = []
 _ASSISTANT_OUTBOUND_MESSAGES: list[dict[str, Any]] = []
+_ATTACHMENT_SUBMISSION_SERVICE = AttachmentSubmissionService()
 
 
 class EventIn(BaseModel):
@@ -339,7 +344,8 @@ class LoginIn(BaseModel):
 
 
 class ChatIn(BaseModel):
-    message: str = Field(min_length=1, max_length=50000)
+    message: str = Field(default="", max_length=50000)
+    attachment_ids: list[uuid.UUID] = Field(default_factory=list)
     limit: int = Field(default=12, ge=1, le=50)
     conversation_id: Optional[str] = None
     client_type: str = Field(default="web", max_length=40)
@@ -776,6 +782,10 @@ class RetrievalPlan:
 
 def db() -> psycopg.Connection:
     return psycopg.connect(DATABASE_URL)
+
+
+def attachment_submission_service() -> AttachmentSubmissionService:
+    return _ATTACHMENT_SUBMISSION_SERVICE
 
 
 def model_gateway():
@@ -14850,17 +14860,26 @@ async def chat(body: ChatIn, x_par_password: Optional[str] = Header(default=None
     total_start_ms = monotonic_ms()
     redis_obj = redis_client()
     initial_persist_start_ms = monotonic_ms()
-    with db() as conn:
-        user_turn = persist_assistant_turn(
-            conn,
-            redis_obj,
-            role="user",
-            content=body.message,
-            conversation_id=body.conversation_id,
-            client_type=body.client_type,
-            tool_call_id=assistant_turn_idempotency_key(body.client_request_id, "user"),
-        )
-        cached_assistant = find_cached_assistant_response(conn, body.client_request_id)
+    try:
+        with db() as conn:
+            user_turn = attachment_submission_service().submit_user_turn(
+                conn=conn,
+                redis_obj=redis_obj,
+                message=body.message,
+                attachment_ids=body.attachment_ids,
+                conversation_id=body.conversation_id,
+                client_type=body.client_type,
+                client_request_id=body.client_request_id,
+                user_tool_call_id=assistant_turn_idempotency_key(body.client_request_id, "user"),
+                persist_turn=persist_assistant_turn,
+            )
+            cached_assistant = find_cached_assistant_response(conn, body.client_request_id)
+    except AttachmentSubmissionError as exc:
+        raise HTTPException(
+            status_code=exc.http_status,
+            detail={"code": exc.code, "message": exc.safe_message},
+        ) from exc
+    body.message = str(user_turn.get("content") or body.message)
     initial_persist_ms = elapsed_ms(initial_persist_start_ms)
     if cached_assistant:
         return {
@@ -15946,6 +15965,7 @@ async def websocket_realtime(websocket: WebSocket, password: Optional[str] = Non
                     conversation_id=data.get("conversation_id"),
                     client_type=str(data.get("client_type") or "realtime"),
                     client_request_id=str(data.get("client_request_id") or ""),
+                    attachment_ids=data.get("attachment_ids") or [],
                     ios_live_activity_id=str(data.get("ios_live_activity_id") or ""),
                     ios_stream_to_live_activity=bool(data.get("ios_stream_to_live_activity") or False),
                 )
@@ -16156,27 +16176,43 @@ async def stream_chat_to_websocket(
     conversation_id: Optional[str] = None,
     client_type: str = "realtime",
     client_request_id: Optional[str] = None,
+    attachment_ids: Optional[list[uuid.UUID]] = None,
     ios_live_activity_id: str = "",
     ios_stream_to_live_activity: bool = False,
 ) -> None:
-    if not message.strip():
-        await websocket.send_json({"type": "error", "message": "message is required"})
-        return
+    requested_attachment_ids = list(attachment_ids or [])
     total_start_ms = monotonic_ms()
     redis_obj = redis_client()
     try:
         with db() as conn:
-            user_turn = persist_assistant_turn(
-                conn,
-                redis_obj,
-                role="user",
-                content=message,
+            user_turn = attachment_submission_service().submit_user_turn(
+                conn=conn,
+                redis_obj=redis_obj,
+                message=message,
+                attachment_ids=requested_attachment_ids,
                 conversation_id=conversation_id,
                 client_type=client_type,
-                tool_call_id=assistant_turn_idempotency_key(client_request_id, "user"),
+                client_request_id=client_request_id,
+                user_tool_call_id=assistant_turn_idempotency_key(client_request_id, "user"),
+                persist_turn=persist_assistant_turn,
             )
+    except AttachmentSubmissionError as exc:
+        await websocket.send_json(
+            {"type": "error", "code": exc.code, "message": exc.safe_message}
+        )
+        return
     except psycopg.Error:
+        if requested_attachment_ids:
+            await websocket.send_json(
+                {
+                    "type": "error",
+                    "code": "attachment_persistence_unavailable",
+                    "message": "文件消息暂时无法保存，请稍后重试。",
+                }
+            )
+            return
         user_turn = transient_assistant_turn("user", conversation_id)
+    message = str(user_turn.get("content") or message)
     context_start_ms = monotonic_ms()
     request_scope = infer_request_scope(message, {})
     deterministic_route = route_chat_context(message, {})

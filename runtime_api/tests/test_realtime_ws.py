@@ -2,6 +2,7 @@ import json
 import os
 import sys
 from pathlib import Path
+from uuid import uuid4
 
 from fastapi.testclient import TestClient
 
@@ -9,6 +10,214 @@ from fastapi.testclient import TestClient
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 os.environ.setdefault("DATABASE_URL", "postgresql://test")
 os.environ.setdefault("REDIS_URL", "redis://test")
+
+
+def test_chat_input_allows_attachment_only_payload():
+    from app import main
+
+    attachment_id = uuid4()
+    body = main.ChatIn(message="", attachment_ids=[attachment_id])
+
+    assert body.message == ""
+    assert body.attachment_ids == [attachment_id]
+
+
+def test_http_and_websocket_forward_same_ordered_attachments(monkeypatch):
+    monkeypatch.setenv("APP_PASSWORD", "secret")
+    from app import main
+
+    first = uuid4()
+    second = uuid4()
+    captured = []
+
+    class Submission:
+        def submit_user_turn(self, **kwargs):
+            captured.append(
+                {
+                    "message": kwargs["message"],
+                    "attachment_ids": list(kwargs["attachment_ids"]),
+                    "conversation_id": kwargs["conversation_id"],
+                    "client_type": kwargs["client_type"],
+                    "client_request_id": kwargs["client_request_id"],
+                }
+            )
+            return {
+                "conversation_id": kwargs["conversation_id"] or "conversation-parity",
+                "turn_id": f"turn-{len(captured)}",
+                "event_id": f"event-{len(captured)}",
+                "content": kwargs["message"],
+                "attachment_ids": [str(value) for value in kwargs["attachment_ids"]],
+                "duplicate": False,
+            }
+
+    class Conn:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    monkeypatch.setattr(main, "attachment_submission_service", lambda: Submission())
+    monkeypatch.setattr(main, "redis_client", lambda: None)
+    monkeypatch.setattr(main, "db", lambda: Conn())
+    monkeypatch.setattr(
+        main,
+        "find_cached_assistant_response",
+        lambda conn, request_id: {
+            "answer": "cached",
+            "conversation_id": "conversation-parity",
+        },
+    )
+
+    response = TestClient(main.app).post(
+        "/api/chat",
+        headers={"x-par-password": "secret"},
+        json={
+            "message": "比较附件",
+            "attachment_ids": [str(second), str(first)],
+            "conversation_id": "conversation-parity",
+            "client_type": "android",
+            "client_request_id": "parity-1",
+        },
+    )
+    assert response.status_code == 200
+
+    monkeypatch.setattr(
+        main,
+        "persist_assistant_turn",
+        lambda *args, **kwargs: {
+            "conversation_id": kwargs.get("conversation_id") or "conversation-parity",
+            "turn_id": "assistant-turn",
+            "event_id": "assistant-event",
+        },
+    )
+    monkeypatch.setattr(main, "retrieve_context", lambda message, limit, request_scope=None: [])
+    monkeypatch.setattr(main, "retrieve_current_source_context", lambda message, request_scope, limit=6: [])
+    monkeypatch.setattr(main, "retrieve_assistant_dialogue_context", lambda message, conversation_id=None, limit=64: [])
+    monkeypatch.setattr(main, "retrieve_active_agenda_context", lambda message, conversation_id=None, limit=6: [])
+    monkeypatch.setattr(main, "retrieve_active_task_context", lambda message, conversation_id=None, limit=8: [])
+    monkeypatch.setattr(
+        main,
+        "build_context_pack",
+        lambda *args, **kwargs: {
+            "included_event_ids": [],
+            "assistant_dialogue": [],
+            "agenda_context": [],
+            "memory_context": [],
+            "source_context": [],
+            "task_context": [],
+            "reason": "attachment parity",
+        },
+    )
+    monkeypatch.setattr(main, "build_chat_messages", lambda message, context_pack: [{"role": "user", "content": message}])
+    monkeypatch.setattr(main, "persist_context_snapshot", lambda *args, **kwargs: None, raising=False)
+    monkeypatch.setattr(main, "safe_persist_context_route_trace", lambda *args, **kwargs: None, raising=False)
+
+    class Gateway:
+        async def stream_chat(self, messages, temperature=0.4):
+            from app.model_gateway import ModelStreamChunk
+
+            yield ModelStreamChunk(delta="完成", provider_id="test-provider")
+
+    monkeypatch.setattr(main, "model_gateway", lambda: Gateway())
+
+    class WebSocket:
+        def __init__(self):
+            self.events = []
+
+        async def send_json(self, event):
+            self.events.append(event)
+
+    websocket = WebSocket()
+    main.asyncio.run(
+        main.stream_chat_to_websocket(
+            websocket,
+            "比较附件",
+            12,
+            conversation_id="conversation-parity",
+            client_type="android",
+            client_request_id="parity-1",
+            attachment_ids=[second, first],
+        )
+    )
+
+    assert captured == [
+        {
+            "message": "比较附件",
+            "attachment_ids": [second, first],
+            "conversation_id": "conversation-parity",
+            "client_type": "android",
+            "client_request_id": "parity-1",
+        },
+        {
+            "message": "比较附件",
+            "attachment_ids": [second, first],
+            "conversation_id": "conversation-parity",
+            "client_type": "android",
+            "client_request_id": "parity-1",
+        },
+    ]
+    assert websocket.events[-1]["type"] == "chat_done"
+
+
+def test_http_and_websocket_return_same_attachment_error_code(monkeypatch):
+    monkeypatch.setenv("APP_PASSWORD", "secret")
+    from app import main
+    from app.attachments.service import AttachmentSubmissionError
+
+    attachment_id = uuid4()
+
+    class Submission:
+        def submit_user_turn(self, **kwargs):
+            raise AttachmentSubmissionError(
+                "attachment_not_ready",
+                "文件仍在处理中，请稍后重试。",
+                http_status=409,
+            )
+
+    class Conn:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    monkeypatch.setattr(main, "attachment_submission_service", lambda: Submission())
+    monkeypatch.setattr(main, "redis_client", lambda: None)
+    monkeypatch.setattr(main, "db", lambda: Conn())
+
+    response = TestClient(main.app).post(
+        "/api/chat",
+        headers={"x-par-password": "secret"},
+        json={"message": "分析", "attachment_ids": [str(attachment_id)]},
+    )
+
+    class WebSocket:
+        def __init__(self):
+            self.events = []
+
+        async def send_json(self, event):
+            self.events.append(event)
+
+    websocket = WebSocket()
+    main.asyncio.run(
+        main.stream_chat_to_websocket(
+            websocket,
+            "分析",
+            12,
+            attachment_ids=[attachment_id],
+        )
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "attachment_not_ready"
+    assert websocket.events == [
+        {
+            "type": "error",
+            "code": "attachment_not_ready",
+            "message": "文件仍在处理中，请稍后重试。",
+        }
+    ]
 
 
 def test_websocket_streams_chat_delta_and_done(monkeypatch):

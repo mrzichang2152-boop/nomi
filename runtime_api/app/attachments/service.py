@@ -4,15 +4,17 @@ import hashlib
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import BinaryIO, Callable, Optional, Protocol, Union
+from typing import Any, BinaryIO, Callable, Optional, Protocol, Sequence, Union
 from uuid import UUID, uuid4
 
 from app.attachments.detection import detect_attachment
 from app.attachments.models import (
+    DEFAULT_ATTACHMENT_ONLY_INSTRUCTION,
     AttachmentErrorCode,
     AttachmentLimits,
     AttachmentRejected,
     SAFE_ATTACHMENT_ERROR_MESSAGES,
+    validate_chat_input,
 )
 from app.attachments.queue import RedisAttachmentQueue
 from app.attachments.repository import AttachmentRecord, AttachmentRepository
@@ -56,6 +58,14 @@ class AttachmentLifecycleError(RuntimeError):
         super().__init__(safe_message)
 
 
+class AttachmentSubmissionError(RuntimeError):
+    def __init__(self, code: str, safe_message: str, *, http_status: int) -> None:
+        self.code = code
+        self.safe_message = safe_message
+        self.http_status = http_status
+        super().__init__(safe_message)
+
+
 @dataclass(frozen=True)
 class UploadedAttachment:
     record: AttachmentRecord
@@ -68,6 +78,206 @@ class AttachmentContentReference:
     mime_type: str
     filename: str
     byte_size: int
+
+
+class AttachmentSubmissionService:
+    def __init__(
+        self,
+        *,
+        limits: Optional[AttachmentLimits] = None,
+        now: Optional[Callable[[], datetime]] = None,
+    ) -> None:
+        self.limits = limits or AttachmentLimits()
+        self.now = now or (lambda: datetime.now(timezone.utc))
+
+    @staticmethod
+    def _input_error(exc: ValueError) -> AttachmentSubmissionError:
+        code = str(exc)
+        status, message = {
+            "message_or_attachment_required": (422, "请输入消息或选择至少一个文件。"),
+            "duplicate_attachment_id": (422, "同一条消息不能重复选择同一个文件。"),
+            "too_many_attachments": (422, "单条消息选择的文件数量超过上限。"),
+        }.get(code, (422, "消息或附件参数无效。"))
+        return AttachmentSubmissionError(code, message, http_status=status)
+
+    @staticmethod
+    def _existing_turn(conn: Any, user_tool_call_id: Optional[str]) -> Optional[dict[str, Any]]:
+        if not user_tool_call_id:
+            return None
+        row = conn.execute(
+            """
+            SELECT id, conversation_id, event_id, role, content
+            FROM assistant_turns
+            WHERE tool_call_id = %s AND role = 'user'
+            ORDER BY created_at ASC
+            LIMIT 1
+            """,
+            (user_tool_call_id,),
+        ).fetchone()
+        if not row:
+            return None
+        bindings = conn.execute(
+            """
+            SELECT attachment_id
+            FROM assistant_turn_attachments
+            WHERE turn_id = %s
+            ORDER BY ordinal ASC
+            """,
+            (row[0],),
+        ).fetchall()
+        return {
+            "turn_id": str(row[0]),
+            "conversation_id": str(row[1]),
+            "event_id": str(row[2]),
+            "role": str(row[3]),
+            "content": str(row[4]) if len(row) > 4 else "",
+            "attachment_ids": [str(binding[0]) for binding in bindings],
+        }
+
+    def _locked_drafts(self, conn: Any, attachment_ids: Sequence[UUID]) -> list[dict[str, Any]]:
+        if not attachment_ids:
+            return []
+        rows = conn.execute(
+            """
+            SELECT id, status, lifecycle, byte_size, expires_at
+            FROM chat_attachments
+            WHERE id = ANY(%s)
+            FOR UPDATE
+            """,
+            (list(attachment_ids),),
+        ).fetchall()
+        records = {
+            str(row[0]): {
+                "attachment_id": UUID(str(row[0])),
+                "status": str(row[1]),
+                "lifecycle": str(row[2]),
+                "byte_size": int(row[3] or 0),
+                "expires_at": row[4],
+            }
+            for row in rows
+        }
+        ordered: list[dict[str, Any]] = []
+        for attachment_id in attachment_ids:
+            record = records.get(str(attachment_id))
+            if record is None or record["lifecycle"] == "deleted":
+                raise AttachmentSubmissionError(
+                    "attachment_not_found",
+                    "未找到该文件。",
+                    http_status=404,
+                )
+            ordered.append(record)
+        return ordered
+
+    def _validate_drafts(self, records: Sequence[dict[str, Any]]) -> None:
+        active_now = self.now()
+        aggregate_bytes = 0
+        for record in records:
+            if record["lifecycle"] == "attached":
+                raise AttachmentSubmissionError(
+                    AttachmentErrorCode.ATTACHMENT_ALREADY_ATTACHED.value,
+                    SAFE_ATTACHMENT_ERROR_MESSAGES[AttachmentErrorCode.ATTACHMENT_ALREADY_ATTACHED],
+                    http_status=409,
+                )
+            expires_at = record.get("expires_at")
+            if expires_at is not None and expires_at <= active_now:
+                raise AttachmentSubmissionError(
+                    AttachmentErrorCode.ATTACHMENT_EXPIRED.value,
+                    SAFE_ATTACHMENT_ERROR_MESSAGES[AttachmentErrorCode.ATTACHMENT_EXPIRED],
+                    http_status=410,
+                )
+            if record["status"] != "ready":
+                raise AttachmentSubmissionError(
+                    AttachmentErrorCode.ATTACHMENT_NOT_READY.value,
+                    SAFE_ATTACHMENT_ERROR_MESSAGES[AttachmentErrorCode.ATTACHMENT_NOT_READY],
+                    http_status=409,
+                )
+            aggregate_bytes += int(record["byte_size"])
+        if aggregate_bytes > self.limits.max_message_attachment_bytes:
+            raise AttachmentSubmissionError(
+                "attachments_too_large",
+                "单条消息中的文件总大小超过允许上限。",
+                http_status=413,
+            )
+
+    def submit_user_turn(
+        self,
+        *,
+        conn: Any,
+        redis_obj: Any,
+        message: str,
+        attachment_ids: Sequence[UUID],
+        conversation_id: Optional[str],
+        client_type: str,
+        client_request_id: Optional[str],
+        user_tool_call_id: Optional[str],
+        persist_turn: Callable[..., dict[str, Any]],
+    ) -> dict[str, Any]:
+        try:
+            ordered_ids = [UUID(str(attachment_id)) for attachment_id in attachment_ids]
+        except (TypeError, ValueError) as exc:
+            raise AttachmentSubmissionError(
+                "invalid_attachment_id",
+                "文件标识无效，请重新选择文件。",
+                http_status=422,
+            ) from exc
+        try:
+            validate_chat_input(message, ordered_ids, self.limits)
+        except ValueError as exc:
+            raise self._input_error(exc) from exc
+        content = message if message.strip() else DEFAULT_ATTACHMENT_ONLY_INSTRUCTION
+        normalized_ids = [str(attachment_id) for attachment_id in ordered_ids]
+
+        existing = self._existing_turn(conn, user_tool_call_id) if ordered_ids else None
+        if existing is not None:
+            if existing["content"] != content or existing["attachment_ids"] != normalized_ids:
+                raise AttachmentSubmissionError(
+                    "client_request_id_conflict",
+                    "同一请求标识对应了不同的消息或文件，请重新发送。",
+                    http_status=409,
+                )
+            return {**existing, "duplicate": True}
+
+        records = self._locked_drafts(conn, ordered_ids)
+        self._validate_drafts(records)
+        turn = persist_turn(
+            conn,
+            redis_obj,
+            role="user",
+            content=content,
+            conversation_id=conversation_id,
+            client_type=client_type,
+            tool_call_id=user_tool_call_id,
+        )
+        turn_id = str(turn["turn_id"])
+        attached_at = self.now()
+        for ordinal, attachment_id in enumerate(ordered_ids):
+            conn.execute(
+                """
+                INSERT INTO assistant_turn_attachments (turn_id, attachment_id, ordinal, purpose)
+                VALUES (%s, %s, %s, %s)
+                """,
+                (turn_id, attachment_id, ordinal, "user_context"),
+            )
+            updated = conn.execute(
+                """
+                UPDATE chat_attachments
+                SET lifecycle = 'attached', attached_at = %s, expires_at = NULL
+                WHERE id = %s AND lifecycle = 'draft'
+                """,
+                (attached_at, attachment_id),
+            )
+            if updated.rowcount != 1:
+                raise AttachmentSubmissionError(
+                    AttachmentErrorCode.ATTACHMENT_ALREADY_ATTACHED.value,
+                    SAFE_ATTACHMENT_ERROR_MESSAGES[AttachmentErrorCode.ATTACHMENT_ALREADY_ATTACHED],
+                    http_status=409,
+                )
+        return {
+            **turn,
+            "content": content,
+            "attachment_ids": normalized_ids,
+            "duplicate": False,
+        }
 
 
 class AttachmentService:
@@ -504,6 +714,8 @@ __all__ = [
     "AttachmentLifecycleError",
     "AttachmentQueue",
     "AttachmentService",
+    "AttachmentSubmissionError",
+    "AttachmentSubmissionService",
     "AttachmentUploadError",
     "RedisAttachmentQueue",
     "UploadedAttachment",
