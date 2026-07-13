@@ -38,6 +38,10 @@
 | Task 10 结构化多模态聚焦回归 | `python3 -m pytest -q runtime_api/tests/test_attachment_model_content.py runtime_api/tests/test_attachment_retrieval.py::test_visual_escalation_is_relevant_bounded_and_not_a_large_document_sweep runtime_api/tests/test_attachment_retrieval.py::test_load_attachment_evidence_batches_manifest_chunks_and_vector_scores runtime_api/tests/test_attachment_chat_context.py::test_retrieve_attachment_context_for_chat_uses_current_ids_without_prior_query runtime_api/tests/test_model_non_thinking.py runtime_api/tests/test_model_gateway.py` | 通过，22 tests | 核对视觉派生文件从 DB 进入本轮证据、结构化 content 不被字符串化、最多 6 图、仅 provider 边界 base64、根目录逃逸拒绝、Qwen 非 thinking 及 reasoning 隐藏 |
 | Task 10 附件/模型/实时组合回归 | `python3 -m pytest -q runtime_api/tests/test_attachment*.py runtime_api/tests/test_model_non_thinking.py runtime_api/tests/test_model_gateway.py runtime_api/tests/test_context_pack_and_chat.py runtime_api/tests/test_realtime_ws.py` | 通过，261 tests | 上传、解析、检索、历史、引用、HTTP/WS、模型网关与流式正式内容组合回归均通过；`compileall` 通过 |
 | Task 10 隔离检查点后端全量 | `python3 -m pytest -q runtime_api/tests` | 2 failed、848 passed | 两个失败仍为既有 `test_chat_response_uses_explicit_memory_layer_fetchers` 与 `test_context_pack_pipeline_retrieves_local_memory_agenda_and_turns`；和 Task 7-9 隔离基线一致，Task 10 未新增失败 |
+| Task 11 Web 附件状态机 | `node --test runtime_api/tests_js/chat_attachments.test.cjs` | 通过，8 tests | 覆盖纯附件/混合发送、8 个/64 MiB 限制、有序 ID、可见性轮询、重试/删除、稳定上传 ID、发送幂等和历史合并 |
+| Task 11 Web/附件组合回归 | JS syntax check、Task 11 静态契约、既有工作台、附件 API/生命周期/历史/绑定组合测试 | 通过，101 pytest + 8 node tests | 鉴权预览、FormData、错误单次读取、终态停止、消息卡、既有日程/求职工作台均未回归 |
+| Task 11 Chromium 响应式检查 | Playwright + Google Chrome，`1440x900` 与 `390x844` | 通过 | 注入图片/文档历史卡和失败上传草稿；两种宽度 `body/chat/message/card` 均无横向溢出，附件名称宽度分别 557/210px，composer 高度 203/193px，无 page error；发现并修复预览失败挤压和响应体二次读取噪声 |
+| Task 11 隔离检查点后端全量 | `python3 -m pytest -q runtime_api/tests` | 2 failed、852 passed | 失败仍仅为既有 `test_chat_response_uses_explicit_memory_layer_fetchers` 与 `test_context_pack_pipeline_retrieves_local_memory_agenda_and_turns`；Task 11 未新增失败 |
 | 工作区 | `git status --short` | 脏工作区 | 存在既有 OpenCode、Web Search、Android 等改动；不得重置或整体暂存 |
 
 ## 规格覆盖状态
@@ -60,7 +64,7 @@
 | Qwen 结构化多模态与非 thinking | 代码与自动化完成，未部署 | 文本 content 保持字符串；视觉 content 为有序 `text/image_url`；私有相对路径只在 provider 边界校验后读取并转 data URL；输入不变；Qwen 请求显式 `enable_thinking=false`/`reasoning_effort=none`；正式响应忽略 reasoning；安全 trace 不含 base64/path | 无 | 尚未向线上 `qwen3.6` 发真实图文请求并核对首字、正式答案与视觉事实；未验证上游是否完整支持当前 data URL 契约 | 云环境与模型端待 Task 16/17 | Task 16、17 |
 | 稳定引用与覆盖声明 | 代码与自动化完成，未部署 | PDF 页、PPTX 张、DOCX 章节、XLSX sheet/range、图片和文本行号有稳定 label；答案只能引用本轮选中 label，未选页引用会被移除并产生 validation trace；partial coverage 明确未覆盖位置 | 无 | 尚未用真实 Qwen 输出验证引用服从率；逐页终态摘要尚未在双客户端展示验收 | 云环境部署待 Task 16 | Task 10、16、17 |
 | 长期记忆来源 | 未开始 | 无 | 无 | 未保存 attachment/turn/locator/version 来源 | 无 | Task 15 |
-| Web 完整 App 交互 | 未开始 | 无 | 无 | 无选择器、托盘、状态卡和附件历史 | 无 | Task 11、12 |
+| Web 完整 App 交互 | 代码与自动化完成，未部署 | 8 个纯 JS 状态机测试、4 个静态契约、101 个 Web/附件组合回归；真实 Chromium 桌面/390px 响应式检查通过 | 本地真实 Chromium 已核对布局；上传接口使用静态服务器故意得到失败态，只验证失败 UI，不冒充真实上传成功 | 尚未连接真实 PostgreSQL/Redis/worker 完成上传、ready、纯附件/混合发送、鉴权预览下载和服务端历史重载 | 云环境部署待 Task 16 | Task 12-16、17 |
 | Android 悬浮窗交互 | 未开始 | 无 | 无 | 无原生选择、流式上传和托盘 | 无 | Task 13 |
 | 双界面历史一致性 | 未开始 | 无 | 无 | 本地镜像无附件元数据 | 无 | Task 14 |
 | 安全与提示注入防护 | 文件入口、解析失败隔离和鉴权下载完成，未部署 | hostile-file 测试验证 ZIP bomb、ZIP traversal、加密/损坏容器、脚本与伪装可执行文件；解析异常不回显路径；持久化失败清除未提交衍生文件；物理删除失败可恢复；预览/原件无密码返回 401 且不含文件字节，响应含 `nosniff` 与私有缓存头 | 无 | 文档内提示注入、审计和真实恶意样本待后续任务 | 无 | Task 8、14、17 |

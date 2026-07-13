@@ -13,6 +13,10 @@ const sidebar = document.querySelector(".sidebar");
 const chatForm = document.querySelector("#chatForm");
 const messageInput = document.querySelector("#messageInput");
 const chatSubmitButton = document.querySelector("#chatForm button[type='submit']");
+const attachmentButton = document.querySelector("#attachmentButton");
+const attachmentInput = document.querySelector("#attachmentInput");
+const attachmentTray = document.querySelector("#attachmentTray");
+const AttachmentDraft = window.NomiChatAttachments || null;
 const messages = document.querySelector("#messages");
 const searchForm = document.querySelector("#searchForm");
 const searchInput = document.querySelector("#searchInput");
@@ -81,6 +85,10 @@ let viewportMetricsBound = false;
 let realtimeChatWatchdog = null;
 let realtimeChatHadDelta = false;
 let lastTouchSubmitAt = 0;
+const attachmentDraft = AttachmentDraft ? AttachmentDraft.createDraftState() : { items: [], in_flight_request_id: null };
+const attachmentPollTimers = new Map();
+let attachmentTrayError = "";
+let activeChatAttempt = null;
 const openClawJobCards = new Map();
 const realtimePendingText = "正在结合本地记忆思考...";
 const realtimeTimeoutMs = 45000;
@@ -325,9 +333,322 @@ function card(className = "card") {
   return node;
 }
 
-function addMessage(role, text, sources = []) {
+function formatAttachmentSize(value) {
+  const bytes = Number(value || 0);
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(bytes < 10 * 1024 ? 1 : 0)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(bytes < 10 * 1024 * 1024 ? 1 : 0)} MB`;
+}
+
+function attachmentStatusText(item) {
+  return {
+    selected: "等待上传",
+    uploading: "正在上传",
+    uploaded: "等待处理",
+    queued: "等待处理",
+    processing: "正在处理",
+    ready: "可发送",
+    failed: "处理失败",
+    rejected: "已拒绝",
+    expired: "已过期",
+  }[item.status] || item.status || "未知状态";
+}
+
+function attachmentIndex(item) {
+  return attachmentDraft.items.indexOf(item);
+}
+
+function updateAttachmentControls() {
+  if (!AttachmentDraft) return;
+  const sending = Boolean(attachmentDraft.in_flight_request_id);
+  attachmentButton.disabled = sending;
+  attachmentInput.disabled = sending;
+  chatSubmitButton.disabled = !AttachmentDraft.canSend(messageInput.value, attachmentDraft);
+}
+
+function setAttachmentTrayError(message = "") {
+  attachmentTrayError = message;
+  renderAttachmentTray();
+}
+
+function renderAttachmentTray() {
+  if (!AttachmentDraft) return;
+  attachmentTray.replaceChildren();
+  if (attachmentTrayError) {
+    const error = document.createElement("p");
+    error.className = "attachment-tray-error";
+    error.textContent = attachmentTrayError;
+    attachmentTray.appendChild(error);
+  }
+  for (const item of attachmentDraft.items) {
+    const draft = document.createElement("article");
+    draft.className = "attachment-draft";
+    draft.dataset.clientUploadId = item.client_upload_id;
+
+    const copy = document.createElement("div");
+    copy.className = "attachment-draft-copy";
+    const filename = document.createElement("span");
+    filename.className = "attachment-filename";
+    filename.textContent = item.filename;
+    const meta = document.createElement("p");
+    meta.className = "attachment-meta";
+    meta.textContent = `${formatAttachmentSize(item.byte_size)} · ${attachmentStatusText(item)}`;
+    copy.append(filename, meta);
+    if (item.error_message) {
+      const error = document.createElement("p");
+      error.className = "attachment-error";
+      error.textContent = item.error_message;
+      copy.appendChild(error);
+    }
+
+    const actions = document.createElement("div");
+    actions.className = "attachment-draft-actions";
+    if (["failed", "rejected", "expired"].includes(item.status)) {
+      const retry = document.createElement("button");
+      retry.type = "button";
+      retry.className = "attachment-retry";
+      retry.title = "重试附件";
+      retry.setAttribute("aria-label", `重试 ${item.filename}`);
+      retry.textContent = "↻";
+      retry.addEventListener("click", () => retryAttachment(item));
+      actions.appendChild(retry);
+    }
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.className = "attachment-remove";
+    remove.title = "移除附件";
+    remove.setAttribute("aria-label", `移除 ${item.filename}`);
+    remove.textContent = "×";
+    remove.disabled = Boolean(attachmentDraft.in_flight_request_id);
+    remove.addEventListener("click", () => removeAttachment(item));
+    actions.appendChild(remove);
+    draft.append(copy, actions);
+
+    if (["uploading", "uploaded", "queued", "processing"].includes(item.status)) {
+      const progress = document.createElement("div");
+      progress.className = "attachment-progress";
+      progress.role = "progressbar";
+      progress.setAttribute("aria-label", `${item.filename} ${attachmentStatusText(item)}`);
+      draft.appendChild(progress);
+    }
+    attachmentTray.appendChild(draft);
+  }
+  attachmentTray.hidden = !attachmentTray.childElementCount;
+  updateAttachmentControls();
+}
+
+async function attachmentApi(path, options = {}) {
+  const response = await fetch(path, {
+    ...options,
+    headers: {
+      "x-par-password": password(),
+      ...(options.headers || {}),
+    },
+  });
+  if (!response.ok) {
+    let message = "附件请求失败。";
+    const rawError = await response.text();
+    try {
+      const payload = JSON.parse(rawError);
+      message = payload.detail?.message || payload.detail?.code || payload.message || message;
+    } catch {
+      if (rawError && !/^<!doctype|^<html/i.test(rawError.trim())) message = rawError;
+    }
+    throw new Error(message);
+  }
+  if (response.status === 204) return null;
+  return response.json();
+}
+
+function clearAttachmentPoll(item) {
+  const timer = attachmentPollTimers.get(item.client_upload_id);
+  if (timer) clearTimeout(timer);
+  attachmentPollTimers.delete(item.client_upload_id);
+}
+
+function scheduleAttachmentPoll(item) {
+  clearAttachmentPoll(item);
+  if (!AttachmentDraft.shouldPoll(item, document.visibilityState !== "hidden")) return;
+  attachmentPollTimers.set(item.client_upload_id, setTimeout(() => pollAttachment(item), 1000));
+}
+
+async function pollAttachment(item) {
+  const index = attachmentIndex(item);
+  if (index < 0 || !AttachmentDraft.shouldPoll(item, document.visibilityState !== "hidden")) return;
+  try {
+    const status = await attachmentApi(`/api/chat/attachments/${item.attachment_id}`);
+    if (status.status === "ready") {
+      AttachmentDraft.markReady(attachmentDraft, index, status);
+    } else if (["failed", "rejected", "expired", "deleted"].includes(status.status)) {
+      AttachmentDraft.markFailed(attachmentDraft, index, status);
+    } else {
+      AttachmentDraft.markUploaded(attachmentDraft, index, status);
+    }
+  } catch (error) {
+    AttachmentDraft.markFailed(attachmentDraft, index, { error_message: error.message });
+  }
+  renderAttachmentTray();
+  scheduleAttachmentPoll(item);
+}
+
+async function uploadAttachment(item) {
+  const index = attachmentIndex(item);
+  if (index < 0) return;
+  AttachmentDraft.markUploading(attachmentDraft, index);
+  renderAttachmentTray();
+  const form = new FormData();
+  form.append("file", item.file, item.filename);
+  form.append("client_upload_id", item.client_upload_id);
+  try {
+    const uploaded = await attachmentApi("/api/chat/attachments", { method: "POST", body: form });
+    const currentIndex = attachmentIndex(item);
+    if (currentIndex < 0) return;
+    AttachmentDraft.markUploaded(attachmentDraft, currentIndex, uploaded);
+    renderAttachmentTray();
+    scheduleAttachmentPoll(item);
+  } catch (error) {
+    const currentIndex = attachmentIndex(item);
+    if (currentIndex >= 0) {
+      AttachmentDraft.markFailed(attachmentDraft, currentIndex, { error_message: error.message });
+      renderAttachmentTray();
+    }
+  }
+}
+
+async function retryAttachment(item) {
+  const index = attachmentIndex(item);
+  if (index < 0) return;
+  const priorAttachmentId = item.attachment_id;
+  AttachmentDraft.retryItem(attachmentDraft, index);
+  renderAttachmentTray();
+  if (!priorAttachmentId) {
+    await uploadAttachment(item);
+    return;
+  }
+  try {
+    const retried = await attachmentApi(`/api/chat/attachments/${priorAttachmentId}/retry`, { method: "POST" });
+    const currentIndex = attachmentIndex(item);
+    if (currentIndex < 0) return;
+    AttachmentDraft.markUploaded(attachmentDraft, currentIndex, retried);
+    renderAttachmentTray();
+    scheduleAttachmentPoll(item);
+  } catch (error) {
+    const currentIndex = attachmentIndex(item);
+    if (currentIndex >= 0) {
+      AttachmentDraft.markFailed(attachmentDraft, currentIndex, { error_message: error.message });
+      renderAttachmentTray();
+    }
+  }
+}
+
+async function removeAttachment(item) {
+  const index = attachmentIndex(item);
+  if (index < 0) return;
+  clearAttachmentPoll(item);
+  AttachmentDraft.removeItem(attachmentDraft, index);
+  renderAttachmentTray();
+  if (item.attachment_id) {
+    try {
+      await attachmentApi(`/api/chat/attachments/${item.attachment_id}`, { method: "DELETE" });
+    } catch (error) {
+      setAttachmentTrayError(`未能从服务器清理 ${item.filename}：${error.message}`);
+    }
+  }
+}
+
+async function loadAuthenticatedAttachmentBlob(url) {
+  const response = await fetch(url, { headers: { "x-par-password": password() } });
+  if (!response.ok) throw new Error("附件内容加载失败。");
+  return response.blob();
+}
+
+function revokeObjectUrlsWithin(node) {
+  if (!(node instanceof Element)) return;
+  const targets = node.matches("[data-object-url]") ? [node] : Array.from(node.querySelectorAll("[data-object-url]"));
+  for (const target of targets) {
+    if (target.dataset.objectUrl) URL.revokeObjectURL(target.dataset.objectUrl);
+  }
+}
+
+if (typeof MutationObserver === "function") {
+  new MutationObserver((records) => {
+    for (const record of records) {
+      for (const node of record.removedNodes) revokeObjectUrlsWithin(node);
+    }
+  }).observe(messages, { childList: true, subtree: true });
+}
+
+async function loadAttachmentThumbnail(image, fallback, url) {
+  try {
+    const blob = await loadAuthenticatedAttachmentBlob(url);
+    if (!fallback.isConnected) return;
+    const objectUrl = URL.createObjectURL(blob);
+    image.dataset.objectUrl = objectUrl;
+    image.src = objectUrl;
+    fallback.replaceWith(image);
+  } catch {
+    image.remove();
+  }
+}
+
+async function downloadAttachment(attachment) {
+  if (!attachment.content_url) return;
+  try {
+    const blob = await loadAuthenticatedAttachmentBlob(attachment.content_url);
+    const objectUrl = URL.createObjectURL(blob);
+    const anchor = document.createElement("a");
+    anchor.href = objectUrl;
+    anchor.download = attachment.filename || "attachment";
+    anchor.click();
+    setTimeout(() => URL.revokeObjectURL(objectUrl), 1000);
+  } catch {
+    addMessage("assistant", `无法打开附件 ${attachment.filename || ""}，请稍后重试。`);
+  }
+}
+
+function renderMessageAttachments(attachments = []) {
+  const list = document.createElement("div");
+  list.className = "message-attachments";
+  for (const attachment of attachments) {
+    const cardNode = document.createElement("button");
+    cardNode.type = "button";
+    cardNode.className = "message-attachment-card";
+    cardNode.addEventListener("click", () => downloadAttachment(attachment));
+    if (attachment.kind === "image" && attachment.preview_url) {
+      const fallback = document.createElement("span");
+      fallback.className = "attachment-file-icon attachment-preview-fallback";
+      fallback.textContent = "image";
+      const image = document.createElement("img");
+      image.className = "attachment-thumbnail";
+      image.alt = "";
+      cardNode.appendChild(fallback);
+      loadAttachmentThumbnail(image, fallback, attachment.preview_url);
+    } else {
+      const icon = document.createElement("span");
+      icon.className = "attachment-file-icon";
+      icon.textContent = (attachment.kind || "file").slice(0, 4);
+      cardNode.appendChild(icon);
+    }
+    const copy = document.createElement("span");
+    copy.className = "message-attachment-copy";
+    const filename = document.createElement("span");
+    filename.className = "attachment-filename";
+    filename.textContent = attachment.filename || "attachment";
+    const meta = document.createElement("span");
+    meta.className = "attachment-meta";
+    meta.textContent = `${attachment.mime_type || attachment.kind || "file"} · ${formatAttachmentSize(attachment.byte_size)} · ${attachmentStatusText(attachment)}`;
+    copy.append(filename, meta);
+    cardNode.appendChild(copy);
+    list.appendChild(cardNode);
+  }
+  return list;
+}
+
+function addMessage(role, text, sources = [], attachments = [], messageId = "") {
   const item = card(`message ${role}`);
   item.textContent = text;
+  if (messageId) item.dataset.messageId = messageId;
+  if (attachments.length) item.appendChild(renderMessageAttachments(attachments));
   if (sources.length) item.appendChild(renderSources(sources));
   messages.appendChild(item);
   messages.scrollTop = messages.scrollHeight;
@@ -556,7 +877,7 @@ async function loadChatHistory(force = false) {
     messages.innerHTML = "";
     (result.messages || []).forEach((message) => {
       if (message.role === "user" || message.role === "assistant") {
-        addMessage(message.role, message.content || "");
+        addMessage(message.role, message.content || "", [], message.attachments || [], message.id || "");
       }
     });
   } catch (error) {
@@ -599,6 +920,10 @@ function clearRealtimeChatWatchdog() {
 
 function failActiveRealtimeChat(message) {
   clearRealtimeChatWatchdog();
+  if (activeChatAttempt) {
+    AttachmentDraft.markTransportFailed(attachmentDraft);
+    renderAttachmentTray();
+  }
   if (activeAssistantNode) {
     if (realtimeChatHadDelta) {
       appendMessageText(activeAssistantNode, `\n\n${message}`);
@@ -606,8 +931,9 @@ function failActiveRealtimeChat(message) {
       activeAssistantNode.textContent = message;
     }
   } else {
-    addMessage("assistant", message);
+    activeAssistantNode = addMessage("assistant", message);
   }
+  if (activeChatAttempt && activeAssistantNode) renderAssistantRetry(activeAssistantNode);
   activeAssistantNode = null;
   realtimeChatHadDelta = false;
 }
@@ -682,6 +1008,11 @@ function handleRealtimeMessage(event) {
     clearRealtimeChatWatchdog();
     if (event.conversation_id) setChatConversationId(event.conversation_id);
     if (activeAssistantNode && event.sources?.length) activeAssistantNode.appendChild(renderSources(event.sources));
+    if (activeChatAttempt && event.client_request_id === activeChatAttempt.payload.client_request_id) {
+      AttachmentDraft.commitSend(attachmentDraft, event.client_request_id);
+      activeChatAttempt = null;
+      renderAttachmentTray();
+    }
     activeAssistantNode = null;
     realtimeChatHadDelta = false;
     return;
@@ -2597,24 +2928,76 @@ loginForm.addEventListener("submit", async (event) => {
   }
 });
 
+function localMessageAttachments(items) {
+  return items.map((item) => ({
+    attachment_id: item.attachment_id,
+    filename: item.filename,
+    mime_type: item.mime_type,
+    byte_size: item.byte_size,
+    status: item.status,
+    kind: item.kind,
+    preview_url: item.preview_url,
+    content_url: item.content_url,
+  }));
+}
+
+function renderAssistantRetry(node) {
+  if (!node || node.querySelector(".assistant-retry")) return;
+  const retry = document.createElement("button");
+  retry.type = "button";
+  retry.className = "assistant-retry";
+  retry.textContent = "重试回复";
+  retry.addEventListener("click", async () => {
+    if (!activeChatAttempt) return;
+    const payload = AttachmentDraft.beginSend(activeChatAttempt.text, attachmentDraft);
+    if (!payload) return;
+    activeChatAttempt.payload = { ...payload, conversation_id: chatConversationId || undefined };
+    node.textContent = realtimePendingText;
+    await submitChatOverHttp(activeChatAttempt.payload, node);
+  });
+  node.appendChild(retry);
+}
+
+async function submitChatOverHttp(payload, pendingNode) {
+  try {
+    const result = await api("/api/chat", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    });
+    if (result.conversation_id) setChatConversationId(result.conversation_id);
+    pendingNode.textContent = result.answer;
+    if (result.sources?.length) pendingNode.appendChild(renderSources(result.sources));
+    AttachmentDraft.commitSend(attachmentDraft, result.client_request_id || payload.client_request_id);
+    activeChatAttempt = null;
+    renderAttachmentTray();
+  } catch {
+    pendingNode.textContent = "请求失败，请检查模型服务或访问密码。";
+    AttachmentDraft.markTransportFailed(attachmentDraft);
+    renderAttachmentTray();
+    renderAssistantRetry(pendingNode);
+  } finally {
+    refocusMessageInput();
+  }
+}
+
 async function submitChatMessage() {
   const text = messageInput.value.trim();
-  if (!text) return;
+  const payload = AttachmentDraft.beginSend(text, attachmentDraft);
+  if (!payload) return;
+  payload.conversation_id = chatConversationId || undefined;
+  payload.client_type = "web";
+  const selectedAttachments = localMessageAttachments(attachmentDraft.items);
+  activeChatAttempt = { payload, text, attachments: selectedAttachments };
   messageInput.value = "";
-  addMessage("user", text);
+  addMessage("user", text, [], selectedAttachments);
+  renderAttachmentTray();
   refocusMessageInput();
   if (realtimeReady && realtimeSocket?.readyState === WebSocket.OPEN) {
     activeAssistantNode = addMessage("assistant", realtimePendingText);
     realtimeChatHadDelta = false;
     startRealtimeChatWatchdog();
     try {
-      realtimeSocket.send(
-        JSON.stringify({
-          type: "chat_message",
-          message: text,
-          conversation_id: chatConversationId || undefined,
-        })
-      );
+      realtimeSocket.send(JSON.stringify({ type: "chat_message", ...payload }));
     } catch {
       failActiveRealtimeChat("实时通道发送失败，请重新发送或检查网络。");
     }
@@ -2622,25 +3005,42 @@ async function submitChatMessage() {
     return;
   }
   const pendingNode = addMessage("assistant", realtimePendingText);
-  try {
-    const result = await api("/api/chat", {
-      method: "POST",
-      body: JSON.stringify({ message: text, conversation_id: chatConversationId || undefined }),
-    });
-    if (result.conversation_id) setChatConversationId(result.conversation_id);
-    pendingNode.textContent = result.answer;
-    if (result.sources?.length) pendingNode.appendChild(renderSources(result.sources));
-  } catch {
-    pendingNode.textContent = "请求失败，请检查模型服务或访问密码。";
-  } finally {
-    refocusMessageInput();
-  }
+  await submitChatOverHttp(payload, pendingNode);
 }
 
 chatForm.addEventListener("submit", async (event) => {
   event.preventDefault();
   await submitChatMessage();
 });
+
+attachmentButton.addEventListener("click", () => attachmentInput.click());
+attachmentInput.addEventListener("change", () => {
+  attachmentTrayError = "";
+  const selected = Array.from(attachmentInput.files || []);
+  const accepted = [];
+  for (const file of selected) {
+    try {
+      accepted.push(AttachmentDraft.addSelectedFile(attachmentDraft, file));
+    } catch (error) {
+      attachmentTrayError = error.message || "无法添加附件。";
+      break;
+    }
+  }
+  attachmentInput.value = "";
+  renderAttachmentTray();
+  accepted.forEach((item) => uploadAttachment(item));
+});
+messageInput.addEventListener("input", updateAttachmentControls);
+if (typeof document.addEventListener === "function") {
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "hidden") {
+      attachmentDraft.items.forEach(clearAttachmentPoll);
+      return;
+    }
+    attachmentDraft.items.forEach(scheduleAttachmentPoll);
+  });
+}
+if (AttachmentDraft) renderAttachmentTray();
 
 function preserveComposerFocus(event) {
   event.preventDefault();

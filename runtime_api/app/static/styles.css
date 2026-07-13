@@ -309,7 +309,7 @@ button.secondary:hover {
 
 .composer {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-columns: minmax(0, 1fr);
   gap: 12px;
   position: sticky;
   bottom: 0;
@@ -317,6 +317,189 @@ button.secondary:hover {
   padding: 16px 24px max(16px, env(safe-area-inset-bottom));
   background: white;
   border-top: 1px solid #d7dee8;
+}
+
+.composer-main {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: end;
+  gap: 10px;
+  min-width: 0;
+}
+
+.composer-main .attachment-button {
+  align-self: center;
+  min-width: 40px;
+  border-color: #cbd5e1;
+  background: #eef2f7;
+  color: #172033;
+  font-size: 18px;
+}
+
+.composer-main button[type="submit"]:disabled,
+.composer-main .attachment-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.52;
+}
+
+.visually-hidden {
+  position: absolute !important;
+  width: 1px !important;
+  height: 1px !important;
+  padding: 0 !important;
+  margin: -1px !important;
+  overflow: hidden !important;
+  clip: rect(0, 0, 0, 0) !important;
+  white-space: nowrap !important;
+  border: 0 !important;
+}
+
+.attachment-tray {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(min(220px, 100%), 1fr));
+  gap: 8px;
+  min-width: 0;
+}
+
+.attachment-tray[hidden] {
+  display: none;
+}
+
+.attachment-draft {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  padding: 9px 10px;
+  border: 1px solid #d7dee8;
+  border-radius: 8px;
+  background: #f8fafc;
+}
+
+.attachment-draft-copy,
+.message-attachment-copy {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.attachment-filename {
+  display: -webkit-box;
+  min-width: 0;
+  overflow: hidden;
+  overflow-wrap: anywhere;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
+  font-weight: 650;
+  line-height: 1.25;
+}
+
+.attachment-meta,
+.attachment-error {
+  min-width: 0;
+  margin: 0;
+  color: #667085;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.attachment-error,
+.attachment-tray-error {
+  color: #b42318;
+}
+
+.attachment-draft-actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.attachment-draft-actions button {
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  border: 1px solid #cbd5e1;
+  border-radius: 8px;
+  background: white;
+  color: #172033;
+}
+
+.attachment-progress {
+  grid-column: 1 / -1;
+  height: 3px;
+  overflow: hidden;
+  border-radius: 2px;
+  background: #dbe4ee;
+}
+
+.attachment-progress::after {
+  display: block;
+  width: 42%;
+  height: 100%;
+  background: #0f766e;
+  animation: attachment-progress 1.2s ease-in-out infinite alternate;
+  content: "";
+}
+
+@keyframes attachment-progress {
+  from { transform: translateX(-15%); }
+  to { transform: translateX(150%); }
+}
+
+.message-attachments {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+  margin-top: 8px;
+}
+
+.message-attachment-card {
+  display: grid;
+  grid-template-columns: 46px minmax(0, 1fr);
+  align-items: center;
+  gap: 9px;
+  width: 100%;
+  min-width: 0;
+  padding: 8px;
+  border: 1px solid rgba(102, 112, 133, 0.28);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.82);
+  color: #172033;
+  text-align: left;
+}
+
+.message.user .message-attachment-card {
+  border-color: rgba(255, 255, 255, 0.36);
+  background: rgba(255, 255, 255, 0.94);
+}
+
+.attachment-thumbnail,
+.attachment-file-icon,
+.attachment-preview-fallback {
+  width: 46px;
+  height: 46px;
+  border-radius: 6px;
+  background: #e5eaf0;
+  object-fit: cover;
+}
+
+.attachment-file-icon {
+  display: grid;
+  place-items: center;
+  color: #475467;
+  font-size: 11px;
+  font-weight: 750;
+  text-transform: uppercase;
+}
+
+.assistant-retry {
+  display: block;
+  margin-top: 8px;
+  border: 1px solid #cbd5e1;
+  background: #eef2f7;
+  color: #172033;
 }
 
 .content-list {

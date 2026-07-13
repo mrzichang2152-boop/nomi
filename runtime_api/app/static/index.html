@@ -91,8 +91,19 @@
           <section id="chatView" class="view active">
             <div id="messages" class="messages"></div>
             <form id="chatForm" class="composer">
-              <textarea id="messageInput" rows="2" placeholder="发消息给你的个人助理"></textarea>
-              <button type="submit">发送</button>
+              <div id="attachmentTray" class="attachment-tray" aria-live="polite" hidden></div>
+              <div class="composer-main">
+                <button id="attachmentButton" class="icon-button attachment-button" type="button" aria-label="添加附件" title="添加附件">&#128206;</button>
+                <input
+                  id="attachmentInput"
+                  class="visually-hidden"
+                  type="file"
+                  accept=".png,.jpg,.jpeg,.webp,.gif,.pdf,.docx,.pptx,.xlsx,.csv,.txt,.md"
+                  multiple
+                />
+                <textarea id="messageInput" rows="2" placeholder="发消息给你的个人助理"></textarea>
+                <button type="submit">发送</button>
+              </div>
             </form>
           </section>
 
@@ -232,6 +243,7 @@
         </section>
       </section>
     </main>
+    <script src="/static/chat-attachments.js"></script>
     <script src="/static/app.js"></script>
   </body>
 </html>
