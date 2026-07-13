@@ -6,6 +6,8 @@ import httpx
 import json
 import os
 
+from app.attachments.model_content import ChatContent, ChatMessage, qwen_provider_messages
+
 
 def model_request_timeout_seconds() -> float:
     try:
@@ -46,7 +48,7 @@ class ChatCompletionClient:
         if self.enable_thinking is None and "qwen" in self.model.lower():
             self.enable_thinking = False
 
-    async def chat(self, messages: list[dict[str, str]], temperature: float = 0.4) -> str:
+    async def chat(self, messages: list[ChatMessage], temperature: float = 0.4) -> str:
         payload, url, headers = self._build_chat_request(messages, temperature=temperature, stream=False)
         async with httpx.AsyncClient() as client:
             if headers:
@@ -56,7 +58,7 @@ class ChatCompletionClient:
             response.raise_for_status()
             return extract_chat_response_text(self.provider_type, response.json()).strip()
 
-    async def stream_chat(self, messages: list[dict[str, str]], temperature: float = 0.4):
+    async def stream_chat(self, messages: list[ChatMessage], temperature: float = 0.4):
         payload, url, headers = self._build_chat_request(messages, temperature=temperature, stream=True)
         async with httpx.AsyncClient() as client:
             stream_kwargs: dict[str, Any] = {
@@ -74,7 +76,7 @@ class ChatCompletionClient:
 
     def _build_chat_request(
         self,
-        messages: list[dict[str, str]],
+        messages: list[ChatMessage],
         *,
         temperature: float,
         stream: bool,
@@ -87,14 +89,14 @@ class ChatCompletionClient:
 
     def _build_openai_compatible_request(
         self,
-        messages: list[dict[str, str]],
+        messages: list[ChatMessage],
         *,
         temperature: float,
         stream: bool,
     ) -> tuple[dict[str, Any], str, dict[str, str]]:
         payload: dict[str, Any] = {
             "model": self.model,
-            "messages": messages,
+            "messages": qwen_provider_messages(messages),
             "temperature": temperature,
             "max_tokens": self.config.max_output_tokens,
             "stream": stream,
@@ -113,7 +115,7 @@ class ChatCompletionClient:
 
     def _build_anthropic_request(
         self,
-        messages: list[dict[str, str]],
+        messages: list[ChatMessage],
         *,
         temperature: float,
         stream: bool,
@@ -137,7 +139,7 @@ class ChatCompletionClient:
 
     def _build_google_request(
         self,
-        messages: list[dict[str, str]],
+        messages: list[ChatMessage],
         *,
         temperature: float,
         stream: bool,
@@ -172,10 +174,10 @@ class QwenClient:
             )
         )
 
-    async def chat(self, messages: list[dict[str, str]], temperature: float = 0.4) -> str:
+    async def chat(self, messages: list[ChatMessage], temperature: float = 0.4) -> str:
         return await self._client.chat(messages, temperature=temperature)
 
-    async def stream_chat(self, messages: list[dict[str, str]], temperature: float = 0.4):
+    async def stream_chat(self, messages: list[ChatMessage], temperature: float = 0.4):
         async for chunk in self._client.stream_chat(messages, temperature=temperature):
             yield chunk
 
@@ -220,15 +222,27 @@ def authorization_header(api_key: str, mode: str, base_url: str) -> str:
     return f"Bearer {value}"
 
 
-def split_system_messages(messages: list[dict[str, str]]) -> tuple[str, list[dict[str, str]]]:
+def _text_from_content(content: ChatContent) -> str:
+    if isinstance(content, str):
+        return content
+    return "".join(
+        str(part.get("text") or "")
+        for part in content
+        if isinstance(part, dict) and part.get("type") == "text"
+    )
+
+
+def split_system_messages(messages: list[ChatMessage]) -> tuple[str, list[ChatMessage]]:
     system_parts: list[str] = []
-    conversation: list[dict[str, str]] = []
+    conversation: list[ChatMessage] = []
     for message in messages:
         role = str(message.get("role") or "user").strip().lower()
-        content = str(message.get("content") or "")
+        raw_content = message.get("content", "")
+        content: ChatContent = raw_content if isinstance(raw_content, (str, list)) else ""
         if role == "system":
-            if content:
-                system_parts.append(content)
+            system_text = _text_from_content(content)
+            if system_text:
+                system_parts.append(system_text)
             continue
         if role not in {"user", "assistant"}:
             role = "user"
@@ -236,16 +250,22 @@ def split_system_messages(messages: list[dict[str, str]]) -> tuple[str, list[dic
     return "\n\n".join(system_parts).strip(), conversation or [{"role": "user", "content": ""}]
 
 
-def anthropic_messages(messages: list[dict[str, str]]) -> tuple[str, list[dict[str, str]]]:
+def anthropic_messages(messages: list[ChatMessage]) -> tuple[str, list[ChatMessage]]:
     return split_system_messages(messages)
 
 
-def google_contents(messages: list[dict[str, str]]) -> tuple[str, list[dict[str, Any]]]:
+def google_contents(messages: list[ChatMessage]) -> tuple[str, list[dict[str, Any]]]:
     system, conversation = split_system_messages(messages)
     contents: list[dict[str, Any]] = []
     for message in conversation:
         role = "model" if message["role"] == "assistant" else "user"
-        contents.append({"role": role, "parts": [{"text": message["content"]}]})
+        content = message["content"]
+        parts = [{"text": content}] if isinstance(content, str) else [
+            {"text": str(part.get("text") or "")}
+            for part in content
+            if isinstance(part, dict) and part.get("type") == "text"
+        ]
+        contents.append({"role": role, "parts": parts or [{"text": ""}]})
     return system, contents
 
 
@@ -260,7 +280,7 @@ def extract_chat_response_text(provider_type: str, data: dict[str, Any]) -> str:
             parts = (((candidates[0] or {}).get("content") or {}).get("parts") or [])
             return "".join(str(part.get("text", "")) for part in parts if isinstance(part, dict)).strip()
     if "choices" in data:
-        return str(data["choices"][0]["message"]["content"]).strip()
+        return _text_from_response_content((data["choices"][0].get("message") or {}).get("content"))
     if "response" in data:
         return str(data["response"]).strip()
     if "text" in data:
@@ -268,6 +288,20 @@ def extract_chat_response_text(provider_type: str, data: dict[str, Any]) -> str:
     if "content" in data:
         return str(data["content"]).strip()
     return str(data).strip()
+
+
+def _text_from_response_content(content: Any) -> str:
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        return "".join(
+            str(part.get("text") or "")
+            for part in content
+            if isinstance(part, dict) and part.get("type") in {None, "text", "output_text"}
+        ).strip()
+    return str(content).strip()
 
 
 def parse_provider_stream_line(provider_type: str, line: str) -> str:
@@ -316,7 +350,7 @@ def parse_stream_data(data: dict[str, Any]) -> str:
             return str(delta["content"])
         message = choice.get("message") or {}
         if "content" in message:
-            return str(message["content"])
+            return _text_from_response_content(message["content"])
     for key in ("response", "text", "content"):
         if key in data:
             return str(data[key])

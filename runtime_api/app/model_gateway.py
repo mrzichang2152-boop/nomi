@@ -14,6 +14,7 @@ from app.model_client import (
     model_request_timeout_seconds,
     openai_compatible_chat_url,
 )
+from app.attachments.model_content import ChatMessage
 
 
 MODEL_UNAVAILABLE_MESSAGE = "模型服务暂时不可用，请稍后重试。"
@@ -99,10 +100,10 @@ def redact_model_error_text(value: Any) -> str:
 class ChatProvider(Protocol):
     config: ModelProviderConfig
 
-    async def chat(self, messages: list[dict[str, str]], temperature: float = 0.4) -> str:
+    async def chat(self, messages: list[ChatMessage], temperature: float = 0.4) -> str:
         ...
 
-    def stream_chat(self, messages: list[dict[str, str]], temperature: float = 0.4) -> AsyncIterator[str]:
+    def stream_chat(self, messages: list[ChatMessage], temperature: float = 0.4) -> AsyncIterator[str]:
         ...
 
 
@@ -122,10 +123,10 @@ class QwenHTTPProvider:
             )
         )
 
-    async def chat(self, messages: list[dict[str, str]], temperature: float = 0.4) -> str:
+    async def chat(self, messages: list[ChatMessage], temperature: float = 0.4) -> str:
         return await self._client.chat(messages, temperature=temperature)
 
-    async def stream_chat(self, messages: list[dict[str, str]], temperature: float = 0.4) -> AsyncIterator[str]:
+    async def stream_chat(self, messages: list[ChatMessage], temperature: float = 0.4) -> AsyncIterator[str]:
         async for chunk in self._client.stream_chat(messages, temperature=temperature):
             yield chunk
 
@@ -168,7 +169,7 @@ class ModelGateway:
             "unavailable": active is None,
         }
 
-    async def chat(self, messages: list[dict[str, str]], temperature: float = 0.4) -> ModelAnswer:
+    async def chat(self, messages: list[ChatMessage], temperature: float = 0.4) -> ModelAnswer:
         failures: list[dict[str, Any]] = []
         fallback_from: list[str] = []
         for provider in self._eligible_providers():
@@ -188,7 +189,7 @@ class ModelGateway:
 
     async def stream_chat(
         self,
-        messages: list[dict[str, str]],
+        messages: list[ChatMessage],
         temperature: float = 0.4,
     ) -> AsyncIterator[ModelStreamChunk]:
         failures: list[dict[str, Any]] = []

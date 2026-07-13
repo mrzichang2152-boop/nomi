@@ -160,6 +160,9 @@ def test_retrieve_attachment_context_for_chat_uses_current_ids_without_prior_que
                         locator={"page": 7},
                         content_hash="hash-7",
                         vector_score=0.9,
+                        contains_visual=True,
+                        visual_storage_relative_path="renders/page-7.png",
+                        visual_mime_type="image/png",
                     ),
                 ),
                 page_count=7,
@@ -184,6 +187,25 @@ def test_retrieve_attachment_context_for_chat_uses_current_ids_without_prior_que
     assert context[0]["evidence_id"].startswith("att-evidence-")
     assert context[0]["citation_label"] == "[方案.pdf，第 7 页]"
     assert context[0]["coverage_complete"] is True
+    visual_context = [item for item in context if item["layer"] == "attachment_visual_evidence"]
+    assert visual_context == [
+        {
+            "layer": "attachment_visual_evidence",
+            "source": "attachment",
+            "source_id": context[0]["evidence_id"],
+            "evidence_id": context[0]["evidence_id"],
+            "attachment_id": str(attachment_id),
+            "filename": "方案.pdf",
+            "kind": "pdf",
+            "locator": {"page": 7},
+            "citation_label": "[方案.pdf，第 7 页]",
+            "storage_relative_path": "renders/page-7.png",
+            "mime_type": "image/png",
+            "reason": "contains_visual",
+            "relevance_score": context[0]["relevance_score"],
+            "coverage_complete": True,
+        }
+    ]
 
 
 def test_retrieve_attachment_context_for_chat_resolves_prior_reference_and_persists_full_inspection(monkeypatch):

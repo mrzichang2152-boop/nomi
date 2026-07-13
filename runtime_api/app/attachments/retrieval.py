@@ -36,6 +36,8 @@ class AttachmentChunk:
     low_text_density: bool = False
     contains_visual: bool = False
     text_insufficient: bool = False
+    visual_storage_relative_path: Optional[str] = None
+    visual_mime_type: Optional[str] = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "attachment_id", UUID(str(self.attachment_id)))
@@ -88,6 +90,8 @@ class SelectedVisualEvidence:
     locator: dict[str, object]
     reason: str
     score: float
+    storage_relative_path: Optional[str] = None
+    mime_type: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -398,6 +402,10 @@ def plan_attachment_evidence(
             locator=dict(item.locator),
             reason=reason,
             score=item.score,
+            storage_relative_path=chunk_by_key[
+                (item.attachment_id, item.ordinal)
+            ].visual_storage_relative_path,
+            mime_type=chunk_by_key[(item.attachment_id, item.ordinal)].visual_mime_type,
         )
         for item, reason in visual_candidates[: max(0, int(max_visual_items))]
     )
@@ -632,14 +640,9 @@ def load_attachment_evidence(
                chunk.content_hash, {vector_expression} AS vector_score,
                COALESCE(manifest.metadata, '{{}}'::jsonb) AS manifest_metadata,
                (length(trim(chunk.text)) < 80) AS low_text_density,
-               EXISTS (
-                 SELECT 1
-                 FROM chat_attachment_derivatives visual
-                 WHERE visual.attachment_id = attachment.id
-                   AND visual.processing_version = attachment.processing_version
-                   AND visual.kind <> 'manifest'
-                   AND visual.locator = chunk.locator
-               ) AS contains_visual
+               (visual.storage_relative_path IS NOT NULL) AS contains_visual,
+               visual.storage_relative_path,
+               visual.mime_type
         FROM chat_attachments attachment
         JOIN chat_attachment_chunks chunk
           ON chunk.attachment_id = attachment.id
@@ -653,6 +656,17 @@ def load_attachment_evidence(
           ORDER BY derivative.created_at DESC
           LIMIT 1
         ) manifest ON TRUE
+        LEFT JOIN LATERAL (
+          SELECT derivative.storage_relative_path, derivative.mime_type
+          FROM chat_attachment_derivatives derivative
+          WHERE derivative.attachment_id = attachment.id
+            AND derivative.processing_version = attachment.processing_version
+            AND derivative.kind <> 'manifest'
+            AND derivative.storage_relative_path IS NOT NULL
+            AND derivative.locator = chunk.locator
+          ORDER BY derivative.created_at DESC, derivative.id
+          LIMIT 1
+        ) visual ON TRUE
         WHERE attachment.id = ANY(%s)
           AND attachment.status = 'ready'
           AND attachment.lifecycle = 'attached'
@@ -687,6 +701,8 @@ def load_attachment_evidence(
                 low_text_density=bool(row[10]),
                 contains_visual=bool(row[11]),
                 text_insufficient=len(text.strip()) < 24,
+                visual_storage_relative_path=str(row[12]) if row[12] else None,
+                visual_mime_type=str(row[13]) if row[13] else None,
             )
         )
     return [

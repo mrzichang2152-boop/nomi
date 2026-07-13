@@ -61,6 +61,8 @@ def chunk(
     low_text_density: bool = False,
     contains_visual: bool = False,
     text_insufficient: bool = False,
+    visual_storage_relative_path: str | None = None,
+    visual_mime_type: str | None = None,
 ) -> AttachmentChunk:
     return AttachmentChunk(
         attachment_id=attachment_id,
@@ -73,6 +75,8 @@ def chunk(
         low_text_density=low_text_density,
         contains_visual=contains_visual,
         text_insufficient=text_insufficient,
+        visual_storage_relative_path=visual_storage_relative_path,
+        visual_mime_type=visual_mime_type,
     )
 
 
@@ -194,6 +198,8 @@ def test_visual_escalation_is_relevant_bounded_and_not_a_large_document_sweep():
             low_text_density=index % 2 == 0,
             contains_visual=index % 2 == 1,
             text_insufficient=True,
+            visual_storage_relative_path=f"renders/page-{index + 1}.png",
+            visual_mime_type="image/png",
         )
         for index in range(10)
     ]
@@ -204,6 +210,8 @@ def test_visual_escalation_is_relevant_bounded_and_not_a_large_document_sweep():
     assert plan.mode == EvidenceMode.HYBRID
     assert len(plan.visual_items) == 6
     assert [item.locator["page"] for item in plan.visual_items] == [1, 2, 3, 4, 5, 6]
+    assert plan.visual_items[0].storage_relative_path == "renders/page-1.png"
+    assert plan.visual_items[0].mime_type == "image/png"
     assert all(item.reason in {"low_text_density", "contains_visual", "visual_question", "text_insufficient"} for item in plan.visual_items)
     assert any(item.reason == "visual_limit" for item in plan.exclusions)
 
@@ -645,6 +653,8 @@ def test_load_attachment_evidence_batches_manifest_chunks_and_vector_scores():
             {"manifest": {"page_count": 22}},
             True,
             True,
+            "renders/page-1.png",
+            "image/png",
         ),
         (
             PDF_ID,
@@ -659,6 +669,8 @@ def test_load_attachment_evidence_batches_manifest_chunks_and_vector_scores():
             {"manifest": {"page_count": 22}},
             False,
             False,
+            None,
+            None,
         ),
     ]
     conn = RecordingConnection([FakeResult(rows=rows)])
@@ -672,6 +684,8 @@ def test_load_attachment_evidence_batches_manifest_chunks_and_vector_scores():
     assert [item.vector_score for item in loaded[0].chunks] == [0.91, 0.82]
     assert loaded[0].chunks[0].low_text_density is True
     assert loaded[0].chunks[0].contains_visual is True
+    assert loaded[0].chunks[0].visual_storage_relative_path == "renders/page-1.png"
+    assert loaded[0].chunks[0].visual_mime_type == "image/png"
 
 
 def test_recent_attachment_ids_are_scoped_ordered_and_bounded_to_recent_turns():
