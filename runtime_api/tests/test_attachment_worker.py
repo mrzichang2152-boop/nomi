@@ -155,6 +155,22 @@ def test_queue_has_one_item_per_attachment_and_processing_version():
     assert queue.pending_count == 2
 
 
+def test_stale_processing_version_job_is_acked_without_mutating_attachment(tmp_path):
+    worker, repository, queue = build_worker(tmp_path, SuccessfulParser())
+    record = stored_record()
+    seed_record(repository, record)
+    create_original(tmp_path, record)
+    queue.enqueue(record.attachment_id, "attachment-v0")
+
+    result = worker.run_next(now=BASE_TIME)
+
+    final = repository.get(record.attachment_id)
+    assert result is not None and result.status == "skipped"
+    assert final is not None and final.status == "stored"
+    assert final.processing_version == "attachment-v1"
+    assert queue.inflight_count == 0
+
+
 def test_worker_transitions_stored_to_processing_to_ready_and_acks_job(tmp_path):
     parser = SuccessfulParser()
     worker, repository, queue = build_worker(tmp_path, parser)
@@ -317,6 +333,30 @@ def test_cleanup_removes_stale_receiving_record_and_orphan_part(tmp_path):
     assert report.deleted_attachment_ids == [stale.attachment_id]
     assert report.removed_orphan_parts == 1
     assert not orphan.exists()
+
+
+def test_cleanup_retries_two_phase_physical_deletion_after_first_failure(tmp_path):
+    repository = InMemoryAttachmentRepository()
+    record = stored_record(expires_at=BASE_TIME - timedelta(seconds=1))
+    seed_record(repository, record)
+    blocked_path = tmp_path / str(record.storage_relative_path)
+    blocked_path.mkdir(parents=True)
+    cleaner = DraftCleaner(repository=repository, storage_root=tmp_path)
+
+    first = cleaner.cleanup(now=BASE_TIME)
+
+    pending = repository.get(record.attachment_id)
+    assert first.deleted_attachment_ids == []
+    assert pending is not None and pending.lifecycle == "deleted" and pending.deleted_at is None
+
+    blocked_path.rmdir()
+    blocked_path.write_bytes(b"content")
+    second = cleaner.cleanup(now=BASE_TIME + timedelta(seconds=1))
+
+    final = repository.get(record.attachment_id)
+    assert second.deleted_attachment_ids == [record.attachment_id]
+    assert final is not None and final.deleted_at == BASE_TIME + timedelta(seconds=1)
+    assert not blocked_path.exists()
 
 
 def test_worker_config_defaults_match_private_two_core_server_budget(monkeypatch):

@@ -4,7 +4,11 @@ import threading
 from dataclasses import dataclass, replace
 from datetime import datetime
 from typing import Callable, ContextManager, Optional, Protocol, Sequence
-from uuid import UUID
+from uuid import UUID, uuid4
+
+from psycopg.types.json import Jsonb
+
+from app.attachments.parsers.common import ParseResult
 
 
 @dataclass(frozen=True)
@@ -52,10 +56,24 @@ class AttachmentRepository(Protocol):
     def mark_failed(self, attachment_id: UUID, **changes: object) -> AttachmentRecord:
         ...
 
-    def mark_processing(self, attachment_id: UUID) -> Optional[AttachmentRecord]:
+    def mark_processing(
+        self,
+        attachment_id: UUID,
+        processing_version: str,
+    ) -> Optional[AttachmentRecord]:
         ...
 
     def mark_ready(self, attachment_id: UUID, **changes: object) -> AttachmentRecord:
+        ...
+
+    def persist_parse_result(
+        self,
+        attachment_id: UUID,
+        processing_version: str,
+        result: ParseResult,
+        *,
+        processed_at: datetime,
+    ) -> AttachmentRecord:
         ...
 
     def mark_attached(self, attachment_id: UUID, *, attached_at: datetime) -> AttachmentRecord:
@@ -75,11 +93,15 @@ class AttachmentRepository(Protocol):
     def complete_deleted(self, attachment_id: UUID, *, deleted_at: datetime) -> AttachmentRecord:
         ...
 
+    def list_storage_paths(self, attachment_id: UUID) -> Sequence[str]:
+        ...
+
 
 class InMemoryAttachmentRepository:
     def __init__(self) -> None:
         self._records: dict[UUID, AttachmentRecord] = {}
         self._client_upload_ids: dict[str, UUID] = {}
+        self._parse_results: dict[tuple[UUID, str], ParseResult] = {}
         self._lock = threading.RLock()
 
     def create_receiving(self, record: AttachmentRecord) -> AttachmentRecord:
@@ -117,10 +139,16 @@ class InMemoryAttachmentRepository:
     def mark_failed(self, attachment_id: UUID, **changes: object) -> AttachmentRecord:
         return self._update(attachment_id, status="failed", **changes)
 
-    def mark_processing(self, attachment_id: UUID) -> Optional[AttachmentRecord]:
+    def mark_processing(
+        self,
+        attachment_id: UUID,
+        processing_version: str,
+    ) -> Optional[AttachmentRecord]:
         with self._lock:
             current = self._records.get(attachment_id)
             if current is None or current.lifecycle == "deleted":
+                return None
+            if current.processing_version != processing_version:
                 return None
             if current.status not in {"stored", "failed", "processing"}:
                 return None
@@ -142,6 +170,49 @@ class InMemoryAttachmentRepository:
             **changes,
         )
 
+    def persist_parse_result(
+        self,
+        attachment_id: UUID,
+        processing_version: str,
+        result: ParseResult,
+        *,
+        processed_at: datetime,
+    ) -> AttachmentRecord:
+        with self._lock:
+            current = self._records[attachment_id]
+            if current.status != "processing" or current.processing_version != processing_version:
+                raise ValueError("attachment_not_processing_for_version")
+            self._parse_results[(attachment_id, processing_version)] = result
+            updated = replace(
+                current,
+                status="ready",
+                processed_at=processed_at,
+                error_code=None,
+                error_detail_safe=None,
+            )
+            self._records[attachment_id] = updated
+            return updated
+
+    def get_parse_result(self, attachment_id: UUID, processing_version: str) -> Optional[ParseResult]:
+        with self._lock:
+            return self._parse_results.get((attachment_id, processing_version))
+
+    def list_storage_paths(self, attachment_id: UUID) -> Sequence[str]:
+        with self._lock:
+            paths: list[str] = []
+            record = self._records.get(attachment_id)
+            if record is not None and record.storage_relative_path:
+                paths.append(record.storage_relative_path)
+            for (stored_attachment_id, _), result in self._parse_results.items():
+                if stored_attachment_id != attachment_id:
+                    continue
+                paths.extend(
+                    derivative.storage_relative_path
+                    for derivative in result.derivatives
+                    if derivative.storage_relative_path
+                )
+            return tuple(dict.fromkeys(paths))
+
     def mark_attached(self, attachment_id: UUID, *, attached_at: datetime) -> AttachmentRecord:
         return self._update(
             attachment_id,
@@ -161,10 +232,15 @@ class InMemoryAttachmentRepository:
                 (
                     record
                     for record in self._records.values()
-                    if record.lifecycle == "draft"
-                    and (
-                        (record.expires_at is not None and record.expires_at <= now)
-                        or (record.status == "receiving" and record.created_at <= stale_receiving_before)
+                    if (
+                        (
+                            record.lifecycle == "draft"
+                            and (
+                                (record.expires_at is not None and record.expires_at <= now)
+                                or (record.status == "receiving" and record.created_at <= stale_receiving_before)
+                            )
+                        )
+                        or (record.lifecycle == "deleted" and record.deleted_at is None)
                     )
                 ),
                 key=lambda record: (record.created_at, str(record.attachment_id)),
@@ -173,7 +249,11 @@ class InMemoryAttachmentRepository:
     def mark_lifecycle_deleted(self, attachment_id: UUID) -> Optional[AttachmentRecord]:
         with self._lock:
             current = self._records.get(attachment_id)
-            if current is None or current.lifecycle != "draft":
+            if current is None:
+                return None
+            if current.lifecycle == "deleted" and current.deleted_at is None:
+                return current
+            if current.lifecycle != "draft":
                 return None
             updated = replace(current, lifecycle="deleted", deleted_at=None)
             self._records[attachment_id] = updated
@@ -361,18 +441,23 @@ class PostgresAttachmentRepository:
     def mark_failed(self, attachment_id: UUID, **changes: object) -> AttachmentRecord:
         return self._update(attachment_id, status="failed", changes=changes)
 
-    def mark_processing(self, attachment_id: UUID) -> Optional[AttachmentRecord]:
+    def mark_processing(
+        self,
+        attachment_id: UUID,
+        processing_version: str,
+    ) -> Optional[AttachmentRecord]:
         with self.connection_factory() as connection:
             locked = connection.execute(
                 f"""
                 SELECT {self._COLUMNS}
                 FROM chat_attachments
                 WHERE id = %s
+                  AND processing_version = %s
                   AND lifecycle <> 'deleted'
                   AND status IN ('stored', 'failed', 'processing')
                 FOR UPDATE SKIP LOCKED
                 """,
-                (attachment_id,),
+                (attachment_id, processing_version),
             ).fetchone()
             if locked is None:
                 return None
@@ -394,6 +479,113 @@ class PostgresAttachmentRepository:
             changes={"error_code": None, "error_detail_safe": None, **changes},
         )
 
+    def persist_parse_result(
+        self,
+        attachment_id: UUID,
+        processing_version: str,
+        result: ParseResult,
+        *,
+        processed_at: datetime,
+    ) -> AttachmentRecord:
+        with self.connection_factory() as connection:
+            locked = connection.execute(
+                """
+                SELECT status, processing_version
+                FROM chat_attachments
+                WHERE id = %s
+                FOR UPDATE
+                """,
+                (attachment_id,),
+            ).fetchone()
+            if locked is None:
+                raise KeyError(str(attachment_id))
+            if locked[0] != "processing" or locked[1] != processing_version:
+                raise ValueError("attachment_not_processing_for_version")
+
+            connection.execute(
+                "DELETE FROM chat_attachment_chunks WHERE attachment_id = %s AND processing_version = %s",
+                (attachment_id, processing_version),
+            )
+            connection.execute(
+                "DELETE FROM chat_attachment_derivatives WHERE attachment_id = %s AND processing_version = %s",
+                (attachment_id, processing_version),
+            )
+            connection.execute(
+                """
+                INSERT INTO chat_attachment_derivatives
+                  (id, attachment_id, kind, mime_type, storage_relative_path, byte_size,
+                   locator, metadata, processing_version)
+                VALUES (%s, %s, 'manifest', 'application/json', NULL, 0, '{}'::jsonb, %s, %s)
+                """,
+                (
+                    uuid4(),
+                    attachment_id,
+                    Jsonb(
+                        {
+                            "manifest": result.manifest,
+                            "warnings": list(result.warnings),
+                            "metrics": result.metrics,
+                            "summary": result.summary,
+                            "requires_default_visual_sweep": result.requires_default_visual_sweep,
+                        }
+                    ),
+                    processing_version,
+                ),
+            )
+            for derivative in result.derivatives:
+                connection.execute(
+                    """
+                    INSERT INTO chat_attachment_derivatives
+                      (id, attachment_id, kind, mime_type, storage_relative_path, byte_size,
+                       locator, metadata, processing_version)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    """,
+                    (
+                        uuid4(),
+                        attachment_id,
+                        derivative.kind,
+                        derivative.mime_type,
+                        derivative.storage_relative_path,
+                        derivative.byte_size,
+                        Jsonb(derivative.locator),
+                        Jsonb({**derivative.metadata, "content_hash": derivative.content_hash}),
+                        processing_version,
+                    ),
+                )
+            for ordinal, chunk in enumerate(result.chunks):
+                connection.execute(
+                    """
+                    INSERT INTO chat_attachment_chunks
+                      (id, attachment_id, ordinal, text, token_count, locator, content_hash,
+                       processing_version)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                    """,
+                    (
+                        uuid4(),
+                        attachment_id,
+                        ordinal,
+                        chunk.text,
+                        chunk.token_count,
+                        Jsonb(chunk.locator),
+                        chunk.content_hash,
+                        processing_version,
+                    ),
+                )
+            row = connection.execute(
+                f"""
+                UPDATE chat_attachments
+                SET status = 'ready', processed_at = %s,
+                    error_code = NULL, error_detail_safe = NULL
+                WHERE id = %s
+                RETURNING {self._COLUMNS}
+                """,
+                (processed_at, attachment_id),
+            ).fetchone()
+        record = self._record(row)
+        if record is None:
+            raise KeyError(str(attachment_id))
+        return record
+
     def mark_attached(self, attachment_id: UUID, *, attached_at: datetime) -> AttachmentRecord:
         return self._update(
             attachment_id,
@@ -412,11 +604,14 @@ class PostgresAttachmentRepository:
                 f"""
                 SELECT {self._COLUMNS}
                 FROM chat_attachments
-                WHERE lifecycle = 'draft'
-                  AND (
-                    (expires_at IS NOT NULL AND expires_at <= %s)
-                    OR (status = 'receiving' AND created_at <= %s)
+                WHERE (
+                    lifecycle = 'draft'
+                    AND (
+                      (expires_at IS NOT NULL AND expires_at <= %s)
+                      OR (status = 'receiving' AND created_at <= %s)
+                    )
                   )
+                  OR (lifecycle = 'deleted' AND deleted_at IS NULL)
                 ORDER BY created_at, id
                 """,
                 (now, stale_receiving_before),
@@ -429,7 +624,11 @@ class PostgresAttachmentRepository:
                 f"""
                 UPDATE chat_attachments
                 SET lifecycle = 'deleted', deleted_at = NULL
-                WHERE id = %s AND lifecycle = 'draft'
+                WHERE id = %s
+                  AND (
+                    lifecycle = 'draft'
+                    OR (lifecycle = 'deleted' AND deleted_at IS NULL)
+                  )
                 RETURNING {self._COLUMNS}
                 """,
                 (attachment_id,),
@@ -437,14 +636,39 @@ class PostgresAttachmentRepository:
         return self._record(row)
 
     def complete_deleted(self, attachment_id: UUID, *, deleted_at: datetime) -> AttachmentRecord:
-        record = self._update(
-            attachment_id,
-            status=None,
-            changes={"deleted_at": deleted_at},
-        )
-        if record.lifecycle != "deleted":
+        with self.connection_factory() as connection:
+            row = connection.execute(
+                f"""
+                UPDATE chat_attachments
+                SET deleted_at = %s
+                WHERE id = %s AND lifecycle = 'deleted' AND deleted_at IS NULL
+                RETURNING {self._COLUMNS}
+                """,
+                (deleted_at, attachment_id),
+            ).fetchone()
+        record = self._record(row)
+        if record is None:
             raise ValueError("attachment_not_marked_deleted")
         return record
+
+    def list_storage_paths(self, attachment_id: UUID) -> Sequence[str]:
+        with self.connection_factory() as connection:
+            original = connection.execute(
+                "SELECT storage_relative_path FROM chat_attachments WHERE id = %s",
+                (attachment_id,),
+            ).fetchone()
+            derivatives = connection.execute(
+                """
+                SELECT storage_relative_path
+                FROM chat_attachment_derivatives
+                WHERE attachment_id = %s AND storage_relative_path IS NOT NULL
+                ORDER BY created_at, id
+                """,
+                (attachment_id,),
+            ).fetchall()
+        paths = [original[0]] if original and original[0] else []
+        paths.extend(row[0] for row in derivatives if row and row[0])
+        return tuple(dict.fromkeys(paths))
 
 
 __all__ = [

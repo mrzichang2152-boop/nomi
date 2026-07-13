@@ -17,6 +17,8 @@
 | Task 4 后端完整测试 | `python3 -m pytest -q runtime_api/tests` | 通过，961 tests | 队列、Worker、清理与容器边界接入后 |
 | Task 4 附件聚焦测试 | `python3 -m pytest -q runtime_api/tests/test_attachment_*.py` | 通过，67 tests | 包含 worker 11 条状态/租约/清理/Compose 契约 |
 | Task 4 Compose 配置 | `docker compose config --quiet` | 通过 | 独立非 root `attachment-worker` 与共享私有卷已解析 |
+| Task 5 后端完整测试 | `python3 -m pytest -q runtime_api/tests` | 通过，978 tests | 八类解析器、原子结果持久化与恢复性修复接入后 |
+| Task 5 附件聚焦测试 | Task 1-5 的全部附件测试文件 | 通过，84 tests | 逐项核对事实、locator、编码、扫描页、公式/值、预览与生命周期 |
 | 工作区 | `git status --short` | 脏工作区 | 存在既有 OpenCode、Web Search、Android 等改动；不得重置或整体暂存 |
 
 ## 规格覆盖状态
@@ -24,13 +26,13 @@
 | 规格域 | 状态 | 自动化证据 | 真实环境证据 | 已知 Gap | 阻塞 | 下一步 |
 | --- | --- | --- | --- | --- | --- | --- |
 | 产品输入：纯附件/附件+文字 | 部分完成 | `test_attachment_models.py` 已验证输入域规则 | 无 | HTTP/WS 尚未接收附件 ID，`ChatIn` 仍待 Task 7 接入 | 无 | Task 7 |
-| 支持格式与拒绝格式 | 检测层代码与自动化完成，解析内容未完成 | `test_attachment_detection.py` 覆盖 11 种允许格式及伪装可执行文件、旧 Office、脚本、损坏/加密容器、ZIP traversal/bomb、图片像素上限 | 无 | 尚未在 Worker 中调用检测层；正文与视觉衍生物待 Task 4、5 | 无 | Task 4、5、17 |
+| 支持格式与拒绝格式 | 轻量解析代码与自动化完成，未部署 | 检测测试覆盖 11 种允许格式与恶意输入；`test_attachment_parsers.py` 逐项验证图片、PDF、DOCX、PPTX、XLSX、CSV、TXT、MD 的实际事实和稳定 locator | 无 | LibreOffice 版式渲染与真实 Qwen 视觉升级尚未接入；真实文件集待 Task 17 | 无 | Task 9、10、17 |
 | 私有流式存储 | 代码与自动化完成，未部署 | `test_attachment_storage.py` 核对 256 KiB 分块、SHA-256、越限立即中止、断连清理、`fsync` 后原子替换、随机磁盘名、路径逃逸拒绝 | 无 | 尚未接上传 API 和真实挂载卷 | 云环境部署待 Task 16 | Task 3、16、17 |
 | 四表数据模型 | 代码与自动化完成，未部署 | runtime/fresh-install schema 契约测试通过；后端全量 903 passed | 无 | 尚未在真实 PostgreSQL 执行迁移并核对约束 | 云环境部署待 Task 16 | Task 16、17 |
 | 上传与草稿幂等 | 代码与自动化完成，未部署 | `test_attachment_api.py` 10 条用例验证鉴权、multipart、202 草稿、安全响应、24 小时过期、断连/越限/拒绝、相同字节幂等及不同字节 409；后端全量 950 passed | 无 | 尚未在真实 PostgreSQL、Redis、挂载卷和客户端上传中验收 | 云环境部署待 Task 16 | Task 10-12、16、17 |
 | 状态、预览、原件、重试、删除 API | 未开始 | 无 | 无 | 端点未建立 | 无 | Task 6 |
-| 有界异步解析 Worker | 代码与自动化完成，未部署 | `test_attachment_worker.py` 11 条用例验证版本去重、状态迁移、分类并发、120 秒默认超时、安全失败、租约恢复、崩溃恢复、两阶段草稿清理、孤儿临时文件及 attached 排除；Compose 约束 CPU 0.75、内存 768MB、非 root、只读根目录和共享私有卷 | 无 | Task 5 解析器尚未提供时入口会等待且不消费任务；Redis/PostgreSQL 真实进程与资源峰值尚未验收 | 云环境部署待 Task 16 | Task 5、16、17 |
-| 图片/PDF/Office/表格/文本解析 | 未开始 | 无 | 无 | 没有统一解析结果与 locator | 无 | Task 5 |
+| 有界异步解析 Worker | 代码与自动化完成，未部署 | `test_attachment_worker.py` 14 条用例验证版本去重、stale-version 隔离、状态迁移、分类并发、超时、安全失败、租约/崩溃恢复、可重试两阶段清理、孤儿临时文件及 attached 排除；Compose 约束 CPU 0.75、内存 768MB、非 root、只读根目录和共享私有卷 | 无 | Redis/PostgreSQL 真实进程与资源峰值尚未验收 | 云环境部署待 Task 16 | Task 16、17 |
+| 图片/PDF/Office/表格/文本解析 | 轻量解析与语义自动化完成，未部署 | 14 组 parser 测试验证 EXIF 旋转、GIF 去重帧、数字/扫描 PDF 与按页渲染、DOCX 标题/表格/链接、31 张 PPTX 备注、XLSX 公式+缓存值、长 CSV、UTF-8/GB18030、Markdown 代码块；worker 在同一 DB 事务保存 manifest/chunks/derivatives 后才置 ready | 无 | Office 版式渲染、图表视觉理解和 visual-result 的生产缓存读写随 Task 9/10 接入；尚无云端真实性能数据 | 无 | Task 9、10、16、17 |
 | 消息原子绑定和幂等 | 未开始 | 无 | 无 | HTTP/WS 未接收附件 ID | 无 | Task 7 |
 | 历史、失败重试和会话删除 | 未开始 | 无 | 无 | 历史无附件，失败重试未复用 user turn | 无 | Task 8 |
 | 全文/混合检索/逐页检查 | 未开始 | 无 | 无 | 附件证据不进入上下文 | 无 | Task 9 |
@@ -42,7 +44,7 @@
 | Web 完整 App 交互 | 未开始 | 无 | 无 | 无选择器、托盘、状态卡和附件历史 | 无 | Task 11、12 |
 | Android 悬浮窗交互 | 未开始 | 无 | 无 | 无原生选择、流式上传和托盘 | 无 | Task 13 |
 | 双界面历史一致性 | 未开始 | 无 | 无 | 本地镜像无附件元数据 | 无 | Task 14 |
-| 安全与提示注入防护 | 文件入口安全部分完成 | hostile-file 测试已验证 ZIP bomb、ZIP traversal、加密/损坏容器、脚本与伪装可执行文件；错误信息不回显本地路径 | 无 | 文档内提示注入、鉴权下载、审计和真实恶意样本待后续任务 | 无 | Task 6、8、14、17 |
+| 安全与提示注入防护 | 文件入口与解析失败隔离完成，未部署 | hostile-file 测试验证 ZIP bomb、ZIP traversal、加密/损坏容器、脚本与伪装可执行文件；解析异常不回显路径；持久化失败清除未提交衍生文件；物理删除失败可在下一轮恢复 | 无 | 文档内提示注入、鉴权下载、审计和真实恶意样本待后续任务 | 无 | Task 6、8、14、17 |
 | 隐私安全 Trace | 未开始 | 无 | 无 | 无附件证据和耗时 trace | 无 | Task 15 |
 | 2 核 4G 性能与部署 | 容器预算契约完成，未实测 | 自动化锁定 attachment-worker `0.75 CPU / 768MB`、分类并发 `2/1/1`、非 root 和只读根文件系统；`docker compose config --quiet` 通过 | 无 | 尚未构建镜像并以 25MB 上传、31 页解析和并发聊天做资源实测 | 云环境部署待 Task 16 | Task 16、17 |
 | 云端、真实文件、Qwen、Android 真机 | 未开始 | 无 | 无 | 全部真实验收尚未执行 | 需要后续真机在线 | Task 17 |

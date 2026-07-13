@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import os
 import threading
+import uuid
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional, Protocol
@@ -14,16 +15,10 @@ from app.attachments.models import (
     AttachmentRejected,
     SAFE_ATTACHMENT_ERROR_MESSAGES,
 )
+from app.attachments.parsers.common import ParseResult, ParsedDerivative
 from app.attachments.queue import QueueItem
 from app.attachments.repository import AttachmentRecord, AttachmentRepository
 from app.attachments.storage import resolve_storage_path
-
-
-@dataclass(frozen=True)
-class ParseResult:
-    summary: str
-    chunk_count: int
-    derivative_count: int
 
 
 @dataclass(frozen=True)
@@ -124,6 +119,44 @@ class AttachmentWorker:
         finally:
             executor.shutdown(wait=False, cancel_futures=True)
 
+    def _materialize_derivatives(
+        self,
+        record: AttachmentRecord,
+        result: ParseResult,
+    ) -> ParseResult:
+        materialized: list[ParsedDerivative] = []
+        for derivative in result.derivatives:
+            if not derivative.payload:
+                materialized.append(derivative)
+                continue
+            extension = derivative.extension if derivative.extension.startswith(".") else f".{derivative.extension}"
+            relative_path = (
+                Path("derivatives")
+                / record.attachment_id.hex[:2]
+                / str(record.attachment_id)
+                / record.processing_version
+                / f"{uuid.uuid4().hex}{extension}"
+            )
+            destination = resolve_storage_path(self.storage_root, str(relative_path))
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            temporary = destination.with_suffix(f"{destination.suffix}.part")
+            try:
+                with temporary.open("wb") as output:
+                    output.write(derivative.payload)
+                    output.flush()
+                    os.fsync(output.fileno())
+                os.replace(temporary, destination)
+            finally:
+                temporary.unlink(missing_ok=True)
+            materialized.append(
+                replace(
+                    derivative,
+                    payload=b"",
+                    storage_relative_path=str(relative_path),
+                )
+            )
+        return replace(result, derivatives=tuple(materialized), derivative_count=len(materialized))
+
     def run_next(self, *, now: Optional[datetime] = None) -> Optional[WorkerRunResult]:
         active_now = now or datetime.now(timezone.utc)
         item = self.queue.claim(
@@ -134,8 +167,8 @@ class AttachmentWorker:
         if item is None:
             return None
 
-        record = self.repository.mark_processing(item.attachment_id)
-        if record is None or record.processing_version != item.processing_version:
+        record = self.repository.mark_processing(item.attachment_id, item.processing_version)
+        if record is None:
             self.queue.ack(item, self.worker_id)
             return WorkerRunResult(item.attachment_id, "skipped")
 
@@ -176,12 +209,36 @@ class AttachmentWorker:
             self.queue.ack(item, self.worker_id)
             return WorkerRunResult(final.attachment_id, final.status)
 
-        final = self.repository.mark_ready(
-            item.attachment_id,
-            processed_at=active_now,
-        )
+        persisted_result: Optional[ParseResult] = None
+        try:
+            persisted_result = self._materialize_derivatives(record, parse_result)
+            final = self.repository.persist_parse_result(
+                item.attachment_id,
+                item.processing_version,
+                persisted_result,
+                processed_at=active_now,
+            )
+        except Exception:
+            if persisted_result is not None:
+                for derivative in persisted_result.derivatives:
+                    if not derivative.storage_relative_path:
+                        continue
+                    try:
+                        resolve_storage_path(
+                            self.storage_root,
+                            derivative.storage_relative_path,
+                        ).unlink(missing_ok=True)
+                    except OSError:
+                        pass
+            final = self.repository.mark_failed(
+                item.attachment_id,
+                error_code=AttachmentErrorCode.PARSE_FAILED.value,
+                error_detail_safe="文件解析失败，可重试或重新选择文件。",
+            )
+            self.queue.ack(item, self.worker_id)
+            return WorkerRunResult(final.attachment_id, final.status)
         self.queue.ack(item, self.worker_id)
-        return WorkerRunResult(final.attachment_id, final.status, parse_result=parse_result)
+        return WorkerRunResult(final.attachment_id, final.status, parse_result=persisted_result)
 
 
 class DraftCleaner:
@@ -209,12 +266,17 @@ class DraftCleaner:
             marked = self.repository.mark_lifecycle_deleted(candidate.attachment_id)
             if marked is None:
                 continue
-            if marked.storage_relative_path:
-                path = resolve_storage_path(self.storage_root, marked.storage_relative_path)
+            storage_paths = self.repository.list_storage_paths(marked.attachment_id)
+            deletion_failed = False
+            for relative_path in storage_paths:
+                path = resolve_storage_path(self.storage_root, relative_path)
                 try:
                     path.unlink(missing_ok=True)
                 except OSError:
-                    continue
+                    deletion_failed = True
+                    break
+            if deletion_failed:
+                continue
             self.repository.complete_deleted(marked.attachment_id, deleted_at=active_now)
             deleted_ids.append(marked.attachment_id)
 
