@@ -2,14 +2,22 @@ from __future__ import annotations
 
 from datetime import datetime
 from pathlib import Path
-from typing import Callable, ContextManager, Optional
+from typing import BinaryIO, Callable, ContextManager, Iterator, Optional
+from urllib.parse import quote
 from uuid import UUID
 
 from fastapi import APIRouter, File, Form, Header, HTTPException, UploadFile
 from pydantic import BaseModel
+from starlette.responses import Response, StreamingResponse
 
 from app.attachments.repository import AttachmentRepository, PostgresAttachmentRepository
-from app.attachments.service import AttachmentQueue, AttachmentService, AttachmentUploadError
+from app.attachments.service import (
+    AttachmentContentReference,
+    AttachmentLifecycleError,
+    AttachmentQueue,
+    AttachmentService,
+    AttachmentUploadError,
+)
 
 
 class AttachmentUploadResponse(BaseModel):
@@ -21,6 +29,59 @@ class AttachmentUploadResponse(BaseModel):
     kind: str
     created_at: datetime
     expires_at: datetime
+
+
+class AttachmentStatusResponse(BaseModel):
+    attachment_id: UUID
+    filename: str
+    mime_type: str
+    byte_size: int
+    status: str
+    lifecycle: str
+    kind: str
+    preview_url: Optional[str]
+    content_url: str
+    error_code: Optional[str]
+    error_message: Optional[str]
+    created_at: datetime
+    expires_at: Optional[datetime]
+
+
+def _raise_lifecycle_error(error: AttachmentLifecycleError) -> None:
+    raise HTTPException(
+        status_code=error.http_status,
+        detail={"code": error.code, "message": error.safe_message},
+    ) from error
+
+
+def _iter_file(source: BinaryIO, chunk_size: int = 256 * 1024) -> Iterator[bytes]:
+    try:
+        while chunk := source.read(chunk_size):
+            yield chunk
+    finally:
+        source.close()
+
+
+def _content_disposition(disposition: str, filename: str) -> str:
+    extension = Path(filename).suffix.lower()
+    ascii_extension = extension if extension.isascii() and extension.replace(".", "").isalnum() else ""
+    fallback = f"attachment{ascii_extension}"
+    return f'{disposition}; filename="{fallback}"; filename*=UTF-8\'\'{quote(filename)}'
+
+
+def _stream_reference(reference: AttachmentContentReference, *, disposition: str) -> StreamingResponse:
+    response = StreamingResponse(
+        _iter_file(reference.path.open("rb")),
+        media_type=reference.mime_type,
+        headers={
+            "Content-Disposition": _content_disposition(disposition, reference.filename),
+            "Content-Length": str(reference.byte_size),
+            "X-Content-Type-Options": "nosniff",
+            "Cache-Control": "private, no-store",
+            "Accept-Ranges": "none",
+        },
+    )
+    return response
 
 
 def create_attachment_router(
@@ -43,6 +104,27 @@ def create_attachment_router(
         queue=queue,
     )
     router = APIRouter()
+
+    def status_response(record) -> AttachmentStatusResponse:
+        attachment_id = record.attachment_id
+        preview_url = None
+        if active_service.has_preview(record):
+            preview_url = f"/api/chat/attachments/{attachment_id}/preview"
+        return AttachmentStatusResponse(
+            attachment_id=attachment_id,
+            filename=record.safe_filename,
+            mime_type=record.detected_mime_type or "application/octet-stream",
+            byte_size=record.byte_size,
+            status=record.status,
+            lifecycle=record.lifecycle,
+            kind=active_service.kind_for(record),
+            preview_url=preview_url,
+            content_url=f"/api/chat/attachments/{attachment_id}/content",
+            error_code=record.error_code,
+            error_message=record.error_detail_safe,
+            created_at=record.created_at,
+            expires_at=record.expires_at,
+        )
 
     @router.post(
         "/api/chat/attachments",
@@ -76,28 +158,89 @@ def create_attachment_router(
         record = uploaded.record
         if record.detected_mime_type is None or record.expires_at is None:
             raise HTTPException(status_code=503, detail={"code": "attachment_metadata_incomplete"})
-        kind_by_parser = {
-            "image": "image",
-            "pdf": "pdf",
-            "docx": "document",
-            "pptx": "presentation",
-            "xlsx": "spreadsheet",
-            "csv": "text",
-            "txt": "text",
-            "md": "text",
-        }
         return AttachmentUploadResponse(
             attachment_id=record.attachment_id,
             filename=record.safe_filename,
             mime_type=record.detected_mime_type,
             byte_size=record.byte_size,
             status=record.status,
-            kind=kind_by_parser.get(record.parser_kind or "", "file"),
+            kind=active_service.kind_for(record),
             created_at=record.created_at,
             expires_at=record.expires_at,
         )
 
+    @router.get(
+        "/api/chat/attachments/{attachment_id}",
+        response_model=AttachmentStatusResponse,
+    )
+    def get_attachment(
+        attachment_id: UUID,
+        x_par_password: Optional[str] = Header(default=None),
+    ) -> AttachmentStatusResponse:
+        password_guard(x_par_password)
+        try:
+            record = active_service.get(attachment_id)
+        except AttachmentLifecycleError as error:
+            _raise_lifecycle_error(error)
+        return status_response(record)
+
+    @router.get("/api/chat/attachments/{attachment_id}/preview")
+    def preview_attachment(
+        attachment_id: UUID,
+        x_par_password: Optional[str] = Header(default=None),
+    ) -> StreamingResponse:
+        password_guard(x_par_password)
+        try:
+            reference = active_service.preview(attachment_id)
+        except AttachmentLifecycleError as error:
+            _raise_lifecycle_error(error)
+        return _stream_reference(reference, disposition="inline")
+
+    @router.get("/api/chat/attachments/{attachment_id}/content")
+    def download_attachment(
+        attachment_id: UUID,
+        x_par_password: Optional[str] = Header(default=None),
+    ) -> StreamingResponse:
+        password_guard(x_par_password)
+        try:
+            reference = active_service.content(attachment_id)
+        except AttachmentLifecycleError as error:
+            _raise_lifecycle_error(error)
+        return _stream_reference(reference, disposition="attachment")
+
+    @router.post(
+        "/api/chat/attachments/{attachment_id}/retry",
+        status_code=202,
+        response_model=AttachmentStatusResponse,
+    )
+    def retry_attachment(
+        attachment_id: UUID,
+        x_par_password: Optional[str] = Header(default=None),
+    ) -> AttachmentStatusResponse:
+        password_guard(x_par_password)
+        try:
+            record = active_service.retry(attachment_id)
+        except AttachmentLifecycleError as error:
+            _raise_lifecycle_error(error)
+        return status_response(record)
+
+    @router.delete("/api/chat/attachments/{attachment_id}", status_code=204)
+    def delete_attachment(
+        attachment_id: UUID,
+        x_par_password: Optional[str] = Header(default=None),
+    ) -> Response:
+        password_guard(x_par_password)
+        try:
+            active_service.delete(attachment_id)
+        except AttachmentLifecycleError as error:
+            _raise_lifecycle_error(error)
+        return Response(status_code=204)
+
     return router
 
 
-__all__ = ["AttachmentUploadResponse", "create_attachment_router"]
+__all__ = [
+    "AttachmentStatusResponse",
+    "AttachmentUploadResponse",
+    "create_attachment_router",
+]

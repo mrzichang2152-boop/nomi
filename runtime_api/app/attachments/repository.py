@@ -37,6 +37,15 @@ class AttachmentRecord:
     deleted_at: Optional[datetime]
 
 
+@dataclass(frozen=True)
+class AttachmentDerivativeRecord:
+    kind: str
+    mime_type: str
+    storage_relative_path: str
+    byte_size: int
+    processing_version: str
+
+
 class AttachmentRepository(Protocol):
     def create_receiving(self, record: AttachmentRecord) -> AttachmentRecord:
         ...
@@ -54,6 +63,15 @@ class AttachmentRepository(Protocol):
         ...
 
     def mark_failed(self, attachment_id: UUID, **changes: object) -> AttachmentRecord:
+        ...
+
+    def prepare_retry(
+        self,
+        attachment_id: UUID,
+        *,
+        expected_processing_version: str,
+        new_processing_version: str,
+    ) -> Optional[AttachmentRecord]:
         ...
 
     def mark_processing(
@@ -94,6 +112,15 @@ class AttachmentRepository(Protocol):
         ...
 
     def list_storage_paths(self, attachment_id: UUID) -> Sequence[str]:
+        ...
+
+    def get_derivative(
+        self,
+        attachment_id: UUID,
+        *,
+        kind: str,
+        processing_version: str,
+    ) -> Optional[AttachmentDerivativeRecord]:
         ...
 
 
@@ -138,6 +165,33 @@ class InMemoryAttachmentRepository:
 
     def mark_failed(self, attachment_id: UUID, **changes: object) -> AttachmentRecord:
         return self._update(attachment_id, status="failed", **changes)
+
+    def prepare_retry(
+        self,
+        attachment_id: UUID,
+        *,
+        expected_processing_version: str,
+        new_processing_version: str,
+    ) -> Optional[AttachmentRecord]:
+        with self._lock:
+            current = self._records.get(attachment_id)
+            if (
+                current is None
+                or current.status != "failed"
+                or current.lifecycle != "draft"
+                or current.processing_version != expected_processing_version
+            ):
+                return None
+            updated = replace(
+                current,
+                status="processing",
+                processing_version=new_processing_version,
+                processed_at=None,
+                error_code=None,
+                error_detail_safe=None,
+            )
+            self._records[attachment_id] = updated
+            return updated
 
     def mark_processing(
         self,
@@ -212,6 +266,29 @@ class InMemoryAttachmentRepository:
                     if derivative.storage_relative_path
                 )
             return tuple(dict.fromkeys(paths))
+
+    def get_derivative(
+        self,
+        attachment_id: UUID,
+        *,
+        kind: str,
+        processing_version: str,
+    ) -> Optional[AttachmentDerivativeRecord]:
+        with self._lock:
+            result = self._parse_results.get((attachment_id, processing_version))
+            if result is None:
+                return None
+            for derivative in result.derivatives:
+                if derivative.kind != kind or not derivative.storage_relative_path:
+                    continue
+                return AttachmentDerivativeRecord(
+                    kind=derivative.kind,
+                    mime_type=derivative.mime_type,
+                    storage_relative_path=derivative.storage_relative_path,
+                    byte_size=derivative.byte_size,
+                    processing_version=processing_version,
+                )
+            return None
 
     def mark_attached(self, attachment_id: UUID, *, attached_at: datetime) -> AttachmentRecord:
         return self._update(
@@ -440,6 +517,29 @@ class PostgresAttachmentRepository:
 
     def mark_failed(self, attachment_id: UUID, **changes: object) -> AttachmentRecord:
         return self._update(attachment_id, status="failed", changes=changes)
+
+    def prepare_retry(
+        self,
+        attachment_id: UUID,
+        *,
+        expected_processing_version: str,
+        new_processing_version: str,
+    ) -> Optional[AttachmentRecord]:
+        with self.connection_factory() as connection:
+            row = connection.execute(
+                f"""
+                UPDATE chat_attachments
+                SET status = 'processing', processing_version = %s, processed_at = NULL,
+                    error_code = NULL, error_detail_safe = NULL
+                WHERE id = %s
+                  AND status = 'failed'
+                  AND lifecycle = 'draft'
+                  AND processing_version = %s
+                RETURNING {self._COLUMNS}
+                """,
+                (new_processing_version, attachment_id, expected_processing_version),
+            ).fetchone()
+        return self._record(row)
 
     def mark_processing(
         self,
@@ -670,8 +770,40 @@ class PostgresAttachmentRepository:
         paths.extend(row[0] for row in derivatives if row and row[0])
         return tuple(dict.fromkeys(paths))
 
+    def get_derivative(
+        self,
+        attachment_id: UUID,
+        *,
+        kind: str,
+        processing_version: str,
+    ) -> Optional[AttachmentDerivativeRecord]:
+        with self.connection_factory() as connection:
+            row = connection.execute(
+                """
+                SELECT kind, mime_type, storage_relative_path, byte_size, processing_version
+                FROM chat_attachment_derivatives
+                WHERE attachment_id = %s
+                  AND kind = %s
+                  AND processing_version = %s
+                  AND storage_relative_path IS NOT NULL
+                ORDER BY created_at, id
+                LIMIT 1
+                """,
+                (attachment_id, kind, processing_version),
+            ).fetchone()
+        if row is None:
+            return None
+        return AttachmentDerivativeRecord(
+            kind=row[0],
+            mime_type=row[1],
+            storage_relative_path=row[2],
+            byte_size=row[3],
+            processing_version=row[4],
+        )
+
 
 __all__ = [
+    "AttachmentDerivativeRecord",
     "AttachmentRecord",
     "AttachmentRepository",
     "InMemoryAttachmentRepository",
