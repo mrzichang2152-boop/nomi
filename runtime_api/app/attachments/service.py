@@ -13,6 +13,7 @@ from app.attachments.models import (
     AttachmentRejected,
     SAFE_ATTACHMENT_ERROR_MESSAGES,
 )
+from app.attachments.queue import RedisAttachmentQueue
 from app.attachments.repository import AttachmentRecord, AttachmentRepository
 from app.attachments.storage import resolve_storage_path, sanitize_display_filename, write_streamed_original
 
@@ -24,15 +25,6 @@ CLIENT_UPLOAD_ID_CONFLICT_MESSAGE = "同一上传标识对应了不同文件，�
 class AttachmentQueue(Protocol):
     def enqueue(self, attachment_id: UUID) -> None:
         ...
-
-
-class RedisAttachmentQueue:
-    def __init__(self, client_factory: Callable[[], object], *, queue_name: str = "nomi:attachments:parse") -> None:
-        self.client_factory = client_factory
-        self.queue_name = queue_name
-
-    def enqueue(self, attachment_id: UUID) -> None:
-        self.client_factory().rpush(self.queue_name, str(attachment_id))
 
 
 class AttachmentUploadError(RuntimeError):

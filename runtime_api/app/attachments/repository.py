@@ -3,7 +3,7 @@ from __future__ import annotations
 import threading
 from dataclasses import dataclass, replace
 from datetime import datetime
-from typing import Callable, ContextManager, Optional, Protocol
+from typing import Callable, ContextManager, Optional, Protocol, Sequence
 from uuid import UUID
 
 
@@ -52,6 +52,29 @@ class AttachmentRepository(Protocol):
     def mark_failed(self, attachment_id: UUID, **changes: object) -> AttachmentRecord:
         ...
 
+    def mark_processing(self, attachment_id: UUID) -> Optional[AttachmentRecord]:
+        ...
+
+    def mark_ready(self, attachment_id: UUID, **changes: object) -> AttachmentRecord:
+        ...
+
+    def mark_attached(self, attachment_id: UUID, *, attached_at: datetime) -> AttachmentRecord:
+        ...
+
+    def list_expired_drafts(
+        self,
+        *,
+        now: datetime,
+        stale_receiving_before: datetime,
+    ) -> Sequence[AttachmentRecord]:
+        ...
+
+    def mark_lifecycle_deleted(self, attachment_id: UUID) -> Optional[AttachmentRecord]:
+        ...
+
+    def complete_deleted(self, attachment_id: UUID, *, deleted_at: datetime) -> AttachmentRecord:
+        ...
+
 
 class InMemoryAttachmentRepository:
     def __init__(self) -> None:
@@ -93,6 +116,77 @@ class InMemoryAttachmentRepository:
 
     def mark_failed(self, attachment_id: UUID, **changes: object) -> AttachmentRecord:
         return self._update(attachment_id, status="failed", **changes)
+
+    def mark_processing(self, attachment_id: UUID) -> Optional[AttachmentRecord]:
+        with self._lock:
+            current = self._records.get(attachment_id)
+            if current is None or current.lifecycle == "deleted":
+                return None
+            if current.status not in {"stored", "failed", "processing"}:
+                return None
+            updated = replace(
+                current,
+                status="processing",
+                error_code=None,
+                error_detail_safe=None,
+            )
+            self._records[attachment_id] = updated
+            return updated
+
+    def mark_ready(self, attachment_id: UUID, **changes: object) -> AttachmentRecord:
+        return self._update(
+            attachment_id,
+            status="ready",
+            error_code=None,
+            error_detail_safe=None,
+            **changes,
+        )
+
+    def mark_attached(self, attachment_id: UUID, *, attached_at: datetime) -> AttachmentRecord:
+        return self._update(
+            attachment_id,
+            lifecycle="attached",
+            attached_at=attached_at,
+            expires_at=None,
+        )
+
+    def list_expired_drafts(
+        self,
+        *,
+        now: datetime,
+        stale_receiving_before: datetime,
+    ) -> Sequence[AttachmentRecord]:
+        with self._lock:
+            return sorted(
+                (
+                    record
+                    for record in self._records.values()
+                    if record.lifecycle == "draft"
+                    and (
+                        (record.expires_at is not None and record.expires_at <= now)
+                        or (record.status == "receiving" and record.created_at <= stale_receiving_before)
+                    )
+                ),
+                key=lambda record: (record.created_at, str(record.attachment_id)),
+            )
+
+    def mark_lifecycle_deleted(self, attachment_id: UUID) -> Optional[AttachmentRecord]:
+        with self._lock:
+            current = self._records.get(attachment_id)
+            if current is None or current.lifecycle != "draft":
+                return None
+            updated = replace(current, lifecycle="deleted", deleted_at=None)
+            self._records[attachment_id] = updated
+            return updated
+
+    def complete_deleted(self, attachment_id: UUID, *, deleted_at: datetime) -> AttachmentRecord:
+        with self._lock:
+            current = self._records[attachment_id]
+            if current.lifecycle != "deleted":
+                raise ValueError("attachment_not_marked_deleted")
+            updated = replace(current, deleted_at=deleted_at)
+            self._records[attachment_id] = updated
+            return updated
 
     def count(self) -> int:
         with self._lock:
@@ -208,7 +302,13 @@ class PostgresAttachmentRepository:
             ).fetchone()
         return self._record(row)
 
-    def _update(self, attachment_id: UUID, *, status: str, changes: dict[str, object]) -> AttachmentRecord:
+    def _update(
+        self,
+        attachment_id: UUID,
+        *,
+        status: Optional[str],
+        changes: dict[str, object],
+    ) -> AttachmentRecord:
         allowed = {
             "sha256",
             "byte_size",
@@ -220,12 +320,19 @@ class PostgresAttachmentRepository:
             "error_detail_safe",
             "stored_at",
             "expires_at",
+            "processed_at",
+            "attached_at",
+            "lifecycle",
+            "deleted_at",
         }
         unknown = set(changes) - allowed
         if unknown:
             raise ValueError(f"unsupported_attachment_update:{','.join(sorted(unknown))}")
-        assignments = ["status = %s"]
-        values: list[object] = [status]
+        assignments: list[str] = []
+        values: list[object] = []
+        if status is not None:
+            assignments.append("status = %s")
+            values.append(status)
         for key, value in changes.items():
             assignments.append(f"{key} = %s")
             values.append(value)
@@ -253,6 +360,91 @@ class PostgresAttachmentRepository:
 
     def mark_failed(self, attachment_id: UUID, **changes: object) -> AttachmentRecord:
         return self._update(attachment_id, status="failed", changes=changes)
+
+    def mark_processing(self, attachment_id: UUID) -> Optional[AttachmentRecord]:
+        with self.connection_factory() as connection:
+            locked = connection.execute(
+                f"""
+                SELECT {self._COLUMNS}
+                FROM chat_attachments
+                WHERE id = %s
+                  AND lifecycle <> 'deleted'
+                  AND status IN ('stored', 'failed', 'processing')
+                FOR UPDATE SKIP LOCKED
+                """,
+                (attachment_id,),
+            ).fetchone()
+            if locked is None:
+                return None
+            row = connection.execute(
+                f"""
+                UPDATE chat_attachments
+                SET status = 'processing', error_code = NULL, error_detail_safe = NULL
+                WHERE id = %s
+                RETURNING {self._COLUMNS}
+                """,
+                (attachment_id,),
+            ).fetchone()
+        return self._record(row)
+
+    def mark_ready(self, attachment_id: UUID, **changes: object) -> AttachmentRecord:
+        return self._update(
+            attachment_id,
+            status="ready",
+            changes={"error_code": None, "error_detail_safe": None, **changes},
+        )
+
+    def mark_attached(self, attachment_id: UUID, *, attached_at: datetime) -> AttachmentRecord:
+        return self._update(
+            attachment_id,
+            status=None,
+            changes={"lifecycle": "attached", "attached_at": attached_at, "expires_at": None},
+        )
+
+    def list_expired_drafts(
+        self,
+        *,
+        now: datetime,
+        stale_receiving_before: datetime,
+    ) -> Sequence[AttachmentRecord]:
+        with self.connection_factory() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT {self._COLUMNS}
+                FROM chat_attachments
+                WHERE lifecycle = 'draft'
+                  AND (
+                    (expires_at IS NOT NULL AND expires_at <= %s)
+                    OR (status = 'receiving' AND created_at <= %s)
+                  )
+                ORDER BY created_at, id
+                """,
+                (now, stale_receiving_before),
+            ).fetchall()
+        return [record for row in rows if (record := self._record(row)) is not None]
+
+    def mark_lifecycle_deleted(self, attachment_id: UUID) -> Optional[AttachmentRecord]:
+        with self.connection_factory() as connection:
+            row = connection.execute(
+                f"""
+                UPDATE chat_attachments
+                SET lifecycle = 'deleted', deleted_at = NULL
+                WHERE id = %s AND lifecycle = 'draft'
+                RETURNING {self._COLUMNS}
+                """,
+                (attachment_id,),
+            ).fetchone()
+        return self._record(row)
+
+    def complete_deleted(self, attachment_id: UUID, *, deleted_at: datetime) -> AttachmentRecord:
+        record = self._update(
+            attachment_id,
+            status=None,
+            changes={"deleted_at": deleted_at},
+        )
+        if record.lifecycle != "deleted":
+            raise ValueError("attachment_not_marked_deleted")
+        return record
 
 
 __all__ = [

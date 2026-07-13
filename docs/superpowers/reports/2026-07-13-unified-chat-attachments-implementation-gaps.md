@@ -14,6 +14,9 @@
 | 后端完整测试 | `python3 -m pytest -q runtime_api/tests` | 通过，894 tests | 附件实现前基线 |
 | Android 单元测试 | `gradle -p android_app :app:testDebugUnitTest` | 通过 | Gradle 提示未来版本弃用警告，不影响当前基线 |
 | Compose 配置 | `docker compose config --quiet` | 通过 | 附件 worker 尚未加入 |
+| Task 4 后端完整测试 | `python3 -m pytest -q runtime_api/tests` | 通过，961 tests | 队列、Worker、清理与容器边界接入后 |
+| Task 4 附件聚焦测试 | `python3 -m pytest -q runtime_api/tests/test_attachment_*.py` | 通过，67 tests | 包含 worker 11 条状态/租约/清理/Compose 契约 |
+| Task 4 Compose 配置 | `docker compose config --quiet` | 通过 | 独立非 root `attachment-worker` 与共享私有卷已解析 |
 | 工作区 | `git status --short` | 脏工作区 | 存在既有 OpenCode、Web Search、Android 等改动；不得重置或整体暂存 |
 
 ## 规格覆盖状态
@@ -26,7 +29,7 @@
 | 四表数据模型 | 代码与自动化完成，未部署 | runtime/fresh-install schema 契约测试通过；后端全量 903 passed | 无 | 尚未在真实 PostgreSQL 执行迁移并核对约束 | 云环境部署待 Task 16 | Task 16、17 |
 | 上传与草稿幂等 | 代码与自动化完成，未部署 | `test_attachment_api.py` 10 条用例验证鉴权、multipart、202 草稿、安全响应、24 小时过期、断连/越限/拒绝、相同字节幂等及不同字节 409；后端全量 950 passed | 无 | 尚未在真实 PostgreSQL、Redis、挂载卷和客户端上传中验收 | 云环境部署待 Task 16 | Task 10-12、16、17 |
 | 状态、预览、原件、重试、删除 API | 未开始 | 无 | 无 | 端点未建立 | 无 | Task 6 |
-| 有界异步解析 Worker | 未开始 | 无 | 无 | 没有队列、并发门禁和超时隔离 | 无 | Task 4 |
+| 有界异步解析 Worker | 代码与自动化完成，未部署 | `test_attachment_worker.py` 11 条用例验证版本去重、状态迁移、分类并发、120 秒默认超时、安全失败、租约恢复、崩溃恢复、两阶段草稿清理、孤儿临时文件及 attached 排除；Compose 约束 CPU 0.75、内存 768MB、非 root、只读根目录和共享私有卷 | 无 | Task 5 解析器尚未提供时入口会等待且不消费任务；Redis/PostgreSQL 真实进程与资源峰值尚未验收 | 云环境部署待 Task 16 | Task 5、16、17 |
 | 图片/PDF/Office/表格/文本解析 | 未开始 | 无 | 无 | 没有统一解析结果与 locator | 无 | Task 5 |
 | 消息原子绑定和幂等 | 未开始 | 无 | 无 | HTTP/WS 未接收附件 ID | 无 | Task 7 |
 | 历史、失败重试和会话删除 | 未开始 | 无 | 无 | 历史无附件，失败重试未复用 user turn | 无 | Task 8 |
@@ -41,7 +44,7 @@
 | 双界面历史一致性 | 未开始 | 无 | 无 | 本地镜像无附件元数据 | 无 | Task 14 |
 | 安全与提示注入防护 | 文件入口安全部分完成 | hostile-file 测试已验证 ZIP bomb、ZIP traversal、加密/损坏容器、脚本与伪装可执行文件；错误信息不回显本地路径 | 无 | 文档内提示注入、鉴权下载、审计和真实恶意样本待后续任务 | 无 | Task 6、8、14、17 |
 | 隐私安全 Trace | 未开始 | 无 | 无 | 无附件证据和耗时 trace | 无 | Task 15 |
-| 2 核 4G 性能与部署 | 未开始 | 无 | 无 | 无 attachment-worker 资源实测 | 无 | Task 16、17 |
+| 2 核 4G 性能与部署 | 容器预算契约完成，未实测 | 自动化锁定 attachment-worker `0.75 CPU / 768MB`、分类并发 `2/1/1`、非 root 和只读根文件系统；`docker compose config --quiet` 通过 | 无 | 尚未构建镜像并以 25MB 上传、31 页解析和并发聊天做资源实测 | 云环境部署待 Task 16 | Task 16、17 |
 | 云端、真实文件、Qwen、Android 真机 | 未开始 | 无 | 无 | 全部真实验收尚未执行 | 需要后续真机在线 | Task 17 |
 
 ## 执行纪律

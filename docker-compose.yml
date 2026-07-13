@@ -59,6 +59,7 @@ services:
       MODEL_BASE_URL: ${MODEL_BASE_URL:-http://81.70.177.246:9161/v1}
       MODEL_NAME: ${MODEL_NAME:-qwen3.6}
       APP_PASSWORD: ${APP_PASSWORD:-par-dev}
+      NOMI_ATTACHMENT_ROOT: /app/data/attachments
       RAW_DATA_ENCRYPTION_KEY: ${RAW_DATA_ENCRYPTION_KEY:-}
       COMPOSIO_API_KEY: ${COMPOSIO_API_KEY:-}
       COMPOSIO_API_BASE_URL: ${COMPOSIO_API_BASE_URL:-https://backend.composio.dev}
@@ -94,6 +95,37 @@ services:
       - "8080"
     volumes:
       - model_cache:/models
+      - attachment_data:/app/data/attachments
+
+  attachment-worker:
+    build:
+      context: ./runtime_api
+    restart: unless-stopped
+    cpus: "0.75"
+    mem_limit: 768m
+    logging: *default-logging
+    command: ["python", "-m", "app.attachments.worker_entrypoint"]
+    user: "65532:65532"
+    read_only: true
+    tmpfs:
+      - /tmp:size=128m,mode=1777
+    environment:
+      DATABASE_URL: postgresql://par:par_dev_password@postgres:5432/par
+      REDIS_URL: redis://redis:6379/0
+      NOMI_ATTACHMENT_ROOT: /app/data/attachments
+      PYTHONDONTWRITEBYTECODE: "1"
+      ATTACHMENT_LIGHTWEIGHT_CONCURRENCY: ${ATTACHMENT_LIGHTWEIGHT_CONCURRENCY:-2}
+      ATTACHMENT_OFFICE_CONCURRENCY: ${ATTACHMENT_OFFICE_CONCURRENCY:-1}
+      ATTACHMENT_VISION_CONCURRENCY: ${ATTACHMENT_VISION_CONCURRENCY:-1}
+      ATTACHMENT_PARSE_TIMEOUT_SECONDS: ${ATTACHMENT_PARSE_TIMEOUT_SECONDS:-120}
+      ATTACHMENT_DRAFT_TTL_SECONDS: ${ATTACHMENT_DRAFT_TTL_SECONDS:-86400}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - attachment_data:/app/data/attachments
 
   worker:
     build:
@@ -192,3 +224,4 @@ volumes:
   redis_data:
   chromium_profile:
   model_cache:
+  attachment_data:
