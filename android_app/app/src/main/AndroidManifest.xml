@@ -15,7 +15,7 @@
         android:theme="@style/AppTheme">
         <activity
             android:name=".WebWorkspaceActivity"
-            android:configChanges="orientation|screenSize|keyboardHidden"
+            android:configChanges="orientation|screenSize|keyboardHidden|screenLayout|smallestScreenSize|uiMode"
             android:exported="false"
             android:windowSoftInputMode="adjustResize" />
         <activity

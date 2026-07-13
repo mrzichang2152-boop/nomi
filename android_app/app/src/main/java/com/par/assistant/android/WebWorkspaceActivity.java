@@ -1,6 +1,7 @@
 package com.par.assistant.android;
 
 import android.app.Activity;
+import android.content.ClipData;
 import android.content.Intent;
 import android.content.res.Configuration;
 import android.net.Uri;
@@ -23,14 +24,35 @@ import android.widget.TextView;
 import android.widget.Toast;
 import android.webkit.JavascriptInterface;
 import android.webkit.WebChromeClient;
+import android.webkit.ValueCallback;
 import android.webkit.WebResourceError;
 import android.webkit.WebResourceRequest;
 import android.webkit.WebView;
 import android.webkit.WebViewClient;
 import android.webkit.WebSettings;
 
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Set;
+
 public final class WebWorkspaceActivity extends Activity {
     private static final long WORKSPACE_LOAD_TIMEOUT_MS = 10_000L;
+    private static final int FILE_CHOOSER_REQUEST_CODE = 4207;
+    private static final String[] DEFAULT_ATTACHMENT_MIME_TYPES = new String[]{
+            "image/png",
+            "image/jpeg",
+            "image/webp",
+            "image/gif",
+            "application/pdf",
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            "text/csv",
+            "text/plain",
+            "text/markdown"
+    };
     static final String EXTRA_URL = "com.par.assistant.android.URL";
     static final String EXTRA_PROACTIVE_ID = "com.par.assistant.android.PROACTIVE_ID";
     static final String EXTRA_PROACTIVE_TITLE = "com.par.assistant.android.PROACTIVE_TITLE";
@@ -45,6 +67,84 @@ public final class WebWorkspaceActivity extends Activity {
     private boolean workspaceLoadCompleted;
     private boolean remoteBrowserMode;
     private boolean remoteBrowserControlsShown;
+    private final ChooserSession<Uri> fileChooserSession = new ChooserSession<>();
+
+    interface ChooserResult<T> {
+        void onResult(List<T> value);
+    }
+
+    static final class ChooserSession<T> {
+        private ChooserResult<T> callback;
+
+        void begin(ChooserResult<T> next) {
+            ChooserResult<T> stale;
+            synchronized (this) {
+                stale = callback;
+                callback = next;
+            }
+            if (stale != null) stale.onResult(null);
+        }
+
+        void deliver(List<T> values) {
+            ChooserResult<T> current;
+            synchronized (this) {
+                current = callback;
+                callback = null;
+            }
+            if (current != null) current.onResult(values);
+        }
+
+        void cancel() {
+            deliver(null);
+        }
+
+        synchronized boolean hasActiveCallback() {
+            return callback != null;
+        }
+    }
+
+    static String[] approvedMimeTypes(String[] acceptTypes) {
+        Set<String> approved = new LinkedHashSet<>();
+        if (acceptTypes != null) {
+            for (String raw : acceptTypes) {
+                if (raw == null) continue;
+                for (String token : raw.split(",")) {
+                    addApprovedMimeType(approved, token.trim().toLowerCase());
+                }
+            }
+        }
+        if (approved.isEmpty()) approved.addAll(Arrays.asList(DEFAULT_ATTACHMENT_MIME_TYPES));
+        return approved.toArray(new String[0]);
+    }
+
+    private static void addApprovedMimeType(Set<String> approved, String token) {
+        if (token.isEmpty() || "*/*".equals(token)) return;
+        if ("image/*".equals(token)) {
+            approved.add("image/png");
+            approved.add("image/jpeg");
+            approved.add("image/webp");
+            approved.add("image/gif");
+            return;
+        }
+        String mapped = switch (token) {
+            case ".png", "image/png" -> "image/png";
+            case ".jpg", ".jpeg", "image/jpeg", "image/jpg" -> "image/jpeg";
+            case ".webp", "image/webp" -> "image/webp";
+            case ".gif", "image/gif" -> "image/gif";
+            case ".pdf", "application/pdf" -> "application/pdf";
+            case ".docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document" ->
+                    "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+            case ".pptx", "application/vnd.openxmlformats-officedocument.presentationml.presentation" ->
+                    "application/vnd.openxmlformats-officedocument.presentationml.presentation";
+            case ".xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" ->
+                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
+            case ".csv", "text/csv" -> "text/csv";
+            case ".txt", "text/plain" -> "text/plain";
+            case ".md", "text/markdown" -> "text/markdown";
+            default -> "";
+        };
+        if (!mapped.isEmpty()) approved.add(mapped);
+    }
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -60,6 +160,35 @@ public final class WebWorkspaceActivity extends Activity {
         webView.getSettings().setSupportMultipleWindows(true);
         webView.addJavascriptInterface(new WorkspaceBridge(), "NomiAndroid");
         webView.setWebChromeClient(new WebChromeClient() {
+            @Override
+            public boolean onShowFileChooser(
+                    WebView view,
+                    ValueCallback<Uri[]> filePathCallback,
+                    FileChooserParams fileChooserParams
+            ) {
+                if (filePathCallback == null) return false;
+                fileChooserSession.begin(values -> filePathCallback.onReceiveValue(
+                        values == null || values.isEmpty() ? null : values.toArray(new Uri[0])
+                ));
+                Intent chooser = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+                chooser.addCategory(Intent.CATEGORY_OPENABLE);
+                chooser.setType("*/*");
+                chooser.putExtra(Intent.EXTRA_MIME_TYPES, approvedMimeTypes(
+                        fileChooserParams == null ? null : fileChooserParams.getAcceptTypes()
+                ));
+                chooser.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true);
+                chooser.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION
+                        | Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION);
+                try {
+                    startActivityForResult(chooser, FILE_CHOOSER_REQUEST_CODE);
+                    return true;
+                } catch (RuntimeException error) {
+                    fileChooserSession.cancel();
+                    Toast.makeText(WebWorkspaceActivity.this, "无法打开文件选择器", Toast.LENGTH_SHORT).show();
+                    return false;
+                }
+            }
+
             @Override
             public boolean onCreateWindow(WebView view, boolean isDialog, boolean isUserGesture, Message resultMsg) {
                 WebView.HitTestResult hitTestResult = view == null ? null : view.getHitTestResult();
@@ -192,7 +321,74 @@ public final class WebWorkspaceActivity extends Activity {
         if (remoteBrowserMode) {
             ensureRemoteBrowserControls();
         }
-        webView.loadUrl(initialUrl);
+        boolean restored = savedInstanceState != null && webView.restoreState(savedInstanceState) != null;
+        if (restored) {
+            workspaceLoadCompleted = true;
+            hideWorkspaceStatus();
+        } else {
+            webView.loadUrl(initialUrl);
+        }
+    }
+
+    @Override
+    protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+        if (requestCode != FILE_CHOOSER_REQUEST_CODE) {
+            super.onActivityResult(requestCode, resultCode, data);
+            return;
+        }
+        List<Uri> selected = resultCode == RESULT_OK ? selectedUris(data) : null;
+        if (selected != null && !selected.isEmpty()) {
+            for (Uri uri : selected) retainReadPermission(uri, data);
+            fileChooserSession.deliver(selected);
+        } else {
+            fileChooserSession.cancel();
+        }
+        if (webView != null) {
+            webView.setVisibility(View.VISIBLE);
+            webView.requestFocus();
+            webView.requestLayout();
+            webView.invalidate();
+        }
+    }
+
+    private List<Uri> selectedUris(Intent data) {
+        if (data == null) return null;
+        List<Uri> result = new ArrayList<>();
+        ClipData clipData = data.getClipData();
+        if (clipData != null) {
+            for (int index = 0; index < clipData.getItemCount(); index += 1) {
+                Uri uri = clipData.getItemAt(index).getUri();
+                if (uri != null && !result.contains(uri)) result.add(uri);
+            }
+        } else if (data.getData() != null) {
+            result.add(data.getData());
+        }
+        return result.isEmpty() ? null : result;
+    }
+
+    private void retainReadPermission(Uri uri, Intent data) {
+        int offeredFlags = data == null ? 0 : data.getFlags();
+        int readFlags = offeredFlags & Intent.FLAG_GRANT_READ_URI_PERMISSION;
+        if ((readFlags & Intent.FLAG_GRANT_READ_URI_PERMISSION) == 0) {
+            readFlags |= Intent.FLAG_GRANT_READ_URI_PERMISSION;
+        }
+        try {
+            getContentResolver().takePersistableUriPermission(uri, readFlags);
+        } catch (SecurityException | IllegalArgumentException ignored) {
+            // Some document providers grant access for this activity without persistable support.
+        }
+    }
+
+    @Override
+    protected void onSaveInstanceState(Bundle outState) {
+        if (webView != null) webView.saveState(outState);
+        super.onSaveInstanceState(outState);
+    }
+
+    @Override
+    protected void onDestroy() {
+        fileChooserSession.cancel();
+        super.onDestroy();
     }
 
     private void showWorkspaceStatus(String message) {

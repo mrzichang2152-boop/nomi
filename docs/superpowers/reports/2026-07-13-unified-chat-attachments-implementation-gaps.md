@@ -42,13 +42,15 @@
 | Task 11 Web/附件组合回归 | JS syntax check、Task 11 静态契约、既有工作台、附件 API/生命周期/历史/绑定组合测试 | 通过，101 pytest + 8 node tests | 鉴权预览、FormData、错误单次读取、终态停止、消息卡、既有日程/求职工作台均未回归 |
 | Task 11 Chromium 响应式检查 | Playwright + Google Chrome，`1440x900` 与 `390x844` | 通过 | 注入图片/文档历史卡和失败上传草稿；两种宽度 `body/chat/message/card` 均无横向溢出，附件名称宽度分别 557/210px，composer 高度 203/193px，无 page error；发现并修复预览失败挤压和响应体二次读取噪声 |
 | Task 11 隔离检查点后端全量 | `python3 -m pytest -q runtime_api/tests` | 2 failed、852 passed | 失败仍仅为既有 `test_chat_response_uses_explicit_memory_layer_fetchers` 与 `test_context_pack_pipeline_retrieves_local_memory_agenda_and_turns`；Task 11 未新增失败 |
+| Task 12 Android WebView 选择器 TDD | `gradle -p android_app :app:testDebugUnitTest --tests '*WebWorkspaceAttachmentChooserTest'` | 通过，4 tests | 实际执行 chooser session：旧回调只取消一次、单/多选有序交付、重复交付无效、取消/重建清理；同时核对 SAF、允许格式、读权限和无相机入口契约 |
+| Task 12 Android 全量单测 | `gradle -p android_app :app:testDebugUnitTest` | 通过，103 tests | WebView 文件选择器、键盘、旋转、远程浏览器、聊天和既有 Android 行为组合回归；Gradle 仅报告未来版本弃用警告 |
 | 工作区 | `git status --short` | 脏工作区 | 存在既有 OpenCode、Web Search、Android 等改动；不得重置或整体暂存 |
 
 ## 规格覆盖状态
 
 | 规格域 | 状态 | 自动化证据 | 真实环境证据 | 已知 Gap | 阻塞 | 下一步 |
 | --- | --- | --- | --- | --- | --- | --- |
-| 产品输入：纯附件/附件+文字 | 代码与自动化完成，未部署 | `ChatIn`、HTTP 和 WebSocket 均接收有序附件 ID；空文本附件消息使用统一附件理解指令；传输一致性测试通过 | 无 | Web/Android 选择器和真实上传发送尚未接入 | 云环境部署待 Task 16 | Task 11-13、16、17 |
+| 产品输入：纯附件/附件+文字 | 代码与自动化完成，未部署 | `ChatIn`、HTTP 和 WebSocket 均接收有序附件 ID；空文本附件消息使用统一附件理解指令；Web 完整 App 与 Android WebView 已接选择器；传输一致性测试通过 | 无 | Android 悬浮窗原生选择器和真实上传发送尚未接入 | 云环境部署待 Task 16 | Task 13、16、17 |
 | 支持格式与拒绝格式 | 轻量解析代码与自动化完成，未部署 | 检测测试覆盖 11 种允许格式与恶意输入；`test_attachment_parsers.py` 逐项验证图片、PDF、DOCX、PPTX、XLSX、CSV、TXT、MD 的实际事实和稳定 locator | 无 | LibreOffice 版式渲染与真实 Qwen 视觉升级尚未接入；真实文件集待 Task 17 | 无 | Task 9、10、17 |
 | 私有流式存储 | 代码与自动化完成，未部署 | `test_attachment_storage.py` 核对 256 KiB 分块、SHA-256、越限立即中止、断连清理、`fsync` 后原子替换、随机磁盘名、路径逃逸拒绝 | 无 | 尚未接上传 API 和真实挂载卷 | 云环境部署待 Task 16 | Task 3、16、17 |
 | 四表数据模型 | 代码与自动化完成，未部署 | runtime/fresh-install schema 契约测试通过；后端全量 903 passed | 无 | 尚未在真实 PostgreSQL 执行迁移并核对约束 | 云环境部署待 Task 16 | Task 16、17 |
@@ -64,7 +66,8 @@
 | Qwen 结构化多模态与非 thinking | 代码与自动化完成，未部署 | 文本 content 保持字符串；视觉 content 为有序 `text/image_url`；私有相对路径只在 provider 边界校验后读取并转 data URL；输入不变；Qwen 请求显式 `enable_thinking=false`/`reasoning_effort=none`；正式响应忽略 reasoning；安全 trace 不含 base64/path | 无 | 尚未向线上 `qwen3.6` 发真实图文请求并核对首字、正式答案与视觉事实；未验证上游是否完整支持当前 data URL 契约 | 云环境与模型端待 Task 16/17 | Task 16、17 |
 | 稳定引用与覆盖声明 | 代码与自动化完成，未部署 | PDF 页、PPTX 张、DOCX 章节、XLSX sheet/range、图片和文本行号有稳定 label；答案只能引用本轮选中 label，未选页引用会被移除并产生 validation trace；partial coverage 明确未覆盖位置 | 无 | 尚未用真实 Qwen 输出验证引用服从率；逐页终态摘要尚未在双客户端展示验收 | 云环境部署待 Task 16 | Task 10、16、17 |
 | 长期记忆来源 | 未开始 | 无 | 无 | 未保存 attachment/turn/locator/version 来源 | 无 | Task 15 |
-| Web 完整 App 交互 | 代码与自动化完成，未部署 | 8 个纯 JS 状态机测试、4 个静态契约、101 个 Web/附件组合回归；真实 Chromium 桌面/390px 响应式检查通过 | 本地真实 Chromium 已核对布局；上传接口使用静态服务器故意得到失败态，只验证失败 UI，不冒充真实上传成功 | 尚未连接真实 PostgreSQL/Redis/worker 完成上传、ready、纯附件/混合发送、鉴权预览下载和服务端历史重载 | 云环境部署待 Task 16 | Task 12-16、17 |
+| Web 完整 App 交互 | 代码与自动化完成，未部署 | 8 个纯 JS 状态机测试、4 个静态契约、101 个 Web/附件组合回归；真实 Chromium 桌面/390px 响应式检查通过 | 本地真实 Chromium 已核对布局；上传接口使用静态服务器故意得到失败态，只验证失败 UI，不冒充真实上传成功 | 尚未连接真实 PostgreSQL/Redis/worker 完成上传、ready、纯附件/混合发送、鉴权预览下载和服务端历史重载 | 云环境部署待 Task 16 | Task 13-16、17 |
+| Android 完整 App WebView 选择器 | 代码与自动化完成，未部署 | 4 条 chooser 行为/契约测试；Android 全量 103 tests；`ACTION_OPEN_DOCUMENT` 多选、允许 MIME、旧回调取消、单/多 URI 有序返回、持久读权限、状态恢复和无相机入口 | 无 | 尚未在真机点击完整 App 回形针并选择单文件、多文件和取消；尚未验证具体文档 provider 是否授予可持久权限 | 真机待 Task 16 | Task 16、17 |
 | Android 悬浮窗交互 | 未开始 | 无 | 无 | 无原生选择、流式上传和托盘 | 无 | Task 13 |
 | 双界面历史一致性 | 未开始 | 无 | 无 | 本地镜像无附件元数据 | 无 | Task 14 |
 | 安全与提示注入防护 | 文件入口、解析失败隔离和鉴权下载完成，未部署 | hostile-file 测试验证 ZIP bomb、ZIP traversal、加密/损坏容器、脚本与伪装可执行文件；解析异常不回显路径；持久化失败清除未提交衍生文件；物理删除失败可恢复；预览/原件无密码返回 401 且不含文件字节，响应含 `nosniff` 与私有缓存头 | 无 | 文档内提示注入、审计和真实恶意样本待后续任务 | 无 | Task 8、14、17 |

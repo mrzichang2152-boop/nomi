@@ -71,7 +71,7 @@ public final class WebWorkspaceKeyboardTest {
                 StandardCharsets.UTF_8
         );
 
-        assertTrue(manifest.contains("android:configChanges=\"orientation|screenSize|keyboardHidden\""));
+        assertTrue(manifest.contains("android:configChanges=\"orientation|screenSize|keyboardHidden"));
         assertTrue(activity.contains("onConfigurationChanged"));
         assertTrue(activity.contains("dispatchEvent(new Event('resize'))"));
         assertTrue(activity.contains("webView.requestLayout()"));
