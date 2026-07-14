@@ -59,6 +59,42 @@ public final class AssistantApiClientTest {
     }
 
     @Test
+    public void chatHistoryKeepsStableMessageIdsAndOrderedSafeAttachmentMetadata() throws Exception {
+        server.enqueue(
+                new MockResponse()
+                        .setResponseCode(200)
+                        .setHeader("content-type", "application/json")
+                        .setBody("{"
+                                + "\"conversation_id\":\"conv-attachments\","
+                                + "\"messages\":[{"
+                                + "\"id\":\"message-1\","
+                                + "\"created_at\":\"2026-07-13T10:00:00+08:00\","
+                                + "\"role\":\"user\","
+                                + "\"content\":\"比较附件\","
+                                + "\"attachments\":["
+                                + "{\"attachment_id\":\"a-1\",\"ordinal\":0,\"filename\":\"第一.png\","
+                                + "\"mime_type\":\"image/png\",\"byte_size\":11,\"status\":\"ready\","
+                                + "\"kind\":\"image\",\"preview_url\":\"/preview/a-1\",\"content_url\":\"/content/a-1\"},"
+                                + "{\"attachment_id\":\"a-2\",\"ordinal\":1,\"filename\":\"第二.pdf\","
+                                + "\"mime_type\":\"application/pdf\",\"byte_size\":22,\"status\":\"ready\","
+                                + "\"kind\":\"pdf\",\"preview_url\":null,\"content_url\":\"/content/a-2\"}"
+                                + "]}]}" )
+        );
+        AssistantApiClient client = new AssistantApiClient(ServerConfig.create(server.url("/").toString(), "secret"));
+
+        ChatHistoryMessage message = client.chatHistory("conv-attachments", 20).messages.get(0);
+
+        assertEquals("message-1", message.id);
+        assertEquals("2026-07-13T10:00:00+08:00", message.createdAt);
+        assertEquals(2, message.attachments.size());
+        assertEquals("message-1", message.attachments.get(0).messageId);
+        assertEquals("a-1", message.attachments.get(0).attachmentId);
+        assertEquals(0, message.attachments.get(0).ordinal);
+        assertEquals("a-2", message.attachments.get(1).attachmentId);
+        assertEquals(1, message.attachments.get(1).ordinal);
+    }
+
+    @Test
     public void chatPostsClientRequestIdForFallbackIdempotency() throws Exception {
         server.enqueue(
                 new MockResponse()

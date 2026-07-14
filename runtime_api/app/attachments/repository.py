@@ -114,6 +114,7 @@ def load_public_attachments_for_turns(
         result.setdefault(turn_id, []).append(
             {
                 "attachment_id": attachment_id,
+                "ordinal": int(row[1] or 0),
                 "filename": str(row[3]),
                 "mime_type": str(row[4] or row[5] or "application/octet-stream"),
                 "byte_size": int(row[6] or 0),

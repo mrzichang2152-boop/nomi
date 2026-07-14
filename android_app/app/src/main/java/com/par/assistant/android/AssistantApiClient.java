@@ -184,7 +184,38 @@ final class AssistantApiClient {
                 String content = item.optString("content", "").trim();
                 if (role.isEmpty() || content.isEmpty()) continue;
                 if (!"user".equals(role) && !"assistant".equals(role)) continue;
-                messages.add(new ChatHistoryMessage(role, content));
+                String messageId = item.optString("id", "").trim();
+                JSONArray attachmentsJson = item.optJSONArray("attachments");
+                List<ChatHistoryAttachment> attachments = new ArrayList<>();
+                if (attachmentsJson != null) {
+                    for (int attachmentIndex = 0; attachmentIndex < attachmentsJson.length(); attachmentIndex++) {
+                        JSONObject attachment = attachmentsJson.optJSONObject(attachmentIndex);
+                        if (attachment == null) continue;
+                        attachments.add(
+                                new ChatHistoryAttachment(
+                                        messageId,
+                                        attachment.optString("attachment_id"),
+                                        attachment.optString("filename"),
+                                        attachment.optString("mime_type"),
+                                        attachment.optLong("byte_size", 0L),
+                                        attachment.optString("status"),
+                                        attachment.optString("kind"),
+                                        attachment.optString("preview_url"),
+                                        attachment.optString("content_url"),
+                                        attachment.optInt("ordinal", attachmentIndex)
+                                )
+                        );
+                    }
+                }
+                messages.add(
+                        new ChatHistoryMessage(
+                                messageId,
+                                item.optString("created_at", ""),
+                                role,
+                                content,
+                                attachments
+                        )
+                );
             }
         }
         return new ChatHistoryResult(json.optString("conversation_id", ""), messages);
@@ -733,12 +764,69 @@ final class ChatHistoryResult {
 }
 
 final class ChatHistoryMessage {
+    final String id;
+    final String createdAt;
     final String role;
     final String content;
+    final List<ChatHistoryAttachment> attachments;
 
     ChatHistoryMessage(String role, String content) {
-        this.role = role == null ? "" : role;
-        this.content = content == null ? "" : content;
+        this("", "", role, content, List.of());
+    }
+
+    ChatHistoryMessage(String id, String createdAt, String role, String content) {
+        this(id, createdAt, role, content, List.of());
+    }
+
+    ChatHistoryMessage(
+            String id,
+            String createdAt,
+            String role,
+            String content,
+            List<ChatHistoryAttachment> attachments
+    ) {
+        this.id = id == null ? "" : id.trim();
+        this.createdAt = createdAt == null ? "" : createdAt.trim();
+        this.role = role == null ? "" : role.trim();
+        this.content = content == null ? "" : content.trim();
+        this.attachments = attachments == null ? List.of() : List.copyOf(attachments);
+    }
+}
+
+final class ChatHistoryAttachment {
+    final String messageId;
+    final String attachmentId;
+    final String filename;
+    final String mimeType;
+    final long byteSize;
+    final String status;
+    final String kind;
+    final String previewUrl;
+    final String contentUrl;
+    final int ordinal;
+
+    ChatHistoryAttachment(
+            String messageId,
+            String attachmentId,
+            String filename,
+            String mimeType,
+            long byteSize,
+            String status,
+            String kind,
+            String previewUrl,
+            String contentUrl,
+            int ordinal
+    ) {
+        this.messageId = messageId == null ? "" : messageId.trim();
+        this.attachmentId = attachmentId == null ? "" : attachmentId.trim();
+        this.filename = filename == null ? "" : filename.trim();
+        this.mimeType = mimeType == null ? "" : mimeType.trim();
+        this.byteSize = Math.max(0L, byteSize);
+        this.status = status == null ? "" : status.trim();
+        this.kind = kind == null ? "" : kind.trim();
+        this.previewUrl = previewUrl == null ? "" : previewUrl.trim();
+        this.contentUrl = contentUrl == null ? "" : contentUrl.trim();
+        this.ordinal = Math.max(0, ordinal);
     }
 }
 

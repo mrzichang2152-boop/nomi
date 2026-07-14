@@ -46,6 +46,9 @@
 | Task 12 Android 全量单测 | `gradle -p android_app :app:testDebugUnitTest` | 通过，103 tests | WebView 文件选择器、键盘、旋转、远程浏览器、聊天和既有 Android 行为组合回归；Gradle 仅报告未来版本弃用警告 |
 | Task 13 Android 悬浮窗附件聚焦测试 | Task 13 五个附件/实时测试类 | 通过，19 tests | 覆盖真实 multipart 大文件字节长度与 SHA-256、分块读取、进度/取消、稳定上传 ID、状态轮询、失败重试/移除、MIME 恢复、纯附件、混合消息、有序 ID 和 HTTP/WS 请求 ID 一致性 |
 | Task 13 Android 全量单测与 APK | `gradle -p android_app :app:testDebugUnitTest`、`gradle -p android_app :app:assembleDebug` | 通过，116 tests；APK 构建成功 | 悬浮窗附件托盘、聊天、历史同步、实时通道和既有 Android 行为组合回归；`git diff --check` 通过 |
+| Task 14 本地历史与附件对账聚焦测试 | `gradle -p android_app :app:testDebugUnitTest --tests '*LocalChatAttachmentHistoryTest' --tests '*AssistantApiClientTest' --tests '*FloatingChatContextTest'`；`python3 -m pytest -q tests/test_attachment_history_contract.py tests/test_attachment_history_and_retry.py` | Android 通过；后端 11 tests 通过 | 核对服务端稳定消息 ID、显式附件 ordinal、只按 `(message_id, attachment_id)` 归属附件、同名附件不串线、重复正文按出现次数消费已提交 pending、本地无原始字节/Base64/文件路径 |
+| Task 14 Android 全量单测与 APK | `gradle -p android_app :app:testDebugUnitTest :app:assembleDebug` | 通过，121 tests；APK 构建成功 | 本地安全镜像、悬浮窗恢复、远端权威对账、附件元数据卡与既有上传/聊天/键盘行为组合回归；`git diff --check` 通过 |
+| Task 14 隔离检查点后端全量 | `python3 -m pytest -q runtime_api/tests` | 2 failed、853 passed | 两个失败仍为既有 `test_chat_response_uses_explicit_memory_layer_fetchers` 与 `test_context_pack_pipeline_retrieves_local_memory_agenda_and_turns`，和 Task 7-13 隔离基线相同；Task 14 未新增失败 |
 | 工作区 | `git status --short` | 脏工作区 | 存在既有 OpenCode、Web Search、Android 等改动；不得重置或整体暂存 |
 
 ## 规格覆盖状态
@@ -71,7 +74,7 @@
 | Web 完整 App 交互 | 代码与自动化完成，未部署 | 8 个纯 JS 状态机测试、4 个静态契约、101 个 Web/附件组合回归；真实 Chromium 桌面/390px 响应式检查通过 | 本地真实 Chromium 已核对布局；上传接口使用静态服务器故意得到失败态，只验证失败 UI，不冒充真实上传成功 | 尚未连接真实 PostgreSQL/Redis/worker 完成上传、ready、纯附件/混合发送、鉴权预览下载和服务端历史重载 | 云环境部署待 Task 16 | Task 13-16、17 |
 | Android 完整 App WebView 选择器 | 代码与自动化完成，未部署 | 4 条 chooser 行为/契约测试；Android 全量 103 tests；`ACTION_OPEN_DOCUMENT` 多选、允许 MIME、旧回调取消、单/多 URI 有序返回、持久读权限、状态恢复和无相机入口 | 无 | 尚未在真机点击完整 App 回形针并选择单文件、多文件和取消；尚未验证具体文档 provider 是否授予可持久权限 | 真机待 Task 16 | Task 16、17 |
 | Android 悬浮窗交互 | 代码与自动化完成，未部署 | 19 条聚焦测试、116 条 Android 全量测试和 debug APK 构建通过；原生 `ACTION_OPEN_DOCUMENT`、允许格式、持久读权限、分块流式上传、进度/取消、ready 轮询、失败重试/移除、图片缩略图/文档图标、纯附件/混合发送、HTTP/WS 同序附件 ID 均已接入 | 无 | 尚未在真机核对不同文档 provider 的 URI 授权、旋转/服务重建、真实上传/解析 ready、失败重试、纯附件与混合发送以及服务端历史重载 | 真机与云环境待 Task 16 | Task 16、17 |
-| 双界面历史一致性 | 未开始 | 无 | 无 | 本地镜像无附件元数据 | 无 | Task 14 |
+| 双界面历史一致性 | 代码与自动化完成，未部署 | 服务端历史 DTO 与 Android 本地镜像保留相同有序安全附件元数据；服务端稳定 ID 权威覆盖已发送消息，删除项不在本地复活；本地只保留尚未被服务端同角色/正文出现次数消费的无 ID pending，且草稿附件始终留在原控制器；Android 全量 121 tests、后端聚焦 11 tests 通过 | 无 | 尚未在真实服务器、完整 App 与悬浮窗之间执行上传后切换、进程重启、离线 pending、服务端删除和附件卡重载；历史附件卡当前只展示安全元数据，真实鉴权下载/打开由 Task 16/17 验收 | 云环境与真机待 Task 16 | Task 16、17 |
 | 安全与提示注入防护 | 文件入口、解析失败隔离和鉴权下载完成，未部署 | hostile-file 测试验证 ZIP bomb、ZIP traversal、加密/损坏容器、脚本与伪装可执行文件；解析异常不回显路径；持久化失败清除未提交衍生文件；物理删除失败可恢复；预览/原件无密码返回 401 且不含文件字节，响应含 `nosniff` 与私有缓存头 | 无 | 文档内提示注入、审计和真实恶意样本待后续任务 | 无 | Task 8、14、17 |
 | 隐私安全 Trace | 未开始 | 无 | 无 | 无附件证据和耗时 trace | 无 | Task 15 |
 | 2 核 4G 性能与部署 | 容器预算契约完成，未实测 | 自动化锁定 attachment-worker `0.75 CPU / 768MB`、分类并发 `2/1/1`、非 root 和只读根文件系统；`docker compose config --quiet` 通过 | 无 | 尚未构建镜像并以 25MB 上传、31 页解析和并发聊天做资源实测 | 云环境部署待 Task 16 | Task 16、17 |

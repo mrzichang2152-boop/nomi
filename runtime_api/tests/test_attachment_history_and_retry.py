@@ -95,6 +95,7 @@ def test_history_metadata_is_batch_loaded_in_user_order_without_private_fields()
     ]
     assert result[str(USER_TURN_ID)][0] == {
         "attachment_id": str(FIRST_ATTACHMENT_ID),
+        "ordinal": 0,
         "filename": "架构图.png",
         "mime_type": "image/png",
         "byte_size": 431551,

@@ -55,7 +55,7 @@ final class FloatingChatContext {
             if (message == null) continue;
             String role = message.role == null ? "" : message.role.trim();
             if (!"user".equals(role) && !"assistant".equals(role)) continue;
-            add(role, message.content);
+            add(message.id, message.createdAt, role, message.content, message.attachments);
         }
     }
 
@@ -64,21 +64,47 @@ final class FloatingChatContext {
     }
 
     private void add(String role, String content) {
+        add("", "", role, content, List.of());
+    }
+
+    private void add(
+            String id,
+            String createdAt,
+            String role,
+            String content,
+            List<ChatHistoryAttachment> attachments
+    ) {
         String clean = content == null ? "" : content.trim();
         if (clean.isEmpty()) return;
-        turns.add(new Turn(role, clean));
+        turns.add(new Turn(id, createdAt, role, clean, attachments));
         if (turns.size() > 80) {
             turns.remove(0);
         }
     }
 
     static final class Turn {
+        final String id;
+        final String createdAt;
         final String role;
         final String content;
+        final List<ChatHistoryAttachment> attachments;
 
         Turn(String role, String content) {
+            this("", "", role, content, List.of());
+        }
+
+        Turn(
+                String id,
+                String createdAt,
+                String role,
+                String content,
+                List<ChatHistoryAttachment> attachments
+        ) {
+            this.id = id == null ? "" : id.trim();
+            this.createdAt = createdAt == null ? "" : createdAt.trim();
             this.role = role;
             this.content = content;
+            this.attachments = attachments == null ? List.of() : List.copyOf(attachments);
         }
     }
 }

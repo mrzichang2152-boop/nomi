@@ -405,7 +405,15 @@ public final class FloatingBallService extends Service {
         chatScrollView.addView(chatHistoryView);
         chatContentView.addView(chatScrollView, new LinearLayout.LayoutParams(-1, 0, 1));
 
-        addChatMessage("Nomi", "我在这里。你可以直接发消息，也可以点右上角查看日程或进入完整 App。");
+        List<ChatHistoryMessage> cachedHistory = LocalChatHistoryStore.load(this, activeConversationId);
+        if (cachedHistory.isEmpty()) {
+            cachedHistory = LocalChatHistoryStore.fromTurns(chatContext.snapshot(80));
+        }
+        if (cachedHistory.isEmpty()) {
+            addChatMessage("Nomi", "我在这里。你可以直接发消息，也可以点右上角查看日程或进入完整 App。");
+        } else {
+            renderChatHistory(cachedHistory);
+        }
 
         EditText input = new EditText(this);
         composerInput = input;
@@ -636,6 +644,7 @@ public final class FloatingBallService extends Service {
         List<FloatingChatContext.Turn> clientContext = chatContext.snapshotDelta(12000);
         addChatMessage("你", displayMessage);
         chatContext.addUser(displayMessage);
+        persistLocalChatHistory();
         TextView pending = addChatMessage("Nomi", "正在思考...");
         responseView.setText("");
         String conversationId = activeConversationId;
@@ -688,6 +697,7 @@ public final class FloatingBallService extends Service {
                     String answer = result.answer.isEmpty() ? "已发送，但没有返回内容。" : result.answer;
                     pending.setText(messageText("Nomi", answer));
                     chatContext.addAssistant(answer);
+                    persistLocalChatHistory();
                     clearSentAttachments();
                 });
             } catch (Exception error) {
@@ -768,6 +778,7 @@ public final class FloatingBallService extends Service {
         }
         streamingPendingView.setText(messageText("Nomi", finalAnswer));
         chatContext.addAssistant(finalAnswer);
+        persistLocalChatHistory();
         clearSentAttachments();
         clearStreamingChatState();
     }
@@ -1032,23 +1043,63 @@ public final class FloatingBallService extends Service {
     }
 
     private void applyRemoteChatHistory(ChatHistoryResult history, int localSizeAtRequest) {
-        if (panelView == null || chatHistoryView == null || history == null || history.messages.isEmpty()) {
-            return;
-        }
+        if (panelView == null || chatHistoryView == null || history == null) return;
         if (chatContext.size() != localSizeAtRequest) {
             return;
         }
         if (!history.conversationId.trim().isEmpty()) {
             rememberActiveConversationId(history.conversationId);
         }
-        chatHistoryView.removeAllViews();
-        chatContext.replaceWithHistory(history.messages);
-        for (ChatHistoryMessage message : history.messages) {
-            addChatMessage(speakerForHistoryRole(message.role), message.content);
-        }
+        List<ChatHistoryMessage> local = LocalChatHistoryStore.fromTurns(chatContext.snapshot(80));
+        List<ChatHistoryMessage> reconciled = LocalChatHistoryStore.reconcile(local, history.messages, 80);
+        renderChatHistory(reconciled);
+        LocalChatHistoryStore.save(this, activeConversationId, reconciled);
         if (responseView != null) {
             responseView.setText("");
         }
+    }
+
+    private void renderChatHistory(List<ChatHistoryMessage> messages) {
+        if (chatHistoryView == null) return;
+        chatHistoryView.removeAllViews();
+        chatContext.replaceWithHistory(messages);
+        for (ChatHistoryMessage message : messages) {
+            addChatMessage(speakerForHistoryRole(message.role), message.content);
+            for (ChatHistoryAttachment attachment : message.attachments) {
+                addHistoryAttachmentCard(attachment);
+            }
+        }
+    }
+
+    private void addHistoryAttachmentCard(ChatHistoryAttachment attachment) {
+        if (chatHistoryView == null || attachment == null) return;
+        TextView card = new TextView(this);
+        String label = attachment.filename.isEmpty() ? "附件" : attachment.filename;
+        String detail = attachment.kind.isEmpty() ? attachment.mimeType : attachment.kind;
+        card.setText("附件  " + label + "\n" + detail + " · " + readableByteSize(attachment.byteSize)
+                + (attachment.status.isEmpty() ? "" : " · " + attachment.status));
+        card.setSingleLine(false);
+        card.setTextSize(12);
+        card.setTextColor(Color.rgb(30, 64, 175));
+        card.setPadding(dp(10), dp(8), dp(10), dp(8));
+        card.setBackground(rounded(Color.rgb(239, 246, 255), Color.rgb(191, 219, 254), 10));
+        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(-1, -2);
+        params.setMargins(dp(16), 0, 0, dp(8));
+        chatHistoryView.addView(card, params);
+    }
+
+    private String readableByteSize(long bytes) {
+        if (bytes < 1024L) return bytes + " B";
+        if (bytes < 1024L * 1024L) return Math.max(1L, bytes / 1024L) + " KB";
+        return Math.max(1L, bytes / (1024L * 1024L)) + " MB";
+    }
+
+    private void persistLocalChatHistory() {
+        LocalChatHistoryStore.save(
+                this,
+                activeConversationId,
+                LocalChatHistoryStore.fromTurns(chatContext.snapshot(80))
+        );
     }
 
     private String speakerForHistoryRole(String role) {
