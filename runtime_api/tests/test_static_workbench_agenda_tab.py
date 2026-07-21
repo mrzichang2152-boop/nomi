@@ -80,6 +80,18 @@ def test_workbench_has_dedicated_career_navigation_and_view():
     assert nav_order == sorted(nav_order)
 
 
+def test_desktop_sidebar_keeps_navigation_compact_and_top_aligned():
+    css = read_static("styles.css")
+    sidebar_start = css.index(".sidebar {")
+    sidebar_end = css.index("}", sidebar_start)
+    sidebar_rule = css[sidebar_start:sidebar_end]
+
+    assert "justify-content: flex-start" in sidebar_rule
+    assert "gap: 32px" in sidebar_rule
+    assert "overflow-y: auto" in sidebar_rule
+    assert "justify-content: space-between" not in sidebar_rule
+
+
 def test_mobile_assistant_shell_prioritizes_chat_and_moves_tools_to_settings():
     html = read_static("index.html")
     css = read_static("styles.css")
