@@ -43,37 +43,9 @@
               <strong>求职助手</strong>
               <span>岗位、简历、外联和面试进展</span>
             </button>
-            <button class="assistant-settings-item" data-view="suggestionsView" type="button">
-              <strong>主动建议</strong>
-              <span>Nomi 认为值得关注的下一步</span>
-            </button>
-            <button class="assistant-settings-item" data-view="toolsView" type="button">
-              <strong>账号连接</strong>
-              <span>Gmail、WhatsApp、Telegram、工具授权</span>
-            </button>
-            <button class="assistant-settings-item" data-view="assistantIdentitiesView" type="button">
-              <strong>助理身份</strong>
-              <span>配置 Nomi 自己的 Gmail 与通信记录</span>
-            </button>
-            <button class="assistant-settings-item" data-view="webSearchSettingsView" type="button">
-              <strong>Web Search</strong>
-              <span>配置 Exa、Tavily、博查和智能路由</span>
-            </button>
-            <button class="assistant-settings-item" data-view="privacyView" type="button">
-              <strong>隐私管理</strong>
-              <span>敏感字段放行、使用用途和一次性授权上下文</span>
-            </button>
-            <button class="assistant-settings-item" data-view="governanceView" type="button">
-              <strong>记忆治理</strong>
-              <span>检查、筛选和管理本地长期记忆</span>
-            </button>
-            <button class="assistant-settings-item" data-view="collectorsView" type="button">
-              <strong>采集状态</strong>
-              <span>查看各私有数据源是否正常同步</span>
-            </button>
-            <button class="assistant-settings-item" data-view="searchView" type="button">
-              <strong>个人搜索</strong>
-              <span>搜索长期记忆、事件和关系</span>
+            <button class="assistant-settings-item" data-view="settingsView" type="button">
+              <strong>设置</strong>
+              <span>管理记忆、账号、外部能力与隐私</span>
             </button>
           </div>
         </section>
@@ -87,13 +59,7 @@
             <button class="nav-button active" data-view="chatView" type="button">对话</button>
             <button class="nav-button" data-view="agendaView" type="button">日程</button>
             <button class="nav-button" data-view="careerView" type="button">求职</button>
-            <button class="nav-button" data-view="searchView" type="button">搜索</button>
-            <button class="nav-button" data-view="governanceView" type="button">治理</button>
-            <button class="nav-button" data-view="suggestionsView" type="button">建议</button>
-            <button class="nav-button" data-view="collectorsView" type="button">采集</button>
-            <button class="nav-button" data-view="assistantIdentitiesView" type="button">助理身份</button>
-            <button class="nav-button" data-view="toolsView" type="button">账号</button>
-            <button class="nav-button" data-view="webSearchSettingsView" type="button">Web Search</button>
+            <button class="nav-button" data-view="settingsView" type="button">设置</button>
           </nav>
         </aside>
 
@@ -129,7 +95,6 @@
             <header class="view-header">
               <h2>日程管理</h2>
               <div class="header-actions">
-                <button class="secondary back-to-settings" data-action="back-to-settings" type="button">返回设置</button>
                 <button id="refreshAgenda" type="button">刷新</button>
               </div>
             </header>
@@ -141,7 +106,6 @@
             <header class="view-header">
               <h2>求职看板</h2>
               <div class="header-actions">
-                <button class="secondary back-to-settings" data-action="back-to-settings" type="button">返回设置</button>
                 <button id="careerOffers" type="button">Offer 跟踪</button>
                 <button id="refreshCareer" type="button">刷新</button>
               </div>
@@ -165,10 +129,37 @@
             <div id="careerContent" class="content-list"></div>
           </section>
 
-          <section id="searchView" class="view settings-child-view">
+          <section id="settingsView" class="view settings-view">
+            <header class="view-header settings-view-header">
+              <div>
+                <h2>设置</h2>
+                <p class="view-subtitle">管理 Nomi 的记忆、数据源、外部能力与隐私。</p>
+              </div>
+            </header>
+            <div class="settings-layout">
+              <nav class="settings-navigation" aria-label="设置导航">
+                <section class="settings-navigation-group" aria-labelledby="settings-memory-group">
+                  <h3 id="settings-memory-group">智能与记忆</h3>
+                  <button class="settings-nav-button active" data-settings-section="suggestionsView" type="button">主动建议</button>
+                  <button class="settings-nav-button" data-settings-section="searchView" type="button">个人搜索</button>
+                  <button class="settings-nav-button" data-settings-section="governanceView" type="button">记忆治理</button>
+                </section>
+                <section class="settings-navigation-group" aria-labelledby="settings-data-group">
+                  <h3 id="settings-data-group">数据与账号</h3>
+                  <button class="settings-nav-button" data-settings-section="collectorsView" type="button">采集状态</button>
+                  <button class="settings-nav-button" data-settings-section="toolsView" type="button">账号连接</button>
+                  <button class="settings-nav-button" data-settings-section="assistantIdentitiesView" type="button">助理身份</button>
+                </section>
+                <section class="settings-navigation-group" aria-labelledby="settings-capability-group">
+                  <h3 id="settings-capability-group">能力与隐私</h3>
+                  <button class="settings-nav-button" data-settings-section="webSearchSettingsView" type="button">Web Search</button>
+                  <button class="settings-nav-button" data-settings-section="privacyView" type="button">隐私管理</button>
+                </section>
+              </nav>
+              <div class="settings-content">
+          <section id="searchView" class="settings-section">
             <header class="view-header">
               <h2>个人搜索</h2>
-              <button class="secondary back-to-settings" data-action="back-to-settings" type="button">返回设置</button>
             </header>
             <form id="searchForm" class="toolbar">
               <input id="searchInput" type="search" placeholder="搜索长期记忆、事件、关系" />
@@ -177,11 +168,10 @@
             <div id="searchContent" class="content-list"></div>
           </section>
 
-          <section id="governanceView" class="view settings-child-view">
+          <section id="governanceView" class="settings-section">
             <header class="view-header">
               <h2>记忆治理</h2>
               <div class="header-actions">
-                <button class="secondary back-to-settings" data-action="back-to-settings" type="button">返回设置</button>
                 <button id="refreshGovernance" type="button">刷新</button>
               </div>
             </header>
@@ -206,36 +196,33 @@
             <div id="governanceContent" class="content-list"></div>
           </section>
 
-          <section id="suggestionsView" class="view settings-child-view">
+          <section id="suggestionsView" class="settings-section active">
             <header class="view-header">
               <h2>主动建议</h2>
               <div class="header-actions">
-                <button class="secondary back-to-settings" data-action="back-to-settings" type="button">返回设置</button>
                 <button id="refreshSuggestions" type="button">刷新</button>
               </div>
             </header>
             <div id="suggestionsContent" class="content-list"></div>
           </section>
 
-          <section id="collectorsView" class="view settings-child-view">
+          <section id="collectorsView" class="settings-section">
             <header class="view-header">
               <h2>采集状态</h2>
               <div class="header-actions">
-                <button class="secondary back-to-settings" data-action="back-to-settings" type="button">返回设置</button>
                 <button id="refreshCollectors" type="button">刷新</button>
               </div>
             </header>
             <div id="collectorsContent" class="content-list"></div>
           </section>
 
-          <section id="assistantIdentitiesView" class="view settings-child-view">
+          <section id="assistantIdentitiesView" class="settings-section">
             <header class="view-header">
               <div>
                 <h2>助理身份</h2>
                 <p class="view-subtitle">这里配置 Nomi 自己的通信账号，与读取你私人信息的“账号连接”相互独立。</p>
               </div>
               <div class="header-actions">
-                <button class="secondary back-to-settings" data-action="back-to-settings" type="button">返回设置</button>
                 <button id="refreshAssistantIdentities" type="button">刷新</button>
               </div>
             </header>
@@ -269,24 +256,22 @@
             </div>
           </section>
 
-          <section id="toolsView" class="view settings-child-view">
+          <section id="toolsView" class="settings-section">
             <header class="view-header">
               <h2>账号连接</h2>
               <div class="header-actions">
-                <button class="secondary back-to-settings" data-action="back-to-settings" type="button">返回设置</button>
                 <button id="refreshTools" type="button">刷新</button>
               </div>
             </header>
             <div id="toolsContent" class="content-list"></div>
           </section>
 
-          <section id="webSearchSettingsView" class="view settings-child-view">
+          <section id="webSearchSettingsView" class="settings-section">
             <header class="view-header">
               <div>
                 <h2>Web Search</h2>
                 <p class="view-subtitle">外部搜索只发送脱敏后的公开查询。</p>
               </div>
-              <button class="secondary back-to-settings" data-action="back-to-settings" type="button">返回设置</button>
             </header>
             <div class="web-search-settings-scroll">
               <section id="webSearchProviderListPanel" class="web-search-provider-list-panel" aria-label="搜索服务列表">
@@ -362,10 +347,9 @@
             </div>
           </section>
 
-          <section id="privacyView" class="view settings-child-view">
+          <section id="privacyView" class="settings-section">
             <header class="view-header">
               <h2>隐私管理</h2>
-              <button class="secondary back-to-settings" data-action="back-to-settings" type="button">返回设置</button>
             </header>
             <div class="privacy-explainer content-list">
               <article class="card compact">
@@ -381,6 +365,9 @@
             </form>
             <div id="fieldReleaseResult" class="content-list route-result"></div>
           </section>
+              </div>
+            </div>
+          </section><!-- settingsView -->
         </section>
       </section>
     </main>

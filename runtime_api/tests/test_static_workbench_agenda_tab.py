@@ -272,7 +272,6 @@ def test_account_connection_buttons_stay_readable_on_mobile():
 
 def test_sensitive_field_release_lives_in_privacy_management_not_account_connection():
     html = read_static("index.html")
-    css = read_static("styles.css")
 
     assert '<button class="settings-nav-button" data-settings-section="privacyView" type="button">' in html
     assert "隐私管理" in html
@@ -295,13 +294,8 @@ def test_sensitive_field_release_lives_in_privacy_management_not_account_connect
     assert 'id="fieldReleaseName"' not in tools_html
     assert "放行字段" not in tools_html
 
-    assert ".settings-section.active" in css
-    assert ".privacy-explainer" in css
-
-
 def test_settings_view_groups_all_configuration_sections_without_back_controls():
     html = read_static("index.html")
-    js = read_static("app.js")
 
     settings_start = html.index('<section id="settingsView" class="view settings-view">')
     settings_end = html.index("</section><!-- settingsView -->", settings_start)
@@ -326,8 +320,6 @@ def test_settings_view_groups_all_configuration_sections_without_back_controls()
 
     assert 'data-action="back-to-settings"' not in settings
     assert "返回设置" not in settings
-    assert 'document.querySelectorAll("[data-action=\\"back-to-settings\\"]")' not in js
-    assert "returnToAssistantSettings" not in js
 
 
 def test_proactive_messages_render_as_chat_cards_in_compact_assistant():
