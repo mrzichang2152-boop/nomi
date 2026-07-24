@@ -20,6 +20,12 @@ def workbench_nav_html(html: str) -> str:
     return html[start:end]
 
 
+def assistant_shortcut_menu_html(html: str) -> str:
+    start = html.index('<section id="assistantSettingsPanel"')
+    end = html.index("</section>", start)
+    return html[start:end]
+
+
 def test_workbench_javascript_is_parseable():
     result = subprocess.run(
         ["node", "--check", str(ROOT / "app" / "static" / "app.js")],
@@ -45,7 +51,8 @@ def test_workbench_has_dedicated_agenda_navigation_and_view():
     nav_order = [
         nav.index('data-view="chatView"'),
         nav.index('data-view="agendaView"'),
-        nav.index('data-view="searchView"'),
+        nav.index('data-view="careerView"'),
+        nav.index('data-view="settingsView"'),
     ]
     assert nav_order == sorted(nav_order)
 
@@ -75,9 +82,31 @@ def test_workbench_has_dedicated_career_navigation_and_view():
         nav.index('data-view="chatView"'),
         nav.index('data-view="agendaView"'),
         nav.index('data-view="careerView"'),
-        nav.index('data-view="searchView"'),
+        nav.index('data-view="settingsView"'),
     ]
     assert nav_order == sorted(nav_order)
+
+
+def test_primary_navigation_only_exposes_workspaces_and_settings():
+    html = read_static("index.html")
+    sidebar = workbench_nav_html(html)
+
+    assert sidebar.count('class="nav-button') == 4
+    assert 'data-view="chatView"' in sidebar
+    assert 'data-view="agendaView"' in sidebar
+    assert 'data-view="careerView"' in sidebar
+    assert 'data-view="settingsView"' in sidebar
+    for old_view in (
+        "searchView",
+        "governanceView",
+        "suggestionsView",
+        "collectorsView",
+        "assistantIdentitiesView",
+        "toolsView",
+        "webSearchSettingsView",
+        "privacyView",
+    ):
+        assert f'data-view="{old_view}"' not in sidebar
 
 
 def test_desktop_sidebar_keeps_navigation_compact_and_top_aligned():
@@ -102,6 +131,7 @@ def test_mobile_assistant_shell_prioritizes_chat_and_moves_tools_to_settings():
     html = read_static("index.html")
     css = read_static("styles.css")
     js = read_static("app.js")
+    shortcut_menu = assistant_shortcut_menu_html(html)
 
     assert 'class="assistant-topbar"' in html
     assert 'id="assistantSettingsToggle"' in html
@@ -110,12 +140,23 @@ def test_mobile_assistant_shell_prioritizes_chat_and_moves_tools_to_settings():
     assert 'title="关闭对话框"' in html
     assert 'id="assistantSettingsPanel"' in html
     assert 'class="assistant-settings-grid"' in html
-    assert 'data-view="agendaView"' in html
-    assert 'data-view="careerView"' in html
+    assert shortcut_menu.count('class="assistant-settings-item"') == 3
+    assert 'data-view="agendaView"' in shortcut_menu
+    assert 'data-view="careerView"' in shortcut_menu
+    assert 'data-view="settingsView"' in shortcut_menu
+    for old_view in (
+        "suggestionsView",
+        "toolsView",
+        "assistantIdentitiesView",
+        "webSearchSettingsView",
+        "privacyView",
+        "governanceView",
+        "collectorsView",
+        "searchView",
+    ):
+        assert f'data-view="{old_view}"' not in shortcut_menu
     assert 'data-action="full-workspace"' not in html
     assert "完整工作台" not in html
-    assert "账号连接" in html
-    assert "记忆治理" in html
 
     assert ".assistant-topbar" in css
     assert ".assistant-settings-panel" in css
@@ -140,11 +181,11 @@ def test_mobile_assistant_shell_prioritizes_chat_and_moves_tools_to_settings():
 def test_account_connection_view_title_matches_settings_entry():
     html = read_static("index.html")
 
-    settings_entry = '<button class="assistant-settings-item" data-view="toolsView" type="button">'
+    settings_entry = '<button class="settings-nav-button" data-settings-section="toolsView" type="button">'
     assert settings_entry in html
-    assert '<button class="nav-button" data-view="toolsView" type="button">账号</button>' in html
-    assert "<strong>账号连接</strong>" in html
-    tools_view_start = html.index('<section id="toolsView" class="view settings-child-view">')
+    assert '<button class="nav-button" data-view="toolsView" type="button">账号</button>' not in html
+    assert "账号连接" in html
+    tools_view_start = html.index('<section id="toolsView" class="settings-section')
     tools_view_header = html[tools_view_start : html.index("</header>", tools_view_start)]
     assert "<h2>账号连接</h2>" in tools_view_header
     assert "<h2>工具目录</h2>" not in tools_view_header
@@ -233,11 +274,11 @@ def test_sensitive_field_release_lives_in_privacy_management_not_account_connect
     html = read_static("index.html")
     css = read_static("styles.css")
 
-    assert '<button class="assistant-settings-item" data-view="privacyView" type="button">' in html
-    assert "<strong>隐私管理</strong>" in html
-    assert '<section id="privacyView" class="view settings-child-view">' in html
+    assert '<button class="settings-nav-button" data-settings-section="privacyView" type="button">' in html
+    assert "隐私管理" in html
+    assert '<section id="privacyView" class="settings-section' in html
 
-    privacy_start = html.index('<section id="privacyView" class="view settings-child-view">')
+    privacy_start = html.index('<section id="privacyView" class="settings-section')
     privacy_html = html[privacy_start : html.index("</section>", privacy_start)]
     assert 'id="fieldReleaseForm"' in privacy_html
     assert 'id="fieldReleaseName"' in privacy_html
@@ -245,7 +286,7 @@ def test_sensitive_field_release_lives_in_privacy_management_not_account_connect
     assert 'id="fieldReleasePurpose"' in privacy_html
     assert "放行字段" in privacy_html
 
-    tools_start = html.index('<section id="toolsView" class="view settings-child-view">')
+    tools_start = html.index('<section id="toolsView" class="settings-section')
     tools_html = html[tools_start : html.index("</section>", tools_start)]
     assert 'id="toolRouteForm"' not in tools_html
     assert 'id="toolRouteInput"' not in tools_html
@@ -254,35 +295,39 @@ def test_sensitive_field_release_lives_in_privacy_management_not_account_connect
     assert 'id="fieldReleaseName"' not in tools_html
     assert "放行字段" not in tools_html
 
-    assert "#privacyView.active" in css
+    assert ".settings-section.active" in css
     assert ".privacy-explainer" in css
 
 
-def test_settings_child_views_have_back_to_settings_controls():
+def test_settings_view_groups_all_configuration_sections_without_back_controls():
     html = read_static("index.html")
     js = read_static("app.js")
 
-    settings_child_views = [
-        "agendaView",
-        "careerView",
+    settings_start = html.index('<section id="settingsView" class="view settings-view">')
+    settings_end = html.index("</section><!-- settingsView -->", settings_start)
+    settings = html[settings_start:settings_end]
+
+    assert 'class="settings-navigation"' in settings
+    assert "智能与记忆" in settings
+    assert "数据与账号" in settings
+    assert "能力与隐私" in settings
+    settings_sections = [
         "suggestionsView",
-        "toolsView",
-        "privacyView",
+        "searchView",
         "governanceView",
         "collectorsView",
-        "searchView",
+        "toolsView",
+        "assistantIdentitiesView",
+        "webSearchSettingsView",
+        "privacyView",
     ]
-    for view_id in settings_child_views:
-        view_start = html.index(f'<section id="{view_id}" class="view settings-child-view">')
-        view_header = html[view_start : html.index("</header>", view_start)]
-        assert "back-to-settings" in view_header
-        assert 'data-action="back-to-settings"' in view_header
-        assert "返回设置" in view_header
+    for view_id in settings_sections:
+        assert f'id="{view_id}" class="settings-section' in settings
 
-    assert 'document.querySelectorAll("[data-action=\\"back-to-settings\\"]")' in js
-    assert "returnToAssistantSettings" in js
-    assert 'switchView("chatView")' in js
-    assert "toggleAssistantSettings(true)" in js
+    assert 'data-action="back-to-settings"' not in settings
+    assert "返回设置" not in settings
+    assert 'document.querySelectorAll("[data-action=\\"back-to-settings\\"]")' not in js
+    assert "returnToAssistantSettings" not in js
 
 
 def test_proactive_messages_render_as_chat_cards_in_compact_assistant():
