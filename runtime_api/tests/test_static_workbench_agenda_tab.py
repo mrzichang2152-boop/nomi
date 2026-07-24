@@ -14,6 +14,88 @@ def read_static(name: str) -> str:
     return (ROOT / "app" / "static" / name).read_text(encoding="utf-8")
 
 
+def run_navigation_runtime(scenario: str) -> None:
+    app_js = ROOT / "app" / "static" / "app.js"
+    harness = f"""
+const assert = require("node:assert/strict");
+const {{ createWorkbenchNavigationController }} = require({str(app_js)!r});
+
+const viewHashMap = {{
+  chatView: "chat",
+  agendaView: "agenda",
+  careerView: "career",
+  settingsView: "settings",
+  suggestionsView: "suggestions",
+  searchView: "search",
+  governanceView: "governance",
+  collectorsView: "collectors",
+  toolsView: "tools",
+  assistantIdentitiesView: "assistant-identities",
+  webSearchSettingsView: "web-search",
+  privacyView: "privacy",
+}};
+const settingsSectionIds = [
+  "suggestionsView",
+  "searchView",
+  "governanceView",
+  "collectorsView",
+  "toolsView",
+  "assistantIdentitiesView",
+  "webSearchSettingsView",
+  "privacyView",
+];
+
+function createHarness(initialHash) {{
+  const location = {{ hash: initialHash }};
+  const history = {{
+    entries: [],
+    pushState(_state, _title, nextHash) {{
+      this.entries.push(nextHash);
+      location.hash = nextHash;
+    }},
+  }};
+  const routes = [];
+  const loads = [];
+  const state = {{ clearCount: 0 }};
+  const primaryLoaders = Object.fromEntries(
+    ["chatView", "agendaView", "careerView"].map((id) => [
+      id,
+      () => loads.push({{ kind: "primary", id }}),
+    ])
+  );
+  const settingsLoaders = Object.fromEntries(
+    settingsSectionIds
+      .filter((id) => id !== "searchView" && id !== "privacyView")
+      .map((id) => [
+        id,
+        (...args) => loads.push({{ kind: "settings", id, args }}),
+      ])
+  );
+  const controller = createWorkbenchNavigationController({{
+    location,
+    history,
+    viewHashMap,
+    settingsSectionIds,
+    defaultSettingsSectionId: "suggestionsView",
+    applyRoute: (route) => routes.push({{ ...route }}),
+    primaryLoaders,
+    settingsLoaders,
+    clearWebSearchKeyInput: () => {{
+      state.clearCount += 1;
+    }},
+  }});
+  return {{ controller, history, loads, location, routes, state }};
+}}
+"""
+    result = subprocess.run(
+        ["node", "-e", f"{harness}\n{scenario}"],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr or result.stdout
+
+
 def workbench_nav_html(html: str) -> str:
     start = html.index('<nav class="nav-actions"')
     end = html.index("</nav>", start)
@@ -257,6 +339,8 @@ def test_account_connection_view_title_matches_settings_entry():
 def test_settings_route_state_preserves_primary_and_legacy_deep_links():
     js = read_static("app.js")
 
+    assert "function createWorkbenchNavigationController" in js
+    assert "const workbenchNavigation = createWorkbenchNavigationController" in js
     assert 'const defaultSettingsSectionId = "suggestionsView";' in js
     assert "const settingsSectionIds = new Set([" in js
     for view_id in (
@@ -275,14 +359,14 @@ def test_settings_route_state_preserves_primary_and_legacy_deep_links():
     assert 'toolsView: "tools"' in js
     assert 'agendaView: "agenda"' in js
     assert 'careerView: "career"' in js
-    assert "const settingsHashViewMap" in js
     assert "function routeStateFromHash" in js
-    assert 'primaryViewId: "settingsView", settingsSectionId: "suggestionsView"' in js
-    assert "settingsHashViewMap[String(hash || \"\")]" in js
     assert "function viewIdFromHash" in js
     assert "routeStateFromHash(hash).primaryViewId" in js
-    assert "const initialRoute = routeStateFromHash(location.hash);" in js
-    assert 'switchView(initialRoute.primaryViewId || "chatView", initialRoute.settingsSectionId);' in js
+    show_app_start = js.index("function showApp()")
+    show_app_end = js.index("function toggleAssistantSettings", show_app_start)
+    show_app = js[show_app_start:show_app_end]
+    assert "workbenchNavigation.activateCurrentRoute()" in show_app
+    assert "loadDashboard()" not in show_app
 
 
 def test_settings_navigation_updates_hash_and_history_restores_secondary_route():
@@ -291,45 +375,53 @@ def test_settings_navigation_updates_hash_and_history_restores_secondary_route()
     settings_handler_start = js.index('document.querySelectorAll(".assistant-settings-item")')
     settings_handler_end = js.index('document.querySelectorAll(".settings-nav-button")', settings_handler_start)
     settings_handler = js[settings_handler_start:settings_handler_end]
-    assert "hashForView(buttonNode.dataset.view)" in settings_handler
-    assert 'buttonNode.dataset.view === "chatView" ? "chat" : ""' not in settings_handler
+    assert "workbenchNavigation.navigateToView(buttonNode.dataset.view)" in settings_handler
+    assert "switchView(" not in settings_handler
+    assert "location.hash =" not in settings_handler
 
-    secondary_handler_start = js.index('document.querySelectorAll(".settings-nav-button")')
+    secondary_handler_start = js.index(
+        'document.querySelectorAll(".settings-nav-button")',
+        settings_handler_end,
+    )
     secondary_handler_end = js.index('loginForm.addEventListener', secondary_handler_start)
     secondary_handler = js[secondary_handler_start:secondary_handler_end]
     assert "buttonNode.dataset.settingsSection" in secondary_handler
-    assert "setHashForView(settingsSectionId)" in secondary_handler
+    assert "workbenchNavigation.navigateToView(settingsSectionId)" in secondary_handler
+    assert "switchView(" not in secondary_handler
 
     hashchange_start = js.index('window.addEventListener("hashchange"')
     hashchange_end = js.index('window.addEventListener("nomi-pending-proactive"', hashchange_start)
     hashchange_handler = js[hashchange_start:hashchange_end]
-    assert "routeStateFromHash(location.hash)" in hashchange_handler
-    assert "route.primaryViewId" in hashchange_handler
-    assert "route.settingsSectionId" in hashchange_handler
-    assert 'if (location.hash === "#chat") switchView("chatView");' not in hashchange_handler
+    assert "workbenchNavigation.activateCurrentRoute()" in hashchange_handler
 
 
-def test_switch_view_activates_settings_section_and_uses_existing_lazy_loaders():
+def test_navigation_controller_uses_existing_lazy_loaders():
     js = read_static("app.js")
 
-    switch_start = js.index("function switchView(")
-    switch_end = js.index("function renderJson", switch_start)
-    switcher = js[switch_start:switch_end]
+    controller_start = js.index("const workbenchNavigation = createWorkbenchNavigationController")
+    controller_end = js.index("function hashForView", controller_start)
+    controller = js[controller_start:controller_end]
 
-    assert "settingsSectionIds.has(primaryViewId)" in switcher
-    assert 'primaryViewId = "settingsView"' in switcher
-    assert 'document.querySelectorAll(".settings-section")' in switcher
-    assert 'document.querySelectorAll(".settings-nav-button")' in switcher
-    assert 'button.setAttribute("aria-current", "page")' in switcher
-    assert 'button.removeAttribute("aria-current")' in switcher
-    assert "selectedSettingsSectionId !== \"webSearchSettingsView\"" in switcher
-    assert "loadSuggestions(currentSuggestionFocusId())" in switcher
-    assert "loadGovernance()" in switcher
-    assert "loadCollectors()" in switcher
-    assert "loadTools()" in switcher
-    assert "loadAssistantIdentities()" in switcher
-    assert "loadWebSearchSettings()" in switcher
-    assert 'selectedSettingsSectionId === "searchView"' not in switcher
+    assert 'chatView: () => loadChatAssistantDrafts()' in controller
+    assert 'agendaView: () => loadAgenda()' in controller
+    assert 'careerView: () => loadCareerBoard()' in controller
+    assert 'suggestionsView: (focusSuggestionId, fallbackEvent)' in controller
+    assert "loadSuggestions(focusSuggestionId, fallbackEvent)" in controller
+    assert 'governanceView: () => loadGovernance()' in controller
+    assert 'collectorsView: () => loadCollectors()' in controller
+    assert 'toolsView: () => loadTools()' in controller
+    assert 'assistantIdentitiesView: () => loadAssistantIdentities()' in controller
+    assert 'webSearchSettingsView: () => loadWebSearchSettings()' in controller
+    assert "searchView:" not in controller
+    assert "privacyView:" not in controller
+
+    apply_start = js.index("function applyWorkbenchRoute")
+    apply_end = js.index("function switchView", apply_start)
+    apply_route = js[apply_start:apply_end]
+    assert 'document.querySelectorAll(".settings-section")' in apply_route
+    assert 'document.querySelectorAll(".settings-nav-button")' in apply_route
+    assert 'button.setAttribute("aria-current", "page")' in apply_route
+    assert 'button.removeAttribute("aria-current")' in apply_route
 
 
 def test_settings_routing_removes_legacy_back_handler():
@@ -462,12 +554,13 @@ def test_proactive_messages_render_as_chat_cards_in_compact_assistant():
 def test_realtime_assistant_events_do_not_steal_settings_child_views():
     js = read_static("app.js")
 
-    helper_start = js.index("function shouldPreserveCurrentViewForAssistantEvent")
+    helper_start = js.index(
+        "function shouldPreserveCurrentViewForAssistantEvent",
+        js.index("const workbenchNavigation = createWorkbenchNavigationController"),
+    )
     helper_end = js.index("function renderAssistantEventWithoutStealingView", helper_start)
     helper = js[helper_start:helper_end]
-    assert "routeStateFromHash(location.hash)" in helper
-    assert "route.primaryViewId" in helper
-    assert '"chatView"' in helper
+    assert "workbenchNavigation.shouldPreserveCurrentViewForAssistantEvent()" in helper
 
     realtime_start = js.index("function handleRealtimeMessage(event)")
     realtime_end = js.index("function consumePendingProactive()", realtime_start)
@@ -480,6 +573,167 @@ def test_realtime_assistant_events_do_not_steal_settings_child_views():
     pending_handler = js[pending_start:pending_end]
     assert "renderAssistantEventWithoutStealingView" in pending_handler
     assert 'location.hash = "chat"' not in pending_handler
+
+    agent_pending_start = js.index("function consumePendingAgentEvent()")
+    agent_pending_end = js.index("function renderSources", agent_pending_start)
+    agent_pending = js[agent_pending_start:agent_pending_end]
+    assert "workbenchNavigation.consumePendingAgentEvent" in agent_pending
+    assert 'switchView("chatView")' not in agent_pending
+
+
+def test_runtime_initial_chat_does_not_load_settings_apis():
+    run_navigation_runtime(
+        """
+const h = createHarness("#chat");
+h.controller.activateCurrentRoute();
+assert.deepEqual(h.loads, [{ kind: "primary", id: "chatView" }]);
+assert.deepEqual(h.routes, [{ primaryViewId: "chatView", settingsSectionId: "" }]);
+"""
+    )
+
+
+def test_runtime_initial_settings_loads_only_suggestions_once():
+    run_navigation_runtime(
+        """
+const h = createHarness("#settings");
+h.controller.activateCurrentRoute();
+assert.equal(h.loads.length, 1);
+assert.equal(h.loads[0].kind, "settings");
+assert.equal(h.loads[0].id, "suggestionsView");
+assert.deepEqual(h.loads[0].args, ["", null]);
+assert.deepEqual(h.routes, [{ primaryViewId: "settingsView", settingsSectionId: "suggestionsView" }]);
+"""
+    )
+
+
+def test_runtime_settings_navigation_and_same_hash_load_exactly_once():
+    run_navigation_runtime(
+        """
+const h = createHarness("#settings");
+h.controller.activateCurrentRoute();
+h.loads.length = 0;
+h.routes.length = 0;
+
+h.controller.navigateToView("toolsView");
+assert.equal(h.location.hash, "#tools");
+assert.deepEqual(h.loads, [{ kind: "settings", id: "toolsView", args: [] }]);
+assert.equal(h.routes.length, 1);
+
+h.loads.length = 0;
+h.routes.length = 0;
+h.controller.navigateToView("toolsView");
+assert.deepEqual(h.loads, [{ kind: "settings", id: "toolsView", args: [] }]);
+assert.equal(h.routes.length, 1);
+assert.deepEqual(h.history.entries, ["#tools"]);
+"""
+    )
+
+
+def test_runtime_suggestion_deep_link_loads_once_with_focus_and_fallback():
+    run_navigation_runtime(
+        """
+const h = createHarness("#chat");
+const fallback = { id: "sg-42", title: "fallback title" };
+h.controller.navigateToSuggestion("sg-42", fallback);
+assert.equal(h.location.hash, "#suggestion:sg-42");
+assert.equal(h.loads.length, 1);
+assert.equal(h.loads[0].id, "suggestionsView");
+assert.equal(h.loads[0].args[0], "sg-42");
+assert.deepEqual(h.loads[0].args[1], fallback);
+assert.deepEqual(h.routes, [{ primaryViewId: "settingsView", settingsSectionId: "suggestionsView" }]);
+"""
+    )
+
+
+def test_runtime_hash_history_restores_primary_and_secondary_state():
+    run_navigation_runtime(
+        """
+const h = createHarness("#chat");
+h.controller.navigateToView("webSearchSettingsView");
+h.location.hash = "#agenda";
+h.controller.activateCurrentRoute();
+h.location.hash = "#web-search";
+h.controller.activateCurrentRoute();
+assert.deepEqual(h.routes, [
+  { primaryViewId: "settingsView", settingsSectionId: "webSearchSettingsView" },
+  { primaryViewId: "agendaView", settingsSectionId: "" },
+  { primaryViewId: "settingsView", settingsSectionId: "webSearchSettingsView" },
+]);
+assert.deepEqual(h.loads.map((item) => item.id), [
+  "webSearchSettingsView",
+  "agendaView",
+  "webSearchSettingsView",
+]);
+"""
+    )
+
+
+def test_runtime_leaving_web_search_clears_plaintext_key():
+    run_navigation_runtime(
+        """
+const h = createHarness("#web-search");
+h.controller.activateCurrentRoute();
+assert.equal(h.state.clearCount, 0);
+h.controller.navigateToView("toolsView");
+assert.equal(h.state.clearCount, 1);
+"""
+    )
+
+
+def test_runtime_pending_parse_error_does_not_steal_settings_view():
+    run_navigation_runtime(
+        """
+const h = createHarness("#settings");
+h.controller.activateCurrentRoute();
+h.loads.length = 0;
+h.routes.length = 0;
+const messages = [];
+h.controller.consumePendingAgentEvent("{not-json", {
+  handleEvent: () => assert.fail("invalid JSON must not reach the event handler"),
+  renderParseError: (message) => messages.push(message),
+});
+assert.equal(h.location.hash, "#settings");
+assert.deepEqual(h.loads, []);
+assert.deepEqual(h.routes, []);
+assert.deepEqual(messages, ["收到一个长尾任务提醒，但事件内容无法解析。"]);
+"""
+    )
+
+
+def test_runtime_realtime_render_does_not_steal_settings_view():
+    run_navigation_runtime(
+        """
+const h = createHarness("#tools");
+h.controller.activateCurrentRoute();
+h.loads.length = 0;
+h.routes.length = 0;
+const messages = [];
+h.controller.renderAssistantEventWithoutStealingView(() => messages.push("realtime"));
+assert.equal(h.location.hash, "#tools");
+assert.deepEqual(h.loads, []);
+assert.deepEqual(h.routes, []);
+assert.deepEqual(messages, ["realtime"]);
+"""
+    )
+
+
+def test_runtime_pending_valid_event_handler_errors_are_not_mislabeled_as_parse_errors():
+    run_navigation_runtime(
+        """
+const h = createHarness("#settings");
+const messages = [];
+assert.throws(
+  () => h.controller.consumePendingAgentEvent('{"type":"chat_done"}', {
+    handleEvent: () => {
+      throw new Error("handler failed");
+    },
+    renderParseError: (message) => messages.push(message),
+  }),
+  /handler failed/
+);
+assert.deepEqual(messages, []);
+"""
+    )
 
 
 def test_chat_messages_wrap_long_urls_inside_bubbles():
@@ -561,7 +815,7 @@ def test_workbench_loads_and_manages_agenda_items_from_runtime_api():
 
     assert 'document.querySelector("#agendaContent")' in js
     assert 'document.querySelector("#refreshAgenda")' in js
-    assert 'if (primaryViewId === "agendaView") loadAgenda();' in js
+    assert 'agendaView: () => loadAgenda()' in js
     assert "loadAgenda()" in js
     assert 'api("/api/agenda?limit=50")' in js
     assert "renderAgendaDayTabs" in js
@@ -591,7 +845,7 @@ def test_workbench_loads_and_manages_career_board_from_runtime_api():
     assert 'document.querySelector("#careerResumeFile")' in js
     assert 'document.querySelector("#refreshCareer")' in js
     assert 'document.querySelector("#careerOffers")' in js
-    assert 'if (primaryViewId === "careerView") loadCareerBoard();' in js
+    assert 'careerView: () => loadCareerBoard()' in js
     assert "loadCareerBoard()" in js
     assert 'api("/api/career/board?limit=50")' in js
     assert 'api("/api/career/offers")' in js
