@@ -379,6 +379,97 @@ button.secondary:hover {
   grid-template-rows: auto auto auto minmax(0, 1fr);
 }
 
+#settingsView.active {
+  grid-template-rows: auto minmax(0, 1fr);
+  background: #f8fafc;
+}
+
+.settings-layout {
+  display: grid;
+  grid-template-columns: 232px minmax(0, 1fr);
+  min-width: 0;
+  min-height: 0;
+  border-top: 1px solid #e2e8f0;
+}
+
+.settings-navigation,
+.settings-content {
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+.settings-navigation {
+  padding: 18px 14px 28px;
+  border-right: 1px solid #e2e8f0;
+  background: #f1f5f9;
+}
+
+.settings-navigation-group {
+  display: grid;
+  gap: 4px;
+  margin-bottom: 20px;
+}
+
+.settings-navigation-group:last-child {
+  margin-bottom: 0;
+}
+
+.settings-navigation-group h3 {
+  margin: 0 8px 7px;
+  color: #64748b;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0;
+}
+
+.settings-nav-button {
+  width: 100%;
+  padding: 10px 12px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: transparent;
+  color: #334155;
+  text-align: left;
+}
+
+.settings-nav-button:hover {
+  border-color: #cbd5e1;
+  background: #ffffff;
+}
+
+.settings-nav-button.active {
+  border-color: #99f6e4;
+  background: #ffffff;
+  color: #0f766e;
+  font-weight: 700;
+  box-shadow: inset 3px 0 0 #0f766e;
+}
+
+.settings-content {
+  min-width: 0;
+  overflow-x: hidden;
+  background: #ffffff;
+}
+
+.settings-section {
+  display: none;
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+}
+
+.settings-section.active {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+}
+
+#searchView.active,
+#governanceView.active {
+  grid-template-rows: auto auto minmax(0, 1fr);
+}
+
 .view-header {
   display: flex;
   align-items: center;
@@ -1737,6 +1828,46 @@ button.secondary:hover {
   .assistant-identity-section-heading {
     display: grid;
     gap: 3px;
+  }
+
+  .settings-layout {
+    grid-template-columns: 1fr;
+    grid-template-rows: auto minmax(0, 1fr);
+  }
+
+  .settings-navigation {
+    display: flex;
+    gap: 8px;
+    overflow-x: auto;
+    overflow-y: hidden;
+    padding: 10px 14px;
+    border-right: 0;
+    border-bottom: 1px solid #d7dee8;
+    background: #ffffff;
+    scrollbar-width: thin;
+  }
+
+  .settings-navigation-group {
+    display: contents;
+  }
+
+  .settings-navigation-group h3 {
+    display: none;
+  }
+
+  .settings-nav-button {
+    flex: 0 0 auto;
+    width: auto;
+    white-space: nowrap;
+    border-color: #d7dee8;
+    background: #f8fafc;
+  }
+
+  .settings-nav-button.active {
+    border-color: #0f766e;
+    background: #0f766e;
+    color: #ffffff;
+    box-shadow: none;
   }
 
   .workspace {

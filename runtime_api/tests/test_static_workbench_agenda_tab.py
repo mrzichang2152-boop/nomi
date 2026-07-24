@@ -124,7 +124,70 @@ def test_desktop_sidebar_keeps_navigation_compact_and_top_aligned():
 def test_workbench_versions_core_stylesheet_to_avoid_stale_layout():
     html = read_static("index.html")
 
-    assert 'href="/static/styles.css?v=20260723-chat-inline-drafts"' in html
+    assert 'href="/static/styles.css?v=20260724-settings-center"' in html
+
+
+def test_settings_center_has_independently_scrollable_desktop_layout():
+    css = read_static("styles.css")
+
+    assert "#settingsView.active" in css
+    assert ".settings-layout" in css
+    assert ".settings-navigation" in css
+    assert ".settings-navigation-group" in css
+    assert ".settings-nav-button" in css
+    assert ".settings-nav-button.active" in css
+    assert ".settings-content" in css
+    assert ".settings-section" in css
+    assert ".settings-section.active" in css
+
+    settings_layout_start = css.index(".settings-layout {")
+    settings_layout_end = css.index("}", settings_layout_start)
+    settings_layout = css[settings_layout_start:settings_layout_end]
+    assert "grid-template-columns: 232px minmax(0, 1fr)" in settings_layout
+    assert "min-height: 0" in settings_layout
+
+    scroll_rule_start = css.index(".settings-navigation,\n.settings-content")
+    scroll_rule_end = css.index("}", scroll_rule_start)
+    scroll_rule = css[scroll_rule_start:scroll_rule_end]
+    assert "overflow-y: auto" in scroll_rule
+    assert "min-height: 0" in scroll_rule
+
+    settings_content_start = css.index(".settings-content {", scroll_rule_end)
+    settings_content_end = css.index("}", settings_content_start)
+    settings_content = css[settings_content_start:settings_content_end]
+    assert "min-width: 0" in settings_content
+    assert "overflow-x: hidden" in settings_content
+
+
+def test_settings_center_uses_horizontal_secondary_navigation_on_mobile():
+    css = read_static("styles.css")
+    mobile = css[css.index("@media (max-width: 860px)") :]
+
+    layout_start = mobile.index(".settings-layout {")
+    layout_end = mobile.index("}", layout_start)
+    layout = mobile[layout_start:layout_end]
+    assert "grid-template-columns: 1fr" in layout
+    assert "grid-template-rows: auto minmax(0, 1fr)" in layout
+
+    navigation_start = mobile.index(".settings-navigation {")
+    navigation_end = mobile.index("}", navigation_start)
+    navigation = mobile[navigation_start:navigation_end]
+    assert "display: flex" in navigation
+    assert "overflow-x: auto" in navigation
+
+    group_start = mobile.index(".settings-navigation-group {")
+    group_end = mobile.index("}", group_start)
+    assert "display: contents" in mobile[group_start:group_end]
+
+    heading_start = mobile.index(".settings-navigation-group h3 {")
+    heading_end = mobile.index("}", heading_start)
+    assert "display: none" in mobile[heading_start:heading_end]
+
+    button_start = mobile.index(".settings-nav-button {")
+    button_end = mobile.index("}", button_start)
+    button = mobile[button_start:button_end]
+    assert "flex: 0 0 auto" in button
+    assert "white-space: nowrap" in button
 
 
 def test_mobile_assistant_shell_prioritizes_chat_and_moves_tools_to_settings():
