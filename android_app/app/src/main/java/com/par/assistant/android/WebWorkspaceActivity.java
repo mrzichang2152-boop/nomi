@@ -39,6 +39,13 @@ import java.util.Set;
 
 public final class WebWorkspaceActivity extends Activity {
     private static final long WORKSPACE_LOAD_TIMEOUT_MS = 10_000L;
+    private static final String WORKSPACE_SETTINGS_BACK_SCRIPT =
+            "(function(){"
+                    + "var state=history.state;"
+                    + "if(!state||state.nomiWorkbenchSettingsEntry!==true){return false;}"
+                    + "history.back();"
+                    + "return true;"
+                    + "})()";
 
     @Override
     protected void onStart() {
@@ -548,6 +555,22 @@ public final class WebWorkspaceActivity extends Activity {
             closeRemoteBrowserToAccounts();
             return;
         }
+        if (webView != null) {
+            webView.evaluateJavascript(WORKSPACE_SETTINGS_BACK_SCRIPT, result -> {
+                if (!javascriptHandledSettingsBack(result)) {
+                    finishWorkspaceFromBack();
+                }
+            });
+            return;
+        }
+        finishWorkspaceFromBack();
+    }
+
+    static boolean javascriptHandledSettingsBack(String result) {
+        return "true".equals(result);
+    }
+
+    private void finishWorkspaceFromBack() {
         super.onBackPressed();
     }
 
