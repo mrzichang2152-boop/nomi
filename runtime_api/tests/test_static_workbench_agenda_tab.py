@@ -51,27 +51,36 @@ function createHarness(initialHash, options = {{}}) {{
     }},
   }};
   const location = {{ hash: initialHash }};
-  const historyStack = [initialHash];
+  const historyStack = [{{ hash: initialHash, state: null }}];
   let historyIndex = 0;
   const history = {{
     entries: [],
-    pushState(_state, _title, nextHash) {{
+    replacements: [],
+    get state() {{
+      return historyStack[historyIndex]?.state ?? null;
+    }},
+    pushState(state, _title, nextHash) {{
       this.entries.push(nextHash);
       historyStack.splice(historyIndex + 1);
-      historyStack.push(nextHash);
+      historyStack.push({{ hash: nextHash, state }});
       historyIndex = historyStack.length - 1;
+      location.hash = nextHash;
+    }},
+    replaceState(state, _title, nextHash) {{
+      this.replacements.push(nextHash);
+      historyStack[historyIndex] = {{ hash: nextHash, state }};
       location.hash = nextHash;
     }},
     back() {{
       if (historyIndex === 0) return;
       historyIndex -= 1;
-      location.hash = historyStack[historyIndex];
+      location.hash = historyStack[historyIndex].hash;
       eventTarget.dispatchEvent({{ type: "hashchange" }});
     }},
     forward() {{
       if (historyIndex >= historyStack.length - 1) return;
       historyIndex += 1;
-      location.hash = historyStack[historyIndex];
+      location.hash = historyStack[historyIndex].hash;
       eventTarget.dispatchEvent({{ type: "hashchange" }});
     }},
   }};
@@ -664,7 +673,8 @@ h.routes.length = 0;
 h.controller.navigateToView("toolsView");
 assert.deepEqual(h.loads, [{ kind: "settings", id: "toolsView", args: [] }]);
 assert.equal(h.routes.length, 1);
-assert.deepEqual(h.history.entries, ["#tools"]);
+assert.deepEqual(h.history.entries, []);
+assert.deepEqual(h.history.replacements, ["#tools"]);
 """
     )
 
@@ -1207,6 +1217,73 @@ for (const testCase of cases) {
     )
 
 
+def test_runtime_settings_sections_share_one_history_entry_and_exit_to_source():
+    run_navigation_runtime(
+        """
+const h = createHarness("#career");
+h.controller.bindHashChanges(h.eventTarget);
+h.controller.activateCurrentRoute();
+
+h.controller.navigateToView("settingsView");
+assert.equal(h.location.hash, "#settings");
+assert.deepEqual(h.history.entries, ["#settings"]);
+assert.equal(h.history.state.nomiWorkbenchSettingsEntry, true);
+assert.equal(h.history.state.nomiSettingsReturnHash, "#career");
+
+h.controller.navigateToView("toolsView");
+h.controller.navigateToView("webSearchSettingsView");
+assert.equal(h.location.hash, "#web-search");
+assert.deepEqual(h.history.entries, ["#settings"]);
+assert.deepEqual(h.history.replacements, ["#tools", "#web-search"]);
+assert.equal(h.history.state.nomiSettingsReturnHash, "#career");
+
+h.controller.exitSettings();
+assert.equal(h.location.hash, "#career");
+assert.deepEqual(h.routes.at(-1), {
+  primaryViewId: "careerView",
+  settingsSectionId: "",
+});
+"""
+    )
+
+
+def test_runtime_android_history_back_exits_settings_after_section_changes():
+    run_navigation_runtime(
+        """
+const h = createHarness("#agenda");
+h.controller.bindHashChanges(h.eventTarget);
+h.controller.activateCurrentRoute();
+h.controller.navigateToView("settingsView");
+h.controller.navigateToView("assistantIdentitiesView");
+h.controller.navigateToView("privacyView");
+
+h.history.back();
+assert.equal(h.location.hash, "#agenda");
+assert.deepEqual(h.routes.at(-1), {
+  primaryViewId: "agendaView",
+  settingsSectionId: "",
+});
+"""
+    )
+
+
+def test_runtime_direct_settings_entry_back_falls_back_to_chat():
+    run_navigation_runtime(
+        """
+const h = createHarness("#settings");
+h.controller.activateCurrentRoute();
+h.controller.exitSettings();
+
+assert.equal(h.location.hash, "#chat");
+assert.deepEqual(h.history.replacements, ["#chat"]);
+assert.deepEqual(h.routes.at(-1), {
+  primaryViewId: "chatView",
+  settingsSectionId: "",
+});
+"""
+    )
+
+
 def test_runtime_hash_back_forward_events_restore_routes_with_one_load_each():
     run_navigation_runtime(
         """
@@ -1228,13 +1305,9 @@ h.history.forward();
 
 assert.deepEqual(h.routes, [
   { primaryViewId: "settingsView", settingsSectionId: "toolsView" },
-  { primaryViewId: "settingsView", settingsSectionId: "suggestionsView" },
-  { primaryViewId: "settingsView", settingsSectionId: "toolsView" },
   { primaryViewId: "agendaView", settingsSectionId: "" },
 ]);
 assert.deepEqual(h.loads.map((item) => item.id), [
-  "toolsView",
-  "suggestionsView",
   "toolsView",
   "agendaView",
 ]);

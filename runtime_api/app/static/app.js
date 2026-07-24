@@ -166,6 +166,7 @@ function createWorkbenchNavigationController({
   onLoaderError = () => {},
 }) {
   const primaryViewIds = new Set(["chatView", "agendaView", "careerView", "settingsView"]);
+  const primaryReturnViewIds = ["chatView", "agendaView", "careerView"];
   const settingsIds = new Set(settingsSectionIds || []);
   const suggestionFallbacks = new Map();
   let activeRoute = null;
@@ -209,6 +210,35 @@ function createWorkbenchNavigationController({
       settingsSectionId = "";
     }
     return { primaryViewId, settingsSectionId };
+  }
+
+  function isSettingsRoute(route) {
+    return normalizeRoute(route).primaryViewId === "settingsView";
+  }
+
+  function safePrimaryHash(hash) {
+    const candidate = String(hash || "");
+    return primaryReturnViewIds.some((viewId) => `#${hashForView(viewId)}` === candidate)
+      ? candidate
+      : "";
+  }
+
+  function settingsEntryState(returnHash, currentState = null) {
+    const base =
+      currentState && typeof currentState === "object" && !Array.isArray(currentState)
+        ? currentState
+        : {};
+    return {
+      ...base,
+      nomiWorkbenchSettingsEntry: true,
+      nomiSettingsReturnHash: safePrimaryHash(returnHash),
+    };
+  }
+
+  function settingsReturnHashFromState() {
+    const state = history.state;
+    if (!state || state.nomiWorkbenchSettingsEntry !== true) return "";
+    return safePrimaryHash(state.nomiSettingsReturnHash);
   }
 
   function currentSuggestionFocusId(hash = location.hash) {
@@ -315,8 +345,34 @@ function createWorkbenchNavigationController({
   function navigateToHash(nextHash) {
     if (!nextHash) return activateCurrentRoute();
     if (String(location.hash || "") !== nextHash) {
-      history.pushState(null, "", nextHash);
+      const currentRoute = normalizeRoute(routeStateFromHash(location.hash));
+      const nextRoute = normalizeRoute(routeStateFromHash(nextHash));
+      if (isSettingsRoute(currentRoute) && isSettingsRoute(nextRoute)) {
+        const returnHash = settingsReturnHashFromState();
+        const nextState = returnHash
+          ? settingsEntryState(returnHash, history.state)
+          : history.state ?? null;
+        history.replaceState(nextState, "", nextHash);
+      } else if (!isSettingsRoute(currentRoute) && isSettingsRoute(nextRoute)) {
+        const currentHash =
+          safePrimaryHash(location.hash) ||
+          (currentRoute.primaryViewId === "chatView" ? `#${hashForView("chatView")}` : "");
+        history.pushState(settingsEntryState(currentHash), "", nextHash);
+      } else {
+        history.pushState(null, "", nextHash);
+      }
     }
+    return activateCurrentRoute();
+  }
+
+  function exitSettings() {
+    const returnHash = settingsReturnHashFromState();
+    if (returnHash && typeof history.back === "function") {
+      history.back();
+      return;
+    }
+    const chatHash = `#${hashForView("chatView")}`;
+    history.replaceState(null, "", chatHash);
     return activateCurrentRoute();
   }
 
@@ -385,6 +441,7 @@ function createWorkbenchNavigationController({
     consumePendingAgentEvent,
     currentSuggestionFocusId,
     currentRouteContext,
+    exitSettings,
     hashForView,
     navigateToSuggestion,
     navigateToView,
