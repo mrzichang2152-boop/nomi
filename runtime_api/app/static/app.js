@@ -476,6 +476,7 @@ const passwordInput = document.querySelector("#passwordInput");
 const assistantSettingsToggle = document.querySelector("#assistantSettingsToggle");
 const assistantSettingsClose = document.querySelector("#assistantSettingsClose");
 const assistantSettingsPanel = document.querySelector("#assistantSettingsPanel");
+const settingsBackButton = document.querySelector("#settingsBackButton");
 const assistantCloseButton = document.querySelector("#assistantCloseButton");
 const sidebar = document.querySelector(".sidebar");
 const chatForm = document.querySelector("#chatForm");
@@ -4413,6 +4414,9 @@ document.querySelectorAll(".nav-button").forEach((buttonNode) => {
 
 assistantSettingsToggle?.addEventListener("click", () => toggleAssistantSettings());
 assistantSettingsClose?.addEventListener("click", () => toggleAssistantSettings(false));
+settingsBackButton?.addEventListener("click", () => {
+  workbenchNavigation.exitSettings();
+});
 assistantCloseButton?.addEventListener("click", closeAssistantWorkspace);
 webSearchProviderBack?.addEventListener("click", closeWebSearchProviderDetail);
 webSearchToggleKeyVisibility?.addEventListener("click", () => {

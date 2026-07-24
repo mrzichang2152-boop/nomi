@@ -251,7 +251,22 @@ def test_desktop_sidebar_keeps_navigation_compact_and_top_aligned():
 def test_workbench_versions_core_stylesheet_to_avoid_stale_layout():
     html = read_static("index.html")
 
-    assert 'href="/static/styles.css?v=20260724-settings-center"' in html
+    assert 'href="/static/styles.css?v=20260724-settings-back-navigation"' in html
+    assert 'src="/static/app.js?v=20260724-settings-back-navigation"' in html
+
+
+def test_settings_detail_exposes_accessible_back_button():
+    html = read_static("index.html")
+    js = read_static("app.js")
+    css = read_static("styles.css")
+
+    assert 'id="settingsBackButton"' in html
+    assert 'class="settings-back-button"' in html
+    assert 'aria-label="返回进入设置前的页面"' in html
+    assert 'document.querySelector("#settingsBackButton")' in js
+    assert "workbenchNavigation.exitSettings()" in js
+    assert ".settings-back-button" in css
+    assert "min-height: 44px" in css
 
 
 def test_settings_center_has_independently_scrollable_desktop_layout():

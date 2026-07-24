@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Nomi Personal Assistant</title>
-    <link rel="stylesheet" href="/static/styles.css?v=20260724-settings-center" />
+    <link rel="stylesheet" href="/static/styles.css?v=20260724-settings-back-navigation" />
   </head>
   <body>
     <main class="shell">
@@ -131,7 +131,16 @@
 
           <section id="settingsView" class="view settings-view">
             <header class="view-header settings-view-header">
-              <div>
+              <button
+                id="settingsBackButton"
+                class="settings-back-button"
+                type="button"
+                aria-label="返回进入设置前的页面"
+              >
+                <span aria-hidden="true">←</span>
+                <span>返回</span>
+              </button>
+              <div class="settings-view-heading-copy">
                 <h2>设置</h2>
                 <p class="view-subtitle">管理 Nomi 的记忆、数据源、外部能力与隐私。</p>
               </div>
@@ -373,6 +382,6 @@
     </main>
     <script src="/static/chat-attachments.js"></script>
     <script src="/static/file-viewer-links.js"></script>
-    <script src="/static/app.js?v=20260724-settings-center"></script>
+    <script src="/static/app.js?v=20260724-settings-back-navigation"></script>
   </body>
 </html>

@@ -384,6 +384,34 @@ button.secondary:hover {
   background: #f8fafc;
 }
 
+.settings-view-header {
+  align-items: flex-start;
+  justify-content: flex-start;
+}
+
+.settings-view-heading-copy {
+  min-width: 0;
+}
+
+.settings-back-button {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  min-height: 44px;
+  padding: 0 13px;
+  border: 1px solid #d7dee8;
+  border-radius: 10px;
+  background: #ffffff;
+  color: #172033;
+  font-weight: 700;
+}
+
+.settings-back-button:hover {
+  background: #f1f5f9;
+}
+
 .settings-layout {
   display: grid;
   grid-template-columns: 232px minmax(0, 1fr);
@@ -1833,6 +1861,16 @@ button.secondary:hover {
   .settings-layout {
     grid-template-columns: 1fr;
     grid-template-rows: auto minmax(0, 1fr);
+  }
+
+  .settings-view-header {
+    align-items: flex-start;
+    gap: 10px;
+  }
+
+  .settings-back-button {
+    min-height: 44px;
+    padding-inline: 12px;
   }
 
   .settings-navigation {
