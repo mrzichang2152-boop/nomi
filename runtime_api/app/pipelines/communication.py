@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import re
 from typing import Any
 
@@ -77,6 +78,72 @@ def run_communication_pipeline(pipeline_id: str, request: str, context: dict[str
     if pipeline_id == "email_pipeline":
         return _email(request, context)
     return None
+
+
+def attach_assistant_email_draft(
+    result: dict[str, Any],
+    context: dict[str, Any],
+    *,
+    gateway: Any,
+) -> dict[str, Any]:
+    """Materialize a deterministic Nomi Gmail plan through the shared tool gateway."""
+
+    identity_id = _text(context.get("assistant_identity_id"))
+    if identity_id != "nomi_gmail_primary":
+        return result
+    if result.get("status") != "draft_ready":
+        return result
+    if result.get("pipeline_id") not in {"reply_pipeline", "email_pipeline"}:
+        return result
+
+    resolved_slots = result.get("resolved_slots") if isinstance(result.get("resolved_slots"), dict) else {}
+    channel = _text(resolved_slots.get("channel")).lower()
+    mailbox = _text(resolved_slots.get("mailbox")).lower()
+    if channel not in {"email", "gmail"} and not mailbox.startswith("gmail"):
+        return result
+
+    contact_id = _text(context.get("recipient_contact_id"))
+    task_id = _text(result.get("task_trace_id"))
+    output = result.get("output") if isinstance(result.get("output"), dict) else {}
+    body_text = _text(output.get("draft"))
+    if not contact_id or not task_id or not body_text:
+        return result
+
+    evidence_ids = [
+        _text(item)
+        for item in result.get("source_event_ids") or []
+        if _text(item)
+    ]
+    subject = _text(context.get("email_subject"))
+    fingerprint = hashlib.sha256(
+        "\x1f".join(
+            [task_id, identity_id, contact_id, subject, body_text, *evidence_ids]
+        ).encode("utf-8")
+    ).hexdigest()
+    contract = gateway.execute(
+        "assistant.email.create_draft",
+        {
+            "identity_id": identity_id,
+            "recipient": {"contact_id": contact_id},
+            "subject": subject,
+            "body_text": body_text,
+            "source_evidence_ids": evidence_ids,
+            "task_id": task_id,
+            "idempotency_key": f"pipeline:{task_id}:{fingerprint}",
+        },
+        task_scope={
+            "task_id": task_id,
+            "permitted_tool_names": ["assistant.email.create_draft"],
+            "permitted_contact_ids": [contact_id],
+            "permitted_source_evidence_ids": evidence_ids,
+        },
+    )
+    persisted_output = dict(output)
+    persisted_output["draft_id"] = contract["draft_id"]
+    persisted_output["confirmation_card"] = dict(contract["confirmation_card"])
+    result["output"] = persisted_output
+    result["assistant_draft"] = dict(contract)
+    return result
 
 
 def _base_result(

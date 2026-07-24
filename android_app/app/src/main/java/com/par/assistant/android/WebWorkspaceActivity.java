@@ -39,6 +39,19 @@ import java.util.Set;
 
 public final class WebWorkspaceActivity extends Activity {
     private static final long WORKSPACE_LOAD_TIMEOUT_MS = 10_000L;
+
+    @Override
+    protected void onStart() {
+        super.onStart();
+        NomiForegroundUiState.enter();
+        startForegroundService(FloatingBallService.clearProactiveOverlayIntent(this));
+    }
+
+    @Override
+    protected void onStop() {
+        NomiForegroundUiState.exit();
+        super.onStop();
+    }
     private static final int FILE_CHOOSER_REQUEST_CODE = 4207;
     private static final String[] DEFAULT_ATTACHMENT_MIME_TYPES = new String[]{
             "image/png",
@@ -490,6 +503,18 @@ public final class WebWorkspaceActivity extends Activity {
         @JavascriptInterface
         public void updateConversationId(String conversationId) {
             runOnUiThread(() -> ConfigPrefs.writeConversationId(WebWorkspaceActivity.this, conversationId));
+        }
+
+        @JavascriptInterface
+        public void openFileViewer(String viewerUrl) {
+            runOnUiThread(() -> {
+                String baseUrl = ConfigPrefs.baseUrlOrDefault(WebWorkspaceActivity.this);
+                if (!FileViewerUrls.isTrustedViewerUrl(baseUrl, viewerUrl)) {
+                    Toast.makeText(WebWorkspaceActivity.this, "文件查看地址无效", Toast.LENGTH_SHORT).show();
+                    return;
+                }
+                startActivity(NomiFileViewerActivity.intentFor(WebWorkspaceActivity.this, viewerUrl));
+            });
         }
     }
 

@@ -21,6 +21,20 @@ final class WorkbenchUrls {
                 + "#chat";
     }
 
+    static String assistantIdentitiesUrl(String baseUrl) {
+        return stripHash(normalizedBaseUrl(baseUrl)) + "#assistant-identities";
+    }
+
+    static String accountConnectionsUrl(String baseUrl) {
+        return stripHash(normalizedBaseUrl(baseUrl)) + "#tools";
+    }
+
+    private static String normalizedBaseUrl(String baseUrl) {
+        return baseUrl == null || baseUrl.trim().isEmpty()
+                ? ConfigPrefs.DEFAULT_BASE_URL
+                : baseUrl.trim();
+    }
+
     private static String stripHash(String value) {
         int hashIndex = value.indexOf('#');
         return hashIndex >= 0 ? value.substring(0, hashIndex) : value;

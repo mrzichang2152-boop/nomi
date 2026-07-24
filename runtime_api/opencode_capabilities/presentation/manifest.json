@@ -1,0 +1,32 @@
+{
+  "schema_version": 1,
+  "id": "presentation",
+  "version": "1.0.0",
+  "display_name": "Nomi Presentation Studio",
+  "artifact_types": [
+    "pptx"
+  ],
+  "default_agent": "presentation-producer",
+  "resource_paths": {
+    "skills": [
+      "skills/presentation-quality/SKILL.md"
+    ],
+    "agents": [
+      "agents/presentation-producer.md"
+    ],
+    "tools": [
+      "tools/create_presentation.ts"
+    ],
+    "plugins": []
+  },
+  "quality_profile": {
+    "minimum_slide_count": 1,
+    "minimum_layout_kinds": 2,
+    "maximum_text_chars_per_slide": 360,
+    "require_visual_for_slide_count": 4,
+    "maximum_repeated_title_count": 1,
+    "maximum_process_steps": 4,
+    "maximum_list_items": 4,
+    "maximum_comparison_items_per_side": 3
+  }
+}

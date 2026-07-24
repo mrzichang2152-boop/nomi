@@ -1,9 +1,11 @@
 # Nomi Web Search Provider 设置与智能路由设计
 
-日期：2026-07-12  
-状态：设计已确认，尚未实现  
-依赖：`2026-07-12-nomi-web-search-design.md`  
+日期：2026-07-12
+状态：核心实现完成；真实多 Provider、云服务器与 Android 真机验收仍有阻塞
+依赖：`2026-07-12-nomi-web-search-design.md`
 范围：单用户、单实例私有部署；Exa、Tavily、博查的密钥设置、状态管理与智能路由
+
+实现与验收明细见：`docs/superpowers/reports/2026-07-12-web-search-provider-settings-gaps.md`。该报告区分本地自动化、真实博查、真实多 Provider 和真机证据；未提供真实凭据或未执行的链路不得视为通过。
 
 ## 1. 目标
 

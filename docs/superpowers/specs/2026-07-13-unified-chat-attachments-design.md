@@ -1,7 +1,7 @@
 # Nomi 统一聊天附件设计
 
 **日期：** 2026-07-13
-**状态：** 已确认，等待实现计划
+**状态：** 已确认，附件主链路已实现；2026-07-15 增补内置原格式查看器
 **范围：** Android 悬浮窗与完整 App 的图片和常见文档上传、持久化、理解、问答与跨端同步
 **研究依据：** `docs/superpowers/reports/2026-07-13-chat-attachments-research.md`
 
@@ -26,7 +26,8 @@ Nomi 必须允许用户在两种 Android 聊天界面中：
 - 纯附件消息默认任务是“识别并概括附件内容”。
 - PDF 超过 20 页或 PPTX 超过 30 张时，默认完成全量轻量解析和索引，但不逐页调用视觉模型。
 - 大文件根据用户问题选择相关文本和页面；只有用户明确要求逐页完整检查时才创建异步任务。
-- 完整 Docling 不进入 2 核 4G 默认部署，仅保留为未来可插拔的高配 Worker。
+- 完整 Docling 不进入默认部署，仅保留为未来可插拔的专项 Worker；现有核心解析能力不因
+  低配兼容而裁剪。
 
 ## 3. V1 支持范围
 
@@ -511,7 +512,7 @@ trace 必须能证明回答实际使用了哪个附件的哪些位置，而不�
 
 ## 17. 性能目标
 
-在 2 核 4G 私有服务器上：
+生产验收基线为 4 核 8G 私有服务器：
 
 - 普通小型数字文档解析 `P95 <= 5 秒`。
 - 图片或扫描页问答首个正式字符 `P95 <= 12 秒`。
@@ -579,3 +580,66 @@ trace 必须能证明回答实际使用了哪个附件的哪些位置，而不�
 6. Android 悬浮窗 Picker Activity、上传和附件 UI。
 7. 错误重试、trace、资源限制和安全加固。
 8. 云服务器、模拟器和 Android 真机完整回归。
+
+## 21. Nomi 内置原格式查看器
+
+### 21.1 产品目标
+
+用户点击聊天中的已发送附件或 Nomi 生成的产物时，默认在 Nomi 内部直接查看原文件，不再把查看职责交给 WPS、小米文档查看器或其他系统 App。下载仍可作为后续独立命令，但不能是“查看”的前置步骤。
+
+V1 直接查看格式与附件支持范围一致：PNG/JPEG/WebP/GIF、PDF、DOCX、PPTX、XLSX/CSV、TXT/Markdown。旧版 `.doc/.ppt/.xls` 仍按既有规则拒绝，不通过转换成 PDF 冒充直接查看。
+
+### 21.2 技术选型
+
+- 使用 Apache-2.0 的 Flyfish File Viewer `@file-viewer/web-full@2.1.29`。
+- 查看器及渲染器静态资源固定版本、自托管在 Nomi 镜像内，运行时不访问 CDN。
+- 只打包 V1 所需的 image、pdf、word、presentation、spreadsheet、text renderer 及其对应 vendor 资源，不携带整套 200+ 格式资源。
+- 浏览器先用 `X-Par-Password` 获取原件 Blob，再以 `File` 对象交给查看器；查看器看不到附件存储路径，也不持久化原始字节。
+
+### 21.3 查看链路
+
+```text
+附件卡 / 产物卡
+  -> 构造 /viewer?source=<同源 API path>&filename=<name>&mime_type=<mime>
+  -> Nomi Viewer 校验 source allowlist
+  -> 使用 X-Par-Password 获取原始字节
+  -> File/Blob 直接交给对应原格式 renderer
+  -> Nomi 内部缩放、翻页、搜索和工作表/幻灯片浏览
+```
+
+`source` 只允许以下两种相对路径：
+
+- `/api/chat/attachments/{uuid}/content`
+- `/api/artifacts/{safe-artifact-id}/download`
+
+禁止外部 URL、协议相对 URL、路径穿越、任意 API 路径和 `file/content` URI。访问密码只能来自当前 Web localStorage 或受信 Android JavaScript bridge；不得放入 viewer URL、日志或 trace。
+
+### 21.4 Web 与 Android 一致性
+
+- 完整 App 和桌面 Web 的附件卡、产物卡都进入 `/viewer`，不再默认创建 `<a download>`。
+- Android 悬浮窗历史附件卡必须可点击，并与完整 App 使用同一个服务端原件和同一个查看页。
+- Android 使用专用 `NomiFileViewerActivity` 承载受限 WebView；页面只能留在配置的 Nomi origin，外部导航一律拦截。
+- Android Viewer 提供固定返回/关闭入口，关闭后恢复悬浮球；旋转、系统返回键和失败重试不能丢失聊天历史。
+- 默认查看链路不得使用 `Intent.ACTION_VIEW`，不得弹出“使用哪个应用打开”或第三方应用授权弹窗。
+
+### 21.5 安全与错误状态
+
+- Viewer HTML 使用限制性的 CSP：脚本、连接、Worker 和资源仅允许自身、Blob/Data 的必要子集，禁止 object/frame/form/base。
+- 加载中、鉴权失败、文件不存在、格式不支持、解析失败分别显示明确中文状态；解析失败可重试，但不能自动下载或转交外部 App。
+- 文件名只作展示和 `File.name`，必须经过现有安全文件名处理；source 校验不能依赖文件名或 MIME。
+- 查看器关闭时销毁 Flyfish 实例和 Blob/Worker 资源，避免连续查看大文档产生内存累积。
+- Flyfish 的 PPTX 自适应样式依赖文档作用域，V1 使用专用 Viewer 页面配合
+  `styleIsolation: "scoped"`；该页面不承载聊天或账号 UI，并继续由 CSP、source allowlist
+  和受限 Android Activity 隔离。
+- `/static/vendor/file-viewer/` 只包含版本锁定的构建产物，响应使用
+  `Cache-Control: public, max-age=31536000, immutable`，避免 Android 首次下载后重复获取
+  较大的 Office renderer。
+
+### 21.6 验收标准
+
+1. Web、完整 App、悬浮窗对同一个附件打开一致的 Nomi Viewer。
+2. PNG/JPEG、PDF、DOCX、PPTX、XLSX、CSV、TXT、MD 原件逐一能直接查看，内容与已知事实一致。
+3. 查看 PPTX 能逐张浏览，XLSX 能切换 Sheet，DOCX/PDF 能滚动和缩放；不是转成 PDF 或图片后的替代预览。
+4. 查看过程不出现系统 App 选择器、WPS/小米文档查看器权限弹窗或 CDN 请求。
+5. 非法 source、错误密码和损坏文件均停在 Nomi 内部错误页，并给出合理可操作提示。
+6. 4 核 8G 云服务器连续打开真实文档时 API、聊天和采集服务不重启；Android 连续打开/关闭十次没有明显内存累积或悬浮球消失。

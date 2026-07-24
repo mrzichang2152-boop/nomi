@@ -459,13 +459,32 @@ PPT 内容已经整理完成，但文件生成失败。
 
 ### 10.5 Step 5: Generate PPTX
 
-使用本地 Python/Node 文档库生成 `.pptx`：
+生成文件由 OpenCode 执行器承接，不在 `/api/chat` 或 WebSocket 分支中硬编码单独 PPT 链路。
 
-- Python: `python-pptx`
-- Node: `pptxgenjs`
-- 若项目已有文档/演示依赖，优先沿用现有工具链
+OpenCode 可以根据任务包、仓库依赖和运行环境选择合适的本地 Python/Node 文档库，例如 `python-pptx`、`pptxgenjs` 或项目已有演示文稿工具链。Nomi runtime 只负责：
+
+- 提供原始目标、证据包、缺口报告和约束。
+- 限制 allowed/forbidden actions，阻止未确认的外部副作用。
+- 接收 OpenCode 输出的 artifact manifest、文件路径和 evidence mapping。
+- 校验文件并写入 artifact storage。
 
 文件存入 artifact storage，不直接塞进聊天消息。
+
+当前实现契约：
+
+- OpenCode worker 由 `POST /api/agent-tasks/{task_id}/run-opencode-artifact-worker` 触发。
+- 生产环境通过 `OPENCODE_ARTIFACT_COMMAND` 配置实际执行命令。
+- 执行器收到三个环境变量：
+  - `NOMI_OPENCODE_STEP_PACKET`: Nomi 生成的步骤任务包 JSON。
+  - `NOMI_ARTIFACT_WORKSPACE`: OpenCode 只能在该目录中读写本次产物文件。
+  - `NOMI_ARTIFACT_MANIFEST`: OpenCode 必须写入的 manifest 路径。
+- manifest 至少包含：
+  - `artifact_type`
+  - `filename`
+  - `file_path`
+  - `source_evidence_ids`
+  - `evidence_to_content_map`
+- Nomi worker 会拒绝 workspace 之外的文件路径，然后把合法文件复制到 artifact storage，并写入 `task_artifacts`。
 
 ### 10.6 Step 6: Verify
 
@@ -486,6 +505,22 @@ PPT 内容已经整理完成，但文件生成失败。
    - 是否使用“王总给的资料”
    - 是否输出 PPT，而不只是大纲文本
 
+当前实现状态：
+
+- 已实现基础结构校验：
+  - 文件必须存在且非空。
+  - `.pptx/.docx/.xlsx` 必须是可打开的 Office zip archive，并包含核心 Office 成员文件。
+  - Markdown 必须有非空文本。
+- 已实现第一版内容质量信号：
+  - `.pptx` 会抽取页数、非空页、标题候选、文本样本和每页文本长度。
+  - `source_evidence_ids` 必须全部映射到 `evidence_to_content_map`。
+  - 产物文本会与映射证据做粗粒度关键词覆盖检查，明显无关的产物会被阻断。
+- 尚未实现完整语义级内容质量校验：
+  - 逐页/逐段 evidence audit。
+  - 每个事实点的 entailment / 幻觉检测。
+  - 更细的视觉版式评分。
+  - 是否完整回应用户原始目标的模型/规则混合评估。
+
 ### 10.7 Step 7: Deliver
 
 返回：
@@ -494,6 +529,12 @@ PPT 内容已经整理完成，但文件生成失败。
 - 文件链接
 - 使用资料摘要
 - 可修改选项
+
+当前 Web 交付补充：
+
+- `/tasks/{task_id}` 提供独立任务详情页。
+- 页面读取 `/api/tasks/{task_id}` 和 `/api/tasks/{task_id}/artifacts`。
+- 页面展示任务概览、执行步骤、证据链接、交付文件和下载入口。
 
 ## 11. 执行器边界
 
@@ -751,16 +792,21 @@ OpenClaw/OpenCode 不能直接成为 PPT task 的主控。它们只能作为 exe
 
 ## 18. 已知 Gap
 
-这些是设计落地前明确存在的 gap：
+当前代码已补齐最小 artifact creation 闭环：
 
-1. `/api/chat` 现在不会自动创建 artifact task。
-2. 现有 long-tail agent 有 task 概念，但没有完整 artifact creation 产品闭环。
-3. 没有通用 `task_artifacts` 文件产物表。
-4. 没有 PPT 生成 pipeline。
-5. 没有 evidence pack 到 slide 的强绑定。
-6. Android 悬浮窗还没有 artifact card。
-7. Web 工作台还没有完整任务详情页。
-8. 真实文件生成工具链需要确认使用 Python 还是 Node。
+1. `/api/chat` 和 WebSocket 可以识别 artifact task，并创建 OpenCode long-tail 任务。
+2. 已有 `task_artifacts` 文件产物表、下载接口和 artifact storage。
+3. 默认命令可以生成真实 `.pptx`，OpenCode CLI adapter 已存在。
+4. verifier 已覆盖文件结构、PPTX 文本抽取、布局信号、证据映射和粗粒度 grounding。
+5. Android 悬浮窗已能显示 artifact card。
+6. Web 已有 `/tasks/{task_id}` 任务详情页。
+
+仍然存在的真实 gap：
+
+1. 生产环境还没有切换到真实 `opencode` CLI 并完成长时间 soak test。
+2. 完整语义级逐事实 evidence audit 还没有实现。
+3. WhatsApp/Gmail/Telegram live 附件下载到本地 artifact workspace 的 collector 仍待补齐。
+4. 真实账号消息/附件到 artifact 的端到端验收仍需要现场账号数据配合。
 
 ## 19. 分期建议
 
@@ -772,6 +818,8 @@ OpenClaw/OpenCode 不能直接成为 PPT task 的主控。它们只能作为 exe
 - 生成大纲和 Markdown 预览。
 - 如果资料不足，问用户。
 
+状态：已由 OpenCode artifact task 取代单独 PPT pipeline，最小闭环已实现。
+
 ### Phase 2: 真正生成 PPTX
 
 - 增加 PPT 生成器。
@@ -779,11 +827,15 @@ OpenClaw/OpenCode 不能直接成为 PPT task 的主控。它们只能作为 exe
 - 增加下载接口。
 - 增加 verifier。
 
+状态：默认命令已能生成 PPTX；真实 OpenCode CLI 仍待生产配置和 soak test。
+
 ### Phase 3: Android / Web 完整体验
 
 - Android 显示进度卡和文件卡。
 - Web 工作台显示任务详情。
 - 支持继续修改。
+
+状态：Android 文件卡和 Web 任务详情页已实现；继续修改仍需后续增强。
 
 ### Phase 4: Executor 增强
 

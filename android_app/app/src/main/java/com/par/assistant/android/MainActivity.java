@@ -26,6 +26,7 @@ public final class MainActivity extends Activity {
     static final String EXTRA_REQUEST_MICROPHONE = "com.par.assistant.android.REQUEST_MICROPHONE";
     private static final int REQUEST_RECORD_AUDIO = 2001;
     private final ExecutorService executor = Executors.newSingleThreadExecutor();
+    private boolean awaitingOverlayPermission;
     private EditText baseUrlInput;
     private EditText passwordInput;
     private TextView statusText;
@@ -33,10 +34,25 @@ public final class MainActivity extends Activity {
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+        if (shouldAutoStartFloatingBall()) {
+            if (Settings.canDrawOverlays(this)) {
+                launchNomi();
+                return;
+            }
+        }
         setContentView(buildView());
+        if (shouldAutoStartFloatingBall()) {
+            launchNomi();
+            return;
+        }
         if (getIntent() != null && getIntent().getBooleanExtra(EXTRA_REQUEST_MICROPHONE, false)) {
             requestMicrophoneIfNeeded();
         }
+    }
+
+    private boolean shouldAutoStartFloatingBall() {
+        return ConfigPrefs.hasSavedServerConfig(this)
+                && (getIntent() == null || !getIntent().getBooleanExtra(EXTRA_REQUEST_MICROPHONE, false));
     }
 
     private LinearLayout buildView() {
@@ -97,7 +113,7 @@ public final class MainActivity extends Activity {
         Button overlay = new Button(this);
         overlay.setText("启动 Nomi");
         stylePrimaryButton(overlay);
-        overlay.setOnClickListener(view -> startFloatingBall());
+        overlay.setOnClickListener(view -> launchNomi());
         root.addView(overlay, matchWidth());
 
         statusText = new TextView(this);
@@ -125,18 +141,39 @@ public final class MainActivity extends Activity {
         }
     }
 
-    private void startFloatingBall() {
+    private void launchNomi() {
         if (!Settings.canDrawOverlays(this)) {
+            awaitingOverlayPermission = true;
             Intent intent = new Intent(
                     Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
                     Uri.parse("package:" + getPackageName())
             );
             startActivity(intent);
-            statusText.setText("请授权显示在其他应用上层。");
+            if (statusText != null) {
+                statusText.setText("请授权显示在其他应用上层。");
+            }
             return;
         }
+        awaitingOverlayPermission = false;
         startForegroundService(new Intent(this, FloatingBallService.class));
-        closePageOnly();
+
+        String chatUrl = WorkbenchUrls.chatUrl(
+                ConfigPrefs.baseUrlOrDefault(this),
+                ConfigPrefs.conversationId(this)
+        );
+        Intent workspace = new Intent(this, WebWorkspaceActivity.class);
+        workspace.putExtra(WebWorkspaceActivity.EXTRA_URL, chatUrl);
+        workspace.addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP | Intent.FLAG_ACTIVITY_SINGLE_TOP);
+        startActivity(workspace);
+        finish();
+    }
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        if (awaitingOverlayPermission && Settings.canDrawOverlays(this)) {
+            launchNomi();
+        }
     }
 
     private void requestMicrophoneIfNeeded() {

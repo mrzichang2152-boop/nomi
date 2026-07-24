@@ -92,6 +92,12 @@ def test_desktop_sidebar_keeps_navigation_compact_and_top_aligned():
     assert "justify-content: space-between" not in sidebar_rule
 
 
+def test_workbench_versions_core_stylesheet_to_avoid_stale_layout():
+    html = read_static("index.html")
+
+    assert 'href="/static/styles.css?v=20260723-chat-inline-drafts"' in html
+
+
 def test_mobile_assistant_shell_prioritizes_chat_and_moves_tools_to_settings():
     html = read_static("index.html")
     css = read_static("styles.css")
@@ -1422,3 +1428,20 @@ def test_workbench_renders_long_tail_rollback_and_compensation_action_cards():
     assert 'external-effects/${effectId}/compensation' in js
     assert ".long-tail-action-card" in css
     assert ".long-tail-action-card .actions" in css
+
+
+def test_chat_artifact_urls_render_in_the_internal_viewer_across_all_reply_paths():
+    js = read_static("app.js")
+    css = read_static("styles.css")
+
+    assert "function renderMessageContent(node, text)" in js
+    assert "function isArtifactDownloadUrl(url)" in js
+    assert "function artifactFilenameFromMessage(text)" in js
+    assert 'anchor.className = "artifact-view-link"' in js
+    assert 'anchor.textContent = `点击查看${filename ? `：${filename}` : "文件"}`' in js
+    assert "openInternalFileViewer({ source: url, filename })" in js
+    assert "window.NomiAndroid.openFileViewer(viewerUrl)" in js
+    assert "renderMessageContent(item, text)" in js
+    assert "renderMessageContent(activeAssistantNode, activeAssistantNode.textContent)" in js
+    assert "renderMessageContent(pendingNode, result.answer)" in js
+    assert ".artifact-view-link" in css

@@ -387,10 +387,10 @@ def test_attachment_worker_compose_has_bounded_non_root_private_storage():
     assert "mem_limit: 768m" in attachment_worker
     assert 'user: "65532:65532"' in attachment_worker
     assert "read_only: true" in attachment_worker
-    assert "attachment_data:/app/data/attachments" in attachment_worker
-    assert "NOMI_ATTACHMENT_ROOT: /app/data/attachments" in attachment_worker
+    assert "NOMI_ATTACHMENT_ROOT: ${NOMI_ATTACHMENT_ROOT:-/app/data/attachments}" in attachment_worker
+    assert "attachment_data:${NOMI_ATTACHMENT_ROOT:-/app/data/attachments}" in attachment_worker
 
     runtime_api = compose.split("  runtime-api:\n", 1)[1].split("\n  opencode-artifact-worker:\n", 1)[0]
-    assert "attachment_data:/app/data/attachments" in runtime_api
-    assert "NOMI_ATTACHMENT_ROOT: /app/data/attachments" in runtime_api
+    assert "attachment_data:${NOMI_ATTACHMENT_ROOT:-/app/data/attachments}" in runtime_api
+    assert "NOMI_ATTACHMENT_ROOT: ${NOMI_ATTACHMENT_ROOT:-/app/data/attachments}" in runtime_api
     assert "  attachment_data:\n" in compose

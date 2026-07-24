@@ -8,7 +8,38 @@ os.environ.setdefault("DATABASE_URL", "postgresql://test")
 os.environ.setdefault("REDIS_URL", "redis://test")
 
 
+from app.pipelines import communication
 from app.pipelines.communication import run_communication_pipeline
+
+
+def _assistant_email_gateway():
+    from app.assistant_identity.models import AssistantIdentity
+    from app.assistant_identity.outbound import OutboundMessagePipeline
+    from app.assistant_identity.registry import AssistantIdentityRegistry
+    from app.assistant_identity.tool_gateway import AssistantToolGateway
+
+    registry = AssistantIdentityRegistry()
+    registry.add(
+        AssistantIdentity(
+            identity_id="nomi_gmail_primary",
+            kind="assistant_gmail",
+            provider="composio_gmail",
+            display_name="Nomi",
+            address="nomi@example.com",
+            status="connected",
+            capabilities=["receive", "draft", "send", "thread_reply"],
+        )
+    )
+    return AssistantToolGateway(
+        registry=registry,
+        outbound=OutboundMessagePipeline(),
+        contacts={
+            "contact_alice": {
+                "display_name": "Alice",
+                "gmail": "alice@example.com",
+            }
+        },
+    )
 
 
 def test_unknown_pipeline_returns_none():
@@ -188,6 +219,84 @@ def test_reply_pipeline_builds_draft_without_sending():
     assert result["output"]["confirmation_card"]["channel"] == "whatsapp"
     assert result["output"]["confirmation_card"]["actions"] == ["confirm_send", "edit_draft", "cancel"]
     assert result["provider_calls"] == []
+
+
+def test_deterministic_nomi_email_uses_the_same_persisted_gateway_draft_contract():
+    assert hasattr(communication, "attach_assistant_email_draft")
+    gateway = _assistant_email_gateway()
+    result = run_communication_pipeline(
+        "reply_pipeline",
+        "用 Nomi 邮箱回复 Alice，说周五八点可以",
+        {
+            "recipient": "Alice",
+            "channel": "email",
+            "message_intent": "周五八点可以",
+        },
+    )
+    result["task_trace_id"] = "pipeline_task_1"
+    result["source_event_ids"] = ["evt_123"]
+
+    attached = communication.attach_assistant_email_draft(
+        result,
+        {
+            "assistant_identity_id": "nomi_gmail_primary",
+            "recipient_contact_id": "contact_alice",
+            "email_subject": "确认周五时间",
+        },
+        gateway=gateway,
+    )
+
+    contract = attached["assistant_draft"]
+    persisted = gateway.outbound.get_draft(contract["draft_id"])
+    assert contract["status"] == "confirmation_required"
+    assert contract["identity"] == "Nomi <nomi@example.com>"
+    assert contract["recipient"] == "Alice <alice@example.com>"
+    assert contract["policy_checks"] == [
+        "identity_connected",
+        "recipient_resolved",
+        "evidence_scope_passed",
+        "idempotency_passed",
+    ]
+    assert contract["confirmation_card"] == persisted["confirmation_card"]
+    assert contract["audit"] == {
+        "tool_name": "assistant.email.create_draft",
+        "task_id": "pipeline_task_1",
+        "status": "confirmation_required",
+        "draft_id": persisted["draft_id"],
+        "sensitive_arguments_persisted": False,
+    }
+    assert attached["output"]["confirmation_card"] == persisted["confirmation_card"]
+    assert attached["output"]["draft_id"] == persisted["draft_id"]
+    assert persisted["body_text"] == "周五八点可以"
+    assert persisted["subject"] == "确认周五时间"
+    assert persisted["source_evidence_ids"] == ["evt_123"]
+    assert persisted["send_called"] is False
+    assert attached["provider_calls"] == []
+
+
+def test_deterministic_email_does_not_create_assistant_draft_without_explicit_identity():
+    assert hasattr(communication, "attach_assistant_email_draft")
+    gateway = _assistant_email_gateway()
+    result = run_communication_pipeline(
+        "reply_pipeline",
+        "回复 Alice，说周五八点可以",
+        {
+            "recipient": "Alice",
+            "channel": "email",
+            "message_intent": "周五八点可以",
+        },
+    )
+    result["task_trace_id"] = "pipeline_task_2"
+    result["source_event_ids"] = ["evt_123"]
+
+    attached = communication.attach_assistant_email_draft(
+        result,
+        {"recipient_contact_id": "contact_alice"},
+        gateway=gateway,
+    )
+
+    assert attached == result
+    assert "assistant_draft" not in attached
 
 
 def test_reply_pipeline_blocks_leakage_from_disallowed_context():

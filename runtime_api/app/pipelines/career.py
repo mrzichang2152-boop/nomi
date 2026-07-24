@@ -92,6 +92,8 @@ def _job_discovery_pipeline(request: str, context: dict[str, Any]) -> dict[str, 
     if not jobs:
         jobs = _jobs_from_pages(context)
     if not jobs:
+        jobs = _jobs_from_web_context(context)
+    if not jobs:
         job = _job(context)
         if job:
             jobs = [job]
@@ -1095,6 +1097,28 @@ def _jobs_from_pages(context: dict[str, Any]) -> list[dict[str, Any]]:
             }
         )
     return jobs
+
+
+def _jobs_from_web_context(context: dict[str, Any]) -> list[dict[str, Any]]:
+    raw = context.get("web_context") or []
+    if isinstance(raw, dict):
+        raw = [raw]
+    pages = []
+    for item in raw:
+        if not isinstance(item, dict) or str(item.get("layer") or "") != "web_evidence":
+            continue
+        url = str(item.get("url") or "").strip()
+        if not url or _ats_source(url) == "public_ats":
+            continue
+        pages.append(
+            {
+                "url": url,
+                "title": item.get("title"),
+                "text": item.get("content") or item.get("snippet") or "",
+                "source_event_id": item.get("source_id"),
+            }
+        )
+    return _jobs_from_pages({"job_pages": pages})
 
 
 def _contact(context: dict[str, Any]) -> dict[str, Any]:

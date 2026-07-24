@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Nomi Personal Assistant</title>
-    <link rel="stylesheet" href="/static/styles.css" />
+    <link rel="stylesheet" href="/static/styles.css?v=20260723-chat-inline-drafts" />
   </head>
   <body>
     <main class="shell">
@@ -51,6 +51,14 @@
               <strong>账号连接</strong>
               <span>Gmail、WhatsApp、Telegram、工具授权</span>
             </button>
+            <button class="assistant-settings-item" data-view="assistantIdentitiesView" type="button">
+              <strong>助理身份</strong>
+              <span>配置 Nomi 自己的 Gmail 与通信记录</span>
+            </button>
+            <button class="assistant-settings-item" data-view="webSearchSettingsView" type="button">
+              <strong>Web Search</strong>
+              <span>配置 Exa、Tavily、博查和智能路由</span>
+            </button>
             <button class="assistant-settings-item" data-view="privacyView" type="button">
               <strong>隐私管理</strong>
               <span>敏感字段放行、使用用途和一次性授权上下文</span>
@@ -83,13 +91,23 @@
             <button class="nav-button" data-view="governanceView" type="button">治理</button>
             <button class="nav-button" data-view="suggestionsView" type="button">建议</button>
             <button class="nav-button" data-view="collectorsView" type="button">采集</button>
+            <button class="nav-button" data-view="assistantIdentitiesView" type="button">助理身份</button>
             <button class="nav-button" data-view="toolsView" type="button">账号</button>
+            <button class="nav-button" data-view="webSearchSettingsView" type="button">Web Search</button>
           </nav>
         </aside>
 
         <section class="workspace">
           <section id="chatView" class="view active">
-            <div id="messages" class="messages"></div>
+            <div id="messages" class="messages">
+              <section
+                id="chatAssistantDrafts"
+                class="chat-assistant-drafts"
+                aria-label="Nomi 邮件操作"
+                aria-live="polite"
+                hidden
+              ></section>
+            </div>
             <form id="chatForm" class="composer">
               <div id="attachmentTray" class="attachment-tray" aria-live="polite" hidden></div>
               <div class="composer-main">
@@ -210,6 +228,47 @@
             <div id="collectorsContent" class="content-list"></div>
           </section>
 
+          <section id="assistantIdentitiesView" class="view settings-child-view">
+            <header class="view-header">
+              <div>
+                <h2>助理身份</h2>
+                <p class="view-subtitle">这里配置 Nomi 自己的通信账号，与读取你私人信息的“账号连接”相互独立。</p>
+              </div>
+              <div class="header-actions">
+                <button class="secondary back-to-settings" data-action="back-to-settings" type="button">返回设置</button>
+                <button id="refreshAssistantIdentities" type="button">刷新</button>
+              </div>
+            </header>
+            <div class="assistant-identity-scroll">
+              <div id="assistantIdentityList" class="assistant-identity-layout">
+                <section id="assistantIdentityGmail" class="assistant-identity-primary" aria-label="Nomi Gmail"></section>
+                <section class="assistant-identity-activity" aria-label="助理身份活动">
+                  <div class="assistant-identity-section-heading">
+                    <h3>最近收件</h3>
+                    <span>来自 Nomi 自己的邮箱</span>
+                  </div>
+                  <div id="assistantIdentityInbox" class="assistant-identity-list"></div>
+                  <div class="assistant-identity-section-heading">
+                    <h3>待确认草稿</h3>
+                    <span>确认前不会发送</span>
+                  </div>
+                  <div id="assistantIdentityDrafts" class="assistant-identity-list"></div>
+                  <div class="assistant-identity-section-heading">
+                    <h3>发送记录</h3>
+                    <span>失败与未知状态不会被隐藏</span>
+                  </div>
+                  <div id="assistantIdentityHistory" class="assistant-identity-list"></div>
+                  <div class="assistant-identity-section-heading">
+                    <h3>审计记录</h3>
+                    <span>敏感字段已脱敏</span>
+                  </div>
+                  <div id="assistantIdentityAudit" class="assistant-identity-list"></div>
+                </section>
+              </div>
+              <p id="assistantIdentityStatus" class="muted" aria-live="polite"></p>
+            </div>
+          </section>
+
           <section id="toolsView" class="view settings-child-view">
             <header class="view-header">
               <h2>账号连接</h2>
@@ -219,6 +278,88 @@
               </div>
             </header>
             <div id="toolsContent" class="content-list"></div>
+          </section>
+
+          <section id="webSearchSettingsView" class="view settings-child-view">
+            <header class="view-header">
+              <div>
+                <h2>Web Search</h2>
+                <p class="view-subtitle">外部搜索只发送脱敏后的公开查询。</p>
+              </div>
+              <button class="secondary back-to-settings" data-action="back-to-settings" type="button">返回设置</button>
+            </header>
+            <div class="web-search-settings-scroll">
+              <section id="webSearchProviderListPanel" class="web-search-provider-list-panel" aria-label="搜索服务列表">
+                <p id="webSearchConfiguredSummary" class="web-search-configured-summary"></p>
+                <div id="webSearchProviderList" class="web-search-provider-list"></div>
+                <div class="web-search-routing-panel">
+                  <div class="web-search-section-heading">
+                    <div>
+                      <strong>路由策略</strong>
+                      <span>只配置一个服务时全部请求都使用它。</span>
+                    </div>
+                    <span id="webSearchConfigVersion" class="web-search-version"></span>
+                  </div>
+                  <label>
+                    <span>策略</span>
+                    <select id="webSearchRoutingStrategy">
+                      <option value="smart">智能路由</option>
+                      <option value="fixed">固定顺序</option>
+                    </select>
+                  </label>
+                  <label>
+                    <span>回退顺序</span>
+                    <select id="webSearchRoutingOrder">
+                      <option value="exa,tavily,bocha">Exa → Tavily → 博查</option>
+                      <option value="exa,bocha,tavily">Exa → 博查 → Tavily</option>
+                      <option value="tavily,exa,bocha">Tavily → Exa → 博查</option>
+                      <option value="tavily,bocha,exa">Tavily → 博查 → Exa</option>
+                      <option value="bocha,exa,tavily">博查 → Exa → Tavily</option>
+                      <option value="bocha,tavily,exa">博查 → Tavily → Exa</option>
+                    </select>
+                  </label>
+                  <button id="webSearchSaveRouting" type="button">保存路由</button>
+                  <p id="webSearchRoutingStatus" class="muted small" aria-live="polite"></p>
+                </div>
+              </section>
+
+              <section id="webSearchProviderDetail" class="web-search-provider-detail hidden" aria-label="搜索服务详情">
+                <div class="web-search-detail-heading">
+                  <button id="webSearchProviderBack" class="icon-button compact" type="button" title="返回服务列表" aria-label="返回服务列表">←</button>
+                  <div>
+                    <h3 id="webSearchProviderDetailTitle">搜索服务</h3>
+                    <p id="webSearchProviderDescription" class="muted"></p>
+                  </div>
+                  <span id="webSearchProviderHealth" class="web-search-health"></span>
+                </div>
+                <div class="web-search-provider-summary">
+                  <span id="webSearchProviderSource">未配置</span>
+                  <code id="webSearchProviderKeyHint">••••</code>
+                </div>
+                <label class="web-search-toggle-row" for="webSearchEnabledToggle">
+                  <span>
+                    <strong>启用此服务</strong>
+                    <small>关闭后不会参与搜索或回退。</small>
+                  </span>
+                  <input id="webSearchEnabledToggle" type="checkbox" />
+                </label>
+                <label class="web-search-key-field" for="webSearchKeyInput">
+                  <span>API Key</span>
+                  <span class="web-search-key-input-wrap">
+                    <input id="webSearchKeyInput" type="password" autocomplete="new-password" spellcheck="false" placeholder="粘贴新的 API Key" />
+                    <button id="webSearchToggleKeyVisibility" class="icon-button compact" type="button" title="显示本次输入" aria-label="显示本次输入">◉</button>
+                  </span>
+                  <small>保存前会进行一次真实连接测试；页面不会读取或保存完整 Key。</small>
+                </label>
+                <div class="web-search-detail-actions">
+                  <button id="webSearchSaveAndTest" type="button">测试并保存</button>
+                  <button id="webSearchTestStored" class="secondary" type="button">测试已保存 Key</button>
+                  <button id="webSearchDeleteKey" class="secondary danger" type="button">删除数据库 Key</button>
+                </div>
+                <p id="webSearchLastTestedAt" class="muted small"></p>
+                <p id="webSearchProviderStatus" class="muted" aria-live="polite"></p>
+              </section>
+            </div>
           </section>
 
           <section id="privacyView" class="view settings-child-view">
@@ -244,6 +385,7 @@
       </section>
     </main>
     <script src="/static/chat-attachments.js"></script>
-    <script src="/static/app.js"></script>
+    <script src="/static/file-viewer-links.js"></script>
+    <script src="/static/app.js?v=20260723-chat-inline-drafts"></script>
   </body>
 </html>

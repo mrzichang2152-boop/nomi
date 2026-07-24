@@ -924,7 +924,7 @@ def test_graph_runner_requests_and_resolves_pending_human_input_payload():
 
     assert requested["event_type"] == "human_input.requested"
     assert waiting_state["current_node"] == "waiting_for_human_input"
-    assert waiting_state["pending_human_input"] == {
+    assert {key: value for key, value in waiting_state["pending_human_input"].items() if key != "created_at"} == {
         "step_id": "draft_email",
         "input_type": "clarification",
         "question": "这封邮件要正式一点还是轻松一点？",
@@ -934,6 +934,7 @@ def test_graph_runner_requests_and_resolves_pending_human_input_payload():
         ],
         "status": "waiting",
     }
+    assert waiting_state["pending_human_input"]["created_at"] == requested["created_at"]
     assert received["event_type"] == "human_input.received"
     assert resolved_state["current_node"] == "select_step"
     assert resolved_state.get("pending_human_input") is None
@@ -977,6 +978,8 @@ def test_graph_runner_recovers_pending_human_input_from_event_log():
     assert recovered["current_node"] == "waiting_for_human_input"
     assert recovered["pending_human_input"]["question"] == "使用什么语气？"
     assert recovered["pending_human_input"]["options"] == [{"id": "short", "label": "简短"}]
+    requested_event = next(event for event in store.task_events(task["task_id"]) if event["event_type"] == "human_input.requested")
+    assert recovered["pending_human_input"]["created_at"] == requested_event["created_at"]
 
 
 def test_graph_runner_fallback_contains_action_card_for_forbidden_external_action():
@@ -2292,6 +2295,8 @@ def test_long_tail_recovery_runner_claims_recovers_and_releases_due_tasks(monkey
     assert summary["results"][0]["task_id"] == "lta_recover_1"
     assert summary["results"][0]["state"]["current_node"] == "awaiting_executor"
     assert summary["results"][1]["status"] == "skipped"
+    recovered_events = store.task_events("lta_recover_1")
+    assert not any(event["event_type"] == "checkpoint.restored" for event in recovered_events)
     assert lease_manager.claimed == [
         ("lta_recover_1", "worker-test", 15),
         ("lta_recover_2", "worker-test", 15),

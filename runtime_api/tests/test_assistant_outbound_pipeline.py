@@ -1,4 +1,5 @@
 import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -104,6 +105,29 @@ def test_cancelled_draft_never_calls_provider():
     assert cancelled["send_called"] is False
 
 
+def test_cancelling_an_already_cancelled_draft_is_idempotent():
+    from app.assistant_identity.outbound import OutboundMessagePipeline
+
+    pipeline = OutboundMessagePipeline()
+    draft = pipeline.prepare_draft(
+        identity_id="nomi_gmail_primary",
+        channel="gmail",
+        recipient="qa-recipient@example.invalid",
+        subject="提醒",
+        body_text="提醒您别迟到。",
+        source_evidence_ids=["evt_cancel_retry"],
+    )
+
+    first = pipeline.cancel_draft(draft["draft_id"])
+    second = pipeline.cancel_draft(draft["draft_id"])
+
+    assert first["status"] == "cancelled"
+    assert second["status"] == "cancelled"
+    assert second["revision"] == first["revision"]
+    assert second["send_called"] is False
+    assert second["confirmation_required"] is False
+
+
 def test_send_requires_explicit_confirmation_token():
     from app.assistant_identity.outbound import OutboundMessagePipeline
 
@@ -144,7 +168,12 @@ def test_confirmed_gmail_send_calls_adapter_and_records_provider_result(monkeypa
         source_evidence_ids=["evt_3b"],
     )
 
-    result = pipeline.confirm_and_send(draft["draft_id"], confirmation_token="confirm-send")
+    confirmation = pipeline.issue_confirmation(draft["draft_id"], actor="local_owner")
+    result = pipeline.confirm_and_send(
+        draft["draft_id"],
+        confirmation_token=confirmation["confirmation_token"],
+        actor="local_owner",
+    )
 
     assert result["status"] == "sent"
     assert result["send_called"] is True
@@ -181,7 +210,12 @@ def test_default_gmail_send_returns_misconfigured_after_confirmation(monkeypatch
         source_evidence_ids=["evt_3c"],
     )
 
-    result = pipeline.confirm_and_send(draft["draft_id"], confirmation_token="confirm-send")
+    confirmation = pipeline.issue_confirmation(draft["draft_id"], actor="local_owner")
+    result = pipeline.confirm_and_send(
+        draft["draft_id"],
+        confirmation_token=confirmation["confirmation_token"],
+        actor="local_owner",
+    )
 
     assert result["status"] == "blocked"
     assert result["send_called"] is True
@@ -249,12 +283,115 @@ def test_call_requires_explicit_confirmation_token():
 
     assert adapter.calls == []
 
-    called = pipeline.confirm_and_call(draft["draft_id"], confirmation_token="confirm-call")
+    confirmation = pipeline.issue_confirmation(draft["draft_id"], actor="local_owner")
+    called = pipeline.confirm_and_call(
+        draft["draft_id"],
+        confirmation_token=confirmation["confirmation_token"],
+        actor="local_owner",
+    )
     assert called["status"] == "call_queued"
     assert called["call_called"] is True
     assert called["provider_call_id"] == "call-provider-1"
     assert called["provider_result"]["status_code"] == 201
     assert adapter.calls[0]["to_number"] == "+15551234567"
+
+
+def test_confirmation_binds_actor_and_immutable_draft_content():
+    from app.assistant_identity.outbound import OutboundMessagePipeline
+
+    adapter = RecordingGmailAdapter()
+    pipeline = OutboundMessagePipeline(gmail_adapter=adapter)
+    draft = pipeline.prepare_draft(
+        identity_id="nomi_gmail_primary",
+        channel="gmail",
+        recipient="alice@example.com",
+        subject="报价",
+        body_text="初版正文",
+        source_evidence_ids=["evt_confirm_1"],
+    )
+    confirmation = pipeline.issue_confirmation(draft["draft_id"], actor="local_owner")
+
+    try:
+        pipeline.confirm_and_send(
+            draft["draft_id"],
+            confirmation_token=confirmation["confirmation_token"],
+            actor="other_actor",
+        )
+    except PermissionError as exc:
+        assert "actor" in str(exc).lower()
+    else:
+        raise AssertionError("confirmation was accepted for a different actor")
+
+    pipeline.edit_draft(draft["draft_id"], body_text="修改后的正文")
+    try:
+        pipeline.confirm_and_send(
+            draft["draft_id"],
+            confirmation_token=confirmation["confirmation_token"],
+            actor="local_owner",
+        )
+    except PermissionError as exc:
+        assert "changed" in str(exc).lower() or "invalid" in str(exc).lower()
+    else:
+        raise AssertionError("confirmation survived a protected draft edit")
+
+    assert adapter.calls == []
+
+
+def test_confirmation_expires_and_duplicate_confirm_tap_sends_only_once(monkeypatch):
+    from app.assistant_identity.outbound import OutboundMessagePipeline
+
+    monkeypatch.setenv("ASSISTANT_GMAIL_ADDRESS", "nomi@example.com")
+    now = datetime(2026, 7, 22, 9, 0, tzinfo=timezone.utc)
+    adapter = RecordingGmailAdapter()
+    pipeline = OutboundMessagePipeline(gmail_adapter=adapter, clock=lambda: now)
+    expired_draft = pipeline.prepare_draft(
+        identity_id="nomi_gmail_primary",
+        channel="gmail",
+        recipient="expired@example.com",
+        subject="过期测试",
+        body_text="不会发送",
+        source_evidence_ids=["evt_expired"],
+    )
+    expired = pipeline.issue_confirmation(
+        expired_draft["draft_id"],
+        actor="local_owner",
+        ttl_seconds=60,
+    )
+    now = now + timedelta(seconds=61)
+    try:
+        pipeline.confirm_and_send(
+            expired_draft["draft_id"],
+            confirmation_token=expired["confirmation_token"],
+            actor="local_owner",
+        )
+    except PermissionError as exc:
+        assert "expired" in str(exc).lower()
+    else:
+        raise AssertionError("expired confirmation was accepted")
+
+    active_draft = pipeline.prepare_draft(
+        identity_id="nomi_gmail_primary",
+        channel="gmail",
+        recipient="alice@example.com",
+        subject="只发一次",
+        body_text="重复点击也只能发一次",
+        source_evidence_ids=["evt_once"],
+    )
+    active = pipeline.issue_confirmation(active_draft["draft_id"], actor="local_owner")
+    first = pipeline.confirm_and_send(
+        active_draft["draft_id"],
+        confirmation_token=active["confirmation_token"],
+        actor="local_owner",
+    )
+    second = pipeline.confirm_and_send(
+        active_draft["draft_id"],
+        confirmation_token=active["confirmation_token"],
+        actor="local_owner",
+    )
+
+    assert first == second
+    assert first["status"] == "sent"
+    assert len(adapter.calls) == 1
 
 
 def test_communication_pipeline_returns_agent_policy_for_long_tail_request():
@@ -269,7 +406,8 @@ def test_communication_pipeline_returns_agent_policy_for_long_tail_request():
     )
 
     assert result["status"] == "agent_required"
-    assert result["agent_policy"]["allowed_tools"] == ["assistant.outbound.create_draft"]
+    assert result["agent_policy"]["allowed_tools"] == ["assistant.email.create_draft"]
+    assert "assistant.outbound.create_draft" not in str(result["agent_policy"])
     assert "gmail.messages.send" in result["agent_policy"]["forbidden_provider_tools"]
     assert result["agent_policy"]["must_return_to_pipeline"] == "outbound_message_pipeline"
 

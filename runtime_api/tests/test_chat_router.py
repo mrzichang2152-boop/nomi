@@ -22,6 +22,167 @@ def test_simple_chat_only_needs_dialogue_context():
     assert route.needs_agenda is False
     assert route.needs_tasks is False
     assert route.needs_source is False
+    assert route.needs_web is False
+
+
+def test_explicit_web_search_routes_to_public_web_evidence():
+    from app.chat_router import context_fetch_limits, route_chat_context
+
+    route = route_chat_context("帮我搜索一下 Qwen 最新版本和官方发布说明", ui_state=None)
+    limits = context_fetch_limits(route, requested_limit=12)
+
+    assert route.intent == "web_query"
+    assert route.needs_web is True
+    assert route.web_mode == "balanced"
+    assert route.web_freshness == "month"
+    assert limits["web"] == 8
+
+
+def test_current_public_fact_uses_quick_web_search():
+    from app.chat_router import route_chat_context
+
+    route = route_chat_context("Qwen 当前最新版本是什么？", ui_state=None)
+
+    assert route.intent == "web_query"
+    assert route.needs_web is True
+    assert route.web_mode == "quick"
+
+
+def test_dynamic_public_fact_with_today_does_not_get_misrouted_to_agenda():
+    from app.chat_router import route_chat_context
+
+    route = route_chat_context("今天北京什么天气", ui_state=None)
+
+    assert route.intent == "web_query"
+    assert route.needs_web is True
+    assert route.needs_agenda is False
+    assert route.web_mode == "quick"
+    assert route.web_freshness == "day"
+
+
+def test_other_dynamic_public_facts_use_web_search():
+    from app.chat_router import route_chat_context
+
+    cases = [
+        "现在美元兑人民币汇率是多少？",
+        "今天上证指数多少点？",
+        "北京现在空气质量怎么样？",
+        "今晚国足比赛比分是多少？",
+    ]
+
+    for message in cases:
+        route = route_chat_context(message, ui_state=None)
+        assert route.intent == "web_query", message
+        assert route.needs_web is True, message
+        assert route.needs_agenda is False, message
+
+
+def test_broad_time_sensitive_public_questions_use_web_search_instead_of_agenda():
+    from app.chat_router import route_chat_context
+
+    cases = [
+        "故宫今天开放吗？",
+        "北京今天限号吗？",
+        "今天有什么重要新闻？",
+        "OpenAI 现在的 CEO 是谁？",
+        "iPhone 17 现在多少钱？",
+        "中国最新的个人所得税政策是什么？",
+        "上海迪士尼今天几点关门？",
+        "最近有哪些值得关注的 AI 新闻？",
+        "这周末北京有什么展览？",
+    ]
+
+    for message in cases:
+        route = route_chat_context(message, ui_state=None)
+        assert route.intent == "web_query", message
+        assert route.needs_web is True, message
+        assert route.needs_agenda is False, message
+
+
+def test_time_sensitive_public_role_without_freshness_word_uses_web_search():
+    from app.chat_router import route_chat_context
+
+    route = route_chat_context("OpenAI 的 CEO 是谁？", ui_state=None)
+
+    assert route.intent == "web_query"
+    assert route.needs_web is True
+    assert route.reason == "time_sensitive_public_topic"
+
+
+def test_current_public_office_holder_uses_web_search():
+    from app.chat_router import route_chat_context
+
+    for message in ["日本首相是谁？", "美国总统是谁？", "Who is the current UK prime minister?"]:
+        route = route_chat_context(message, ui_state=None)
+        assert route.intent == "web_query", message
+        assert route.needs_web is True, message
+        assert route.reason == "time_sensitive_public_topic", message
+
+
+def test_private_organization_role_does_not_leak_into_web_search():
+    from app.chat_router import route_chat_context
+
+    for message in ["我们部门负责人是谁？", "我的项目负责人是谁？"]:
+        route = route_chat_context(message, ui_state=None)
+        assert route.intent != "web_query", message
+        assert route.needs_web is False, message
+
+
+def test_private_context_with_time_words_does_not_leak_into_web_search():
+    from app.chat_router import route_chat_context
+
+    cases = [
+        "我今天有哪些安排？",
+        "刚才王总邮件里的报价是多少？",
+        "我最近和 Maya 聊了什么？",
+        "人民广场会面是几点？",
+    ]
+
+    for message in cases:
+        route = route_chat_context(message, ui_state=None)
+        assert route.needs_web is False, message
+        assert route.intent != "web_query", message
+
+
+def test_today_private_schedule_still_routes_to_agenda():
+    from app.chat_router import route_chat_context
+
+    route = route_chat_context("今天下午我有哪些安排？", ui_state=None)
+
+    assert route.intent == "agenda_query"
+    assert route.needs_agenda is True
+    assert route.needs_web is False
+
+
+def test_private_agenda_question_never_uses_public_web_search():
+    from app.chat_router import route_chat_context
+
+    route = route_chat_context("我明天有哪些安排？", ui_state=None)
+
+    assert route.intent == "agenda_query"
+    assert route.needs_web is False
+
+
+def test_job_discovery_combines_private_context_with_balanced_web_search():
+    from app.chat_router import context_fetch_limits, route_chat_context
+
+    route = route_chat_context("根据我的简历帮我找最近适合的 Go 后端工作机会", ui_state=None)
+    limits = context_fetch_limits(route, requested_limit=12)
+
+    assert route.intent == "job_query"
+    assert route.needs_memory is True
+    assert route.needs_web is True
+    assert route.web_mode == "balanced"
+    assert limits["web"] == 10
+
+
+def test_stable_general_knowledge_does_not_force_web_search():
+    from app.chat_router import route_chat_context
+
+    route = route_chat_context("解释一下什么是递归", ui_state=None)
+
+    assert route.intent == "simple_chat"
+    assert route.needs_web is False
 
 
 def test_answer_format_instruction_uses_small_dialogue_window_for_low_latency():

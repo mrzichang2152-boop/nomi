@@ -17,7 +17,9 @@ const attachmentButton = document.querySelector("#attachmentButton");
 const attachmentInput = document.querySelector("#attachmentInput");
 const attachmentTray = document.querySelector("#attachmentTray");
 const AttachmentDraft = window.NomiChatAttachments || null;
+const FileViewerLinks = window.NomiFileViewerLinks || null;
 const messages = document.querySelector("#messages");
+const chatAssistantDrafts = document.querySelector("#chatAssistantDrafts");
 const searchForm = document.querySelector("#searchForm");
 const searchInput = document.querySelector("#searchInput");
 const searchContent = document.querySelector("#searchContent");
@@ -42,6 +44,36 @@ const careerResumeFile = document.querySelector("#careerResumeFile");
 const suggestionsContent = document.querySelector("#suggestionsContent");
 const collectorsContent = document.querySelector("#collectorsContent");
 const toolsContent = document.querySelector("#toolsContent");
+const assistantIdentityGmail = document.querySelector("#assistantIdentityGmail");
+const assistantIdentityInbox = document.querySelector("#assistantIdentityInbox");
+const assistantIdentityDrafts = document.querySelector("#assistantIdentityDrafts");
+const assistantIdentityHistory = document.querySelector("#assistantIdentityHistory");
+const assistantIdentityAudit = document.querySelector("#assistantIdentityAudit");
+const assistantIdentityStatus = document.querySelector("#assistantIdentityStatus");
+const refreshAssistantIdentities = document.querySelector("#refreshAssistantIdentities");
+const webSearchProviderList = document.querySelector("#webSearchProviderList");
+const webSearchConfiguredSummary = document.querySelector("#webSearchConfiguredSummary");
+const webSearchProviderListPanel = document.querySelector("#webSearchProviderListPanel");
+const webSearchProviderDetail = document.querySelector("#webSearchProviderDetail");
+const webSearchProviderDetailTitle = document.querySelector("#webSearchProviderDetailTitle");
+const webSearchProviderDescription = document.querySelector("#webSearchProviderDescription");
+const webSearchProviderHealth = document.querySelector("#webSearchProviderHealth");
+const webSearchProviderSource = document.querySelector("#webSearchProviderSource");
+const webSearchProviderKeyHint = document.querySelector("#webSearchProviderKeyHint");
+const webSearchKeyInput = document.querySelector("#webSearchKeyInput");
+const webSearchToggleKeyVisibility = document.querySelector("#webSearchToggleKeyVisibility");
+const webSearchSaveAndTest = document.querySelector("#webSearchSaveAndTest");
+const webSearchTestStored = document.querySelector("#webSearchTestStored");
+const webSearchDeleteKey = document.querySelector("#webSearchDeleteKey");
+const webSearchEnabledToggle = document.querySelector("#webSearchEnabledToggle");
+const webSearchProviderStatus = document.querySelector("#webSearchProviderStatus");
+const webSearchLastTestedAt = document.querySelector("#webSearchLastTestedAt");
+const webSearchProviderBack = document.querySelector("#webSearchProviderBack");
+const webSearchRoutingStrategy = document.querySelector("#webSearchRoutingStrategy");
+const webSearchRoutingOrder = document.querySelector("#webSearchRoutingOrder");
+const webSearchSaveRouting = document.querySelector("#webSearchSaveRouting");
+const webSearchRoutingStatus = document.querySelector("#webSearchRoutingStatus");
+const webSearchConfigVersion = document.querySelector("#webSearchConfigVersion");
 const refreshGovernance = document.querySelector("#refreshGovernance");
 const refreshAgenda = document.querySelector("#refreshAgenda");
 const refreshCareer = document.querySelector("#refreshCareer");
@@ -63,6 +95,8 @@ let activeAssistantNode = null;
 let approvedSensitiveFields = {};
 let agendaItems = [];
 let selectedAgendaDate = "";
+let webSearchSettingsState = null;
+let selectedWebSearchProvider = "";
 function conversationIdFromUrl() {
   const search = window.location?.search || "";
   if (typeof URLSearchParams === "function") {
@@ -90,6 +124,7 @@ const attachmentPollTimers = new Map();
 let attachmentTrayError = "";
 let activeChatAttempt = null;
 const openClawJobCards = new Map();
+const assistantDraftActionsInFlight = new Set();
 const realtimePendingText = "正在结合本地记忆思考...";
 const realtimeTimeoutMs = 45000;
 const browserLoginChannels = [
@@ -132,8 +167,10 @@ const viewHashMap = {
   governanceView: "governance",
   suggestionsView: "suggestions",
   collectorsView: "collectors",
+  assistantIdentitiesView: "assistant-identities",
   toolsView: "tools",
   privacyView: "privacy",
+  webSearchSettingsView: "web-search",
 };
 const hashViewMap = Object.fromEntries(Object.entries(viewHashMap).map(([viewId, hash]) => [`#${hash}`, viewId]));
 
@@ -311,14 +348,18 @@ async function api(path, options = {}) {
 }
 
 function switchView(viewId) {
+  if (viewId !== "webSearchSettingsView") clearWebSearchKeyInput();
   document.querySelectorAll(".view").forEach((view) => view.classList.toggle("active", view.id === viewId));
   document.querySelectorAll(".nav-button").forEach((button) => button.classList.toggle("active", button.dataset.view === viewId));
   if (viewId === "agendaView") loadAgenda();
   if (viewId === "careerView") loadCareerBoard();
   if (viewId === "suggestionsView") loadSuggestions(currentSuggestionFocusId());
   if (viewId === "collectorsView") loadCollectors();
+  if (viewId === "assistantIdentitiesView") loadAssistantIdentities();
+  if (viewId === "chatView") loadChatAssistantDrafts();
   if (viewId === "toolsView") loadTools();
   if (viewId === "governanceView") loadGovernance();
+  if (viewId === "webSearchSettingsView") loadWebSearchSettings();
 }
 
 function renderJson(value) {
@@ -331,6 +372,80 @@ function card(className = "card") {
   const node = document.createElement("article");
   node.className = className;
   return node;
+}
+
+function isArtifactDownloadUrl(url) {
+  try {
+    const parsed = new URL(String(url || "").trim(), location.href);
+    return /^\/api\/artifacts\/[A-Za-z0-9_-]+\/download\/?$/.test(parsed.pathname);
+  } catch {
+    return false;
+  }
+}
+
+function artifactFilenameFromMessage(text) {
+  const body = String(text || "");
+  const patterns = [
+    /(?:已生成|生成的?)\s*(?:PPTX?|Word|Excel)?\s*文件\s*[:：]\s*([^\r\n]+)/i,
+    /(?:PPTX?|Word|Excel|文件)\s*[:：]\s*([^\r\n]+\.(?:pptx|docx|xlsx|pdf))/i,
+  ];
+  for (const pattern of patterns) {
+    const match = body.match(pattern);
+    const candidate = String(match?.[1] || "").trim();
+    if (candidate && !/^https?:\/\//i.test(candidate)) return candidate;
+  }
+  return "";
+}
+
+function openInternalFileViewer({ source, filename = "", mimeType = "" } = {}) {
+  if (!FileViewerLinks) return false;
+  const viewerUrl = FileViewerLinks.buildViewerUrl({ source, filename, mimeType }, location.origin);
+  if (!viewerUrl) return false;
+  if (window.NomiAndroid && typeof window.NomiAndroid.openFileViewer === "function") {
+    window.NomiAndroid.openFileViewer(viewerUrl);
+    return true;
+  }
+  const opened = window.open(viewerUrl, "_blank", "noopener");
+  if (!opened) location.href = viewerUrl;
+  return true;
+}
+
+function trimUrlPunctuation(value) {
+  return String(value || "").replace(/[),.，。；;！!？?]+$/g, "");
+}
+
+function renderMessageContent(node, text) {
+  const body = String(text || "");
+  const filename = artifactFilenameFromMessage(body);
+  const urlPattern = /https?:\/\/[^\s<>"']+/gi;
+  let cursor = 0;
+  let match;
+  node.textContent = "";
+  while ((match = urlPattern.exec(body)) !== null) {
+    const url = trimUrlPunctuation(match[0]);
+    if (!url) continue;
+    node.appendChild(document.createTextNode(body.slice(cursor, match.index)));
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    if (isArtifactDownloadUrl(url)) {
+      anchor.className = "artifact-view-link";
+      anchor.textContent = `点击查看${filename ? `：${filename}` : "文件"}`;
+      anchor.addEventListener("click", (event) => {
+        if (openInternalFileViewer({ source: url, filename })) {
+          event.preventDefault();
+        }
+      });
+    } else {
+      anchor.target = "_blank";
+      anchor.rel = "noopener";
+      anchor.textContent = url;
+    }
+    node.appendChild(anchor);
+    const trailingPunctuation = match[0].slice(url.length);
+    if (trailingPunctuation) node.appendChild(document.createTextNode(trailingPunctuation));
+    cursor = match.index + match[0].length;
+  }
+  node.appendChild(document.createTextNode(body.slice(cursor)));
 }
 
 function formatAttachmentSize(value) {
@@ -591,21 +706,6 @@ async function loadAttachmentThumbnail(image, fallback, url) {
   }
 }
 
-async function downloadAttachment(attachment) {
-  if (!attachment.content_url) return;
-  try {
-    const blob = await loadAuthenticatedAttachmentBlob(attachment.content_url);
-    const objectUrl = URL.createObjectURL(blob);
-    const anchor = document.createElement("a");
-    anchor.href = objectUrl;
-    anchor.download = attachment.filename || "attachment";
-    anchor.click();
-    setTimeout(() => URL.revokeObjectURL(objectUrl), 1000);
-  } catch {
-    addMessage("assistant", `无法打开附件 ${attachment.filename || ""}，请稍后重试。`);
-  }
-}
-
 function renderMessageAttachments(attachments = []) {
   const list = document.createElement("div");
   list.className = "message-attachments";
@@ -613,7 +713,15 @@ function renderMessageAttachments(attachments = []) {
     const cardNode = document.createElement("button");
     cardNode.type = "button";
     cardNode.className = "message-attachment-card";
-    cardNode.addEventListener("click", () => downloadAttachment(attachment));
+    cardNode.addEventListener("click", () => {
+      if (!openInternalFileViewer({
+        source: attachment.content_url,
+        filename: attachment.filename,
+        mimeType: attachment.mime_type,
+      })) {
+        addMessage("assistant", `无法打开附件 ${attachment.filename || ""}，请稍后重试。`);
+      }
+    });
     if (attachment.kind === "image" && attachment.preview_url) {
       const fallback = document.createElement("span");
       fallback.className = "attachment-file-icon attachment-preview-fallback";
@@ -644,13 +752,26 @@ function renderMessageAttachments(attachments = []) {
   return list;
 }
 
+
+function ensureChatAssistantDraftRegion() {
+  if (!messages || !chatAssistantDrafts) return;
+  if (chatAssistantDrafts.parentElement !== messages) {
+    messages.appendChild(chatAssistantDrafts);
+  }
+}
+
 function addMessage(role, text, sources = [], attachments = [], messageId = "") {
   const item = card(`message ${role}`);
-  item.textContent = text;
+  renderMessageContent(item, text);
   if (messageId) item.dataset.messageId = messageId;
   if (attachments.length) item.appendChild(renderMessageAttachments(attachments));
   if (sources.length) item.appendChild(renderSources(sources));
-  messages.appendChild(item);
+  ensureChatAssistantDraftRegion();
+  if (chatAssistantDrafts?.parentElement === messages) {
+    messages.insertBefore(item, chatAssistantDrafts);
+  } else {
+    messages.appendChild(item);
+  }
   messages.scrollTop = messages.scrollHeight;
   return item;
 }
@@ -862,7 +983,7 @@ function notifyAndroidConversationId() {
 
 async function loadChatHistory(force = false) {
   if (chatHistoryLoaded && !force) return;
-  if (messages.children.length && !force) {
+  if (messages.querySelector(".message") && !force) {
     chatHistoryLoaded = true;
     return;
   }
@@ -875,6 +996,7 @@ async function loadChatHistory(force = false) {
     const result = await api(`/api/chat/history${query}`);
     if (result.conversation_id) setChatConversationId(result.conversation_id);
     messages.innerHTML = "";
+    ensureChatAssistantDraftRegion();
     (result.messages || []).forEach((message) => {
       if (message.role === "user" || message.role === "assistant") {
         addMessage(message.role, message.content || "", [], message.attachments || [], message.id || "");
@@ -920,7 +1042,7 @@ function clearRealtimeChatWatchdog() {
 
 function failActiveRealtimeChat(message) {
   clearRealtimeChatWatchdog();
-  if (activeChatAttempt) {
+  if (activeChatAttempt && AttachmentDraft) {
     AttachmentDraft.markTransportFailed(attachmentDraft);
     renderAttachmentTray();
   }
@@ -1007,6 +1129,7 @@ function handleRealtimeMessage(event) {
   if (event.type === "chat_done") {
     clearRealtimeChatWatchdog();
     if (event.conversation_id) setChatConversationId(event.conversation_id);
+    if (activeAssistantNode) renderMessageContent(activeAssistantNode, activeAssistantNode.textContent);
     if (activeAssistantNode && event.sources?.length) activeAssistantNode.appendChild(renderSources(event.sources));
     if (activeChatAttempt && event.client_request_id === activeChatAttempt.payload.client_request_id) {
       AttachmentDraft.commitSend(attachmentDraft, event.client_request_id);
@@ -1015,6 +1138,7 @@ function handleRealtimeMessage(event) {
     }
     activeAssistantNode = null;
     realtimeChatHadDelta = false;
+    void loadChatAssistantDrafts();
     return;
   }
   if (event.type === "openclaw_job_event") {
@@ -1072,7 +1196,7 @@ function renderSources(sources) {
 function renderLongTailDelivery(delivery, context = {}) {
   const node = card("message assistant long-tail-delivery");
   const message = delivery.message || "长尾任务有新的交付结果。";
-  node.textContent = message;
+  renderMessageContent(node, message);
   if ((delivery.actions || []).length) {
     const actionCard = {
       title: "需要你确认的后续操作",
@@ -1150,7 +1274,7 @@ async function handleLongTailActionCardAction(action, context = {}, node) {
 }
 
 async function loadDashboard() {
-  await Promise.allSettled([loadAgenda(), loadCareerBoard(), loadSuggestions(currentSuggestionFocusId()), loadCollectors(), loadGovernance(), loadTools()]);
+  await Promise.allSettled([loadAgenda(), loadCareerBoard(), loadSuggestions(currentSuggestionFocusId()), loadCollectors(), loadGovernance(), loadTools(), loadChatAssistantDrafts()]);
 }
 
 async function loadSearch(query) {
@@ -2523,6 +2647,277 @@ async function loadCollectors() {
   }
 }
 
+const webSearchProviderMeta = {
+  exa: {
+    name: "Exa",
+    mark: "EX",
+    description: "技术文档、论文、开源项目和公司研究优先使用。",
+  },
+  tavily: {
+    name: "Tavily",
+    mark: "TA",
+    description: "最新新闻、实时变化和时效性信息优先使用。",
+  },
+  bocha: {
+    name: "博查",
+    mark: "博",
+    description: "中文通用搜索、本地信息和中文来源补充。",
+  },
+};
+
+function clearWebSearchKeyInput() {
+  if (webSearchKeyInput) {
+    webSearchKeyInput.value = "";
+    webSearchKeyInput.type = "password";
+  }
+  if (webSearchToggleKeyVisibility) {
+    webSearchToggleKeyVisibility.title = "显示本次输入";
+    webSearchToggleKeyVisibility.setAttribute("aria-label", "显示本次输入");
+  }
+}
+
+function webSearchHealthLabel(status) {
+  return {
+    healthy: "连接正常",
+    untested: "待测试",
+    not_configured: "未配置",
+    invalid_key: "Key 无效",
+    rate_limited: "请求受限",
+    timeout: "连接超时",
+    provider_error: "服务异常",
+  }[status] || "状态未知";
+}
+
+function webSearchSourceLabel(source) {
+  if (source === "database") return "数据库加密配置";
+  if (source === "environment") return "环境变量配置";
+  return "未配置";
+}
+
+function safeWebSearchError(error, fallback = "操作失败，请检查 Key 和网络后重试。") {
+  const message = String(error?.message || "").toLowerCase();
+  if (message.includes("provider_not_configured")) return "请先填写并保存 API Key。";
+  if (message.includes("provider_auth_failed")) return "API Key 无效或没有访问权限。";
+  if (message.includes("provider_rate_limited")) return "服务当前请求受限，请稍后重试。";
+  if (message.includes("provider_test_timeout")) return "连接测试超时，请检查网络后重试。";
+  if (message.includes("provider_secret_error")) {
+    return "服务端尚未配置安全的 WEB_SEARCH_CONFIG_ENCRYPTION_SECRET，暂时不能保存 Key。";
+  }
+  return fallback;
+}
+
+function currentWebSearchProviderConfig(provider = selectedWebSearchProvider) {
+  return (webSearchSettingsState?.providers || []).find((item) => item.provider === provider) || null;
+}
+
+function renderWebSearchProviderList() {
+  if (!webSearchProviderList) return;
+  webSearchProviderList.textContent = "";
+  const providers = webSearchSettingsState?.providers || [];
+  const configuredCount = providers.filter((item) => item.configured).length;
+  const enabledCount = providers.filter(
+    (item) => item.configured && item.enabled && item.connection_status !== "invalid_key",
+  ).length;
+  webSearchConfiguredSummary.textContent = configuredCount
+    ? `已配置 ${configuredCount} 个服务，当前启用 ${enabledCount} 个。多个服务会按查询类型智能选择。`
+    : "尚未配置搜索服务。配置任意一个后，所有公开搜索都会使用它。";
+  for (const config of providers) {
+    const meta = webSearchProviderMeta[config.provider] || { name: config.provider, mark: "WS", description: "" };
+    const row = document.createElement("button");
+    row.type = "button";
+    row.className = "web-search-provider-row";
+    row.dataset.provider = config.provider;
+    const mark = document.createElement("span");
+    mark.className = `web-search-provider-mark provider-${config.provider}`;
+    mark.textContent = meta.mark;
+    const copy = document.createElement("span");
+    copy.className = "web-search-provider-copy";
+    const name = document.createElement("strong");
+    name.textContent = meta.name;
+    const detail = document.createElement("small");
+    detail.textContent = config.configured
+      ? `${webSearchSourceLabel(config.config_source)} · ••••${config.key_hint || ""}`
+      : "尚未配置 API Key";
+    copy.append(name, detail);
+    const status = document.createElement("span");
+    status.className = `web-search-row-status status-${config.connection_status || "unknown"}`;
+    status.textContent = webSearchHealthLabel(config.connection_status);
+    const arrow = document.createElement("span");
+    arrow.className = "web-search-row-arrow";
+    arrow.setAttribute("aria-hidden", "true");
+    arrow.textContent = "›";
+    row.append(mark, copy, status, arrow);
+    row.addEventListener("click", () => openWebSearchProvider(config.provider));
+    webSearchProviderList.appendChild(row);
+  }
+}
+
+function renderWebSearchRouting() {
+  if (!webSearchSettingsState) return;
+  webSearchRoutingStrategy.value = webSearchSettingsState.strategy || "smart";
+  webSearchRoutingOrder.value = (webSearchSettingsState.fallback_order || ["exa", "tavily", "bocha"]).join(",");
+  webSearchConfigVersion.textContent = `配置 v${webSearchSettingsState.config_version || 1}`;
+}
+
+function renderWebSearchProviderDetail(provider) {
+  const config = currentWebSearchProviderConfig(provider);
+  if (!config) return;
+  const meta = webSearchProviderMeta[provider] || { name: provider, description: "" };
+  webSearchProviderDetailTitle.textContent = meta.name;
+  webSearchProviderDescription.textContent = meta.description;
+  webSearchProviderHealth.textContent = webSearchHealthLabel(config.connection_status);
+  webSearchProviderHealth.className = `web-search-health status-${config.connection_status || "unknown"}`;
+  webSearchProviderSource.textContent = webSearchSourceLabel(config.config_source);
+  webSearchProviderKeyHint.textContent = config.configured && config.key_hint ? `•••• ${config.key_hint}` : "未配置";
+  webSearchEnabledToggle.checked = Boolean(config.enabled);
+  webSearchTestStored.disabled = !config.configured;
+  webSearchDeleteKey.disabled = config.config_source !== "database";
+  webSearchLastTestedAt.textContent = config.last_tested_at
+    ? `最近测试：${new Date(config.last_tested_at).toLocaleString()}${config.last_test_latency_ms ? ` · ${config.last_test_latency_ms} ms` : ""}`
+    : "尚未进行连接测试。";
+  webSearchProviderStatus.textContent = config.last_test_latency_ms
+    ? `上次连接耗时 ${config.last_test_latency_ms} ms`
+    : "";
+}
+
+function openWebSearchProvider(provider) {
+  selectedWebSearchProvider = provider;
+  clearWebSearchKeyInput();
+  webSearchProviderListPanel.classList.add("hidden");
+  webSearchProviderDetail.classList.remove("hidden");
+  renderWebSearchProviderDetail(provider);
+}
+
+function closeWebSearchProviderDetail() {
+  selectedWebSearchProvider = "";
+  clearWebSearchKeyInput();
+  webSearchProviderStatus.textContent = "";
+  webSearchProviderDetail.classList.add("hidden");
+  webSearchProviderListPanel.classList.remove("hidden");
+}
+
+function setWebSearchDetailBusy(busy, message = "") {
+  for (const control of [
+    webSearchSaveAndTest,
+    webSearchTestStored,
+    webSearchDeleteKey,
+    webSearchEnabledToggle,
+    webSearchProviderBack,
+  ]) {
+    if (control) control.disabled = Boolean(busy);
+  }
+  if (message) webSearchProviderStatus.textContent = message;
+}
+
+async function loadWebSearchSettings({ reopenProvider = "" } = {}) {
+  if (!webSearchProviderList) return;
+  webSearchProviderList.textContent = "加载搜索服务...";
+  try {
+    webSearchSettingsState = await api("/api/web-search/settings");
+    renderWebSearchProviderList();
+    renderWebSearchRouting();
+    if (reopenProvider) openWebSearchProvider(reopenProvider);
+  } catch (error) {
+    webSearchProviderList.textContent = safeWebSearchError(error, "无法读取 Web Search 设置。");
+  }
+}
+
+async function saveAndTestWebSearchProvider(provider) {
+  const apiKey = webSearchKeyInput.value.trim();
+  if (!provider || !apiKey) {
+    webSearchProviderStatus.textContent = "请粘贴新的 API Key。";
+    return;
+  }
+  setWebSearchDetailBusy(true, "正在连接测试...");
+  let finalMessage = "";
+  try {
+    await api(`/api/web-search/settings/${provider}`, {
+      method: "PUT",
+      body: JSON.stringify({ api_key: apiKey, enabled: webSearchEnabledToggle.checked }),
+    });
+    clearWebSearchKeyInput();
+    await loadWebSearchSettings({ reopenProvider: provider });
+    finalMessage = "连接测试通过，Key 已加密保存。";
+  } catch (error) {
+    finalMessage = safeWebSearchError(error);
+  } finally {
+    setWebSearchDetailBusy(false);
+    renderWebSearchProviderDetail(provider);
+    webSearchProviderStatus.textContent = finalMessage;
+  }
+}
+
+async function testStoredWebSearchProvider(provider) {
+  if (!provider) return;
+  setWebSearchDetailBusy(true, "正在测试已保存 Key...");
+  let finalMessage = "";
+  try {
+    const result = await api(`/api/web-search/settings/${provider}/test`, { method: "POST" });
+    finalMessage = `连接正常 · ${result.latency_ms || 0} ms`;
+  } catch (error) {
+    finalMessage = safeWebSearchError(error);
+  } finally {
+    await loadWebSearchSettings({ reopenProvider: provider });
+    setWebSearchDetailBusy(false);
+    renderWebSearchProviderDetail(provider);
+    webSearchProviderStatus.textContent = finalMessage;
+  }
+}
+
+async function updateWebSearchProviderEnabled(provider, enabled) {
+  if (!provider) return;
+  webSearchProviderStatus.textContent = "正在更新...";
+  try {
+    await api(`/api/web-search/settings/${provider}`, {
+      method: "PATCH",
+      body: JSON.stringify({ enabled }),
+    });
+    await loadWebSearchSettings({ reopenProvider: provider });
+    webSearchProviderStatus.textContent = enabled ? "已启用。" : "已停用。";
+  } catch (error) {
+    webSearchEnabledToggle.checked = !enabled;
+    webSearchProviderStatus.textContent = safeWebSearchError(error);
+  }
+}
+
+async function deleteWebSearchProviderKey(provider) {
+  if (!provider || !window.confirm("删除数据库中保存的 Key？如果存在环境变量，将自动回退使用环境变量。")) return;
+  setWebSearchDetailBusy(true, "正在删除数据库 Key...");
+  let finalMessage = "";
+  try {
+    const result = await api(`/api/web-search/settings/${provider}/key`, { method: "DELETE" });
+    clearWebSearchKeyInput();
+    await loadWebSearchSettings({ reopenProvider: provider });
+    finalMessage = result.config_source === "environment"
+      ? "数据库 Key 已删除，当前回退使用环境变量。"
+      : "数据库 Key 已删除。";
+  } catch (error) {
+    finalMessage = safeWebSearchError(error, "删除失败，请稍后重试。");
+  } finally {
+    setWebSearchDetailBusy(false);
+    renderWebSearchProviderDetail(provider);
+    webSearchProviderStatus.textContent = finalMessage;
+  }
+}
+
+async function saveWebSearchRouting() {
+  webSearchSaveRouting.disabled = true;
+  webSearchRoutingStatus.textContent = "正在保存...";
+  try {
+    const order = webSearchRoutingOrder.value.split(",").filter(Boolean);
+    await api("/api/web-search/settings/routing", {
+      method: "PATCH",
+      body: JSON.stringify({ strategy: webSearchRoutingStrategy.value, fallback_order: order }),
+    });
+    await loadWebSearchSettings();
+    webSearchRoutingStatus.textContent = "路由设置已生效，无需重启服务。";
+  } catch (error) {
+    webSearchRoutingStatus.textContent = safeWebSearchError(error, "路由设置保存失败。");
+  } finally {
+    webSearchSaveRouting.disabled = false;
+  }
+}
+
 function phaseText(phase) {
   if (phase === "core") return "第一批";
   if (phase === "recommended") return "第二批";
@@ -2535,6 +2930,409 @@ function riskText(risk) {
   if (risk === "medium") return "中风险";
   if (risk === "high") return "高风险";
   return risk || "未知风险";
+}
+
+const assistantIdentityPlaceholderAddresses = new Set([
+  "nomi@example.com",
+  "+00000000000",
+]);
+
+function verifiedAssistantIdentityAddress(identity = {}) {
+  const address = String(identity.address || "").trim();
+  if (!address || assistantIdentityPlaceholderAddresses.has(address) || address === "nomi@example.com") {
+    return "尚未验证";
+  }
+  if (!identity.last_verified_at) return "尚未验证";
+  return address;
+}
+
+function assistantIdentityStatusLabel(status) {
+  const labels = {
+    unconfigured: "未配置",
+    authorization_pending: "等待授权",
+    verifying: "验证中",
+    connected: "已连接",
+    degraded: "连接异常",
+    expired: "授权已过期",
+    failed: "验证失败",
+    disabled: "已停用",
+    draft: "待确认",
+    blocked: "发送失败",
+    sending: "发送中",
+    sent: "已发送",
+    delivered: "已送达",
+    read: "已读",
+    rejected: "已拒绝",
+    delivery_unknown: "送达状态待核实",
+  };
+  return labels[String(status || "")] || String(status || "未知状态");
+}
+
+function assistantIdentityTimestamp(value) {
+  if (!value) return "尚无记录";
+  const parsed = new Date(value);
+  return Number.isNaN(parsed.getTime()) ? String(value) : parsed.toLocaleString();
+}
+
+function appendAssistantIdentityListItem(container, { meta, title, body, status = "" }) {
+  const item = document.createElement("article");
+  item.className = "assistant-identity-list-item";
+  const metaNode = document.createElement("time");
+  metaNode.textContent = meta || "";
+  const titleNode = document.createElement("strong");
+  titleNode.textContent = title || "未命名记录";
+  const bodyNode = document.createElement("p");
+  bodyNode.textContent = body || "";
+  item.append(metaNode, titleNode, bodyNode);
+  if (status) item.dataset.status = status;
+  container.appendChild(item);
+  return item;
+}
+
+function renderAssistantIdentityGmail(identity, health = {}) {
+  assistantIdentityGmail.textContent = "";
+  const heading = document.createElement("div");
+  heading.className = "assistant-identity-card-heading";
+  const titleWrap = document.createElement("div");
+  const eyebrow = document.createElement("span");
+  eyebrow.className = "assistant-identity-eyebrow";
+  eyebrow.textContent = "NOMI OWNED ACCOUNT";
+  const title = document.createElement("h3");
+  title.textContent = "Nomi Gmail";
+  titleWrap.append(eyebrow, title);
+  const badge = document.createElement("span");
+  badge.className = `assistant-identity-badge status-${String(identity.status || "unknown")}`;
+  badge.textContent = assistantIdentityStatusLabel(identity.status);
+  heading.append(titleWrap, badge);
+
+  const address = document.createElement("p");
+  address.className = "assistant-identity-address";
+  address.textContent = verifiedAssistantIdentityAddress(identity);
+
+  const facts = document.createElement("dl");
+  facts.className = "assistant-identity-facts";
+  const factValues = [
+    ["提供方", identity.provider || "尚未绑定"],
+    ["最近验证", assistantIdentityTimestamp(identity.last_verified_at)],
+    ["收件", health.checks?.inbound || "未检查"],
+    ["发件", health.checks?.outbound || "未检查"],
+  ];
+  for (const [label, value] of factValues) {
+    const wrapper = document.createElement("div");
+    const term = document.createElement("dt");
+    term.textContent = label;
+    const detail = document.createElement("dd");
+    detail.textContent = String(value);
+    wrapper.append(term, detail);
+    facts.appendChild(wrapper);
+  }
+
+  const note = document.createElement("p");
+  note.className = "assistant-identity-note";
+  note.textContent = identity.last_error_code
+    ? `最近错误：${identity.last_error_code}`
+    : "OAuth 令牌由 Composio 管理，Nomi 页面不会读取或保存令牌。";
+
+  const actions = document.createElement("div");
+  actions.className = "assistant-identity-actions";
+  const connect = button(identity.status === "connected" || identity.status === "degraded" ? "重新连接" : "连接 Gmail");
+  connect.addEventListener("click", connectAssistantGmail);
+  actions.appendChild(connect);
+  if (!["unconfigured", "authorization_pending"].includes(identity.status)) {
+    const verify = button("立即验证");
+    verify.className = "secondary";
+    verify.addEventListener("click", () => verifyAssistantIdentity(identity.identity_id));
+    actions.appendChild(verify);
+  }
+  if (identity.status === "disabled") {
+    const enable = button("启用");
+    enable.className = "secondary";
+    enable.addEventListener("click", () => enableAssistantIdentity(identity.identity_id));
+    actions.appendChild(enable);
+  } else if (identity.status !== "unconfigured") {
+    const disable = button("停用");
+    disable.className = "secondary";
+    disable.addEventListener("click", () => disableAssistantIdentity(identity.identity_id));
+    actions.appendChild(disable);
+  }
+  if (identity.status !== "unconfigured") {
+    const disconnect = button("断开连接");
+    disconnect.className = "secondary danger";
+    disconnect.addEventListener("click", () => disconnectAssistantIdentity(identity.identity_id));
+    actions.appendChild(disconnect);
+  }
+
+  assistantIdentityGmail.append(heading, address, facts, note, actions);
+}
+
+function renderAssistantIdentityInbox(items = []) {
+  assistantIdentityInbox.textContent = "";
+  const gmailItems = items.filter((item) =>
+    String(item.identity_id || item.source_account_id || "") === "nomi_gmail_primary"
+  );
+  for (const item of gmailItems.slice(0, 8)) {
+    appendAssistantIdentityListItem(assistantIdentityInbox, {
+      meta: `${assistantIdentityTimestamp(item.occurred_at || item.created_at)} · ${item.classification || "邮件"}`,
+      title: item.sender_key || "未知发件人",
+      body: item.normalized_text || item.normalized_payload?.subject || "邮件内容已归档",
+    });
+  }
+  if (!assistantIdentityInbox.children.length) assistantIdentityInbox.appendChild(emptyCard("暂无 Nomi Gmail 收件。"));
+}
+
+function setAssistantDraftActionButtonsDisabled(draftId, disabled) {
+  const selector = `[data-draft-id="${cssEscapeValue(draftId)}"] button`;
+  document.querySelectorAll(selector).forEach((node) => {
+    node.disabled = disabled;
+  });
+}
+
+async function refreshAssistantDraftSurfaces() {
+  await Promise.allSettled([loadChatAssistantDrafts(), loadAssistantIdentities()]);
+}
+
+async function runAssistantDraftAction(draftId, operation) {
+  const stableDraftId = String(draftId || "").trim();
+  if (!stableDraftId || assistantDraftActionsInFlight.has(stableDraftId)) return null;
+  assistantDraftActionsInFlight.add(stableDraftId);
+  setAssistantDraftActionButtonsDisabled(stableDraftId, true);
+  try {
+    return await operation();
+  } finally {
+    assistantDraftActionsInFlight.delete(stableDraftId);
+    await refreshAssistantDraftSurfaces();
+  }
+}
+
+async function editAssistantDraft(draftId, draft = {}) {
+  const subject = window.prompt("邮件主题", draft.subject || "");
+  if (subject === null) return null;
+  const bodyText = window.prompt("邮件正文", draft.body_text || "");
+  if (bodyText === null) return null;
+  return runAssistantDraftAction(draftId, () => api(`/api/assistant-outbound/drafts/${draftId}`, {
+    method: "PATCH",
+    body: JSON.stringify({ subject, body_text: bodyText }),
+  }));
+}
+
+async function confirmAssistantDraft(draftId) {
+  return runAssistantDraftAction(draftId, async () => {
+    const confirmation = await api(`/api/assistant-outbound/drafts/${draftId}/confirm`, { method: "POST" });
+    return sendAssistantDraft(draftId, confirmation.confirmation_token);
+  });
+}
+
+async function sendAssistantDraft(draftId, confirmationToken) {
+  return api(`/api/assistant-outbound/drafts/${draftId}/send`, {
+    method: "POST",
+    body: JSON.stringify({ confirmation_token: confirmationToken }),
+  });
+}
+
+async function cancelAssistantDraft(draftId) {
+  return runAssistantDraftAction(draftId, () => api(`/api/assistant-outbound/drafts/${draftId}/cancel`, {
+    method: "POST",
+  }));
+}
+
+function renderChatAssistantDrafts(items = []) {
+  if (!chatAssistantDrafts) return;
+  ensureChatAssistantDraftRegion();
+  chatAssistantDrafts.replaceChildren();
+  const visibleStatuses = ["draft", "blocked", "sending", "sent", "delivered", "read", "failed", "rejected", "delivery_unknown"];
+  const pending = items.filter((draft) =>
+    draft.identity_id === "nomi_gmail_primary"
+      && draft.channel === "gmail"
+      && visibleStatuses.includes(draft.status)
+  );
+  for (const draft of pending.slice(0, 5)) {
+    const item = document.createElement("article");
+    item.className = "message assistant chat-assistant-draft";
+    item.dataset.draftId = draft.draft_id;
+    item.dataset.status = draft.status;
+
+    const meta = document.createElement("time");
+    meta.textContent = `Nomi Gmail · ${assistantIdentityStatusLabel(draft.status)}`;
+    const title = document.createElement("strong");
+    title.textContent = draft.subject || "无主题邮件";
+    const recipient = document.createElement("p");
+    recipient.textContent = `收件人：${draft.recipient || "未填写"}`;
+    const body = document.createElement("p");
+    body.className = "assistant-draft-body";
+    body.textContent = draft.body_text || "";
+    const evidence = document.createElement("p");
+    evidence.className = "assistant-draft-evidence";
+    evidence.textContent = `依据：${(draft.source_evidence_ids || []).length} 条`;
+
+    const failure = document.createElement("p");
+    failure.className = "assistant-draft-failure";
+    const guidance = draft.policy_result?.guidance || "请修改后重新确认，避免重复发送。";
+    failure.textContent = `发送失败：${draft.reason || "提供方未接受请求"}。${guidance}`;
+    failure.hidden = !["blocked", "failed", "rejected"].includes(draft.status);
+
+    const actions = document.createElement("div");
+    actions.className = "assistant-identity-actions compact";
+    if (draft.status === "draft") {
+      const confirm = button("确认并发送");
+      confirm.addEventListener("click", () => confirmAssistantDraft(draft.draft_id));
+      actions.appendChild(confirm);
+    }
+    if (["draft", "blocked"].includes(draft.status)) {
+      const edit = button("修改");
+      edit.className = "secondary";
+      edit.addEventListener("click", () => editAssistantDraft(draft.draft_id, draft));
+      const cancel = button("取消");
+      cancel.className = "secondary";
+      cancel.addEventListener("click", () => cancelAssistantDraft(draft.draft_id));
+      actions.append(edit, cancel);
+    }
+    item.append(meta, title, recipient, body, evidence, failure);
+    if (actions.children.length) item.appendChild(actions);
+    chatAssistantDrafts.appendChild(item);
+  }
+  chatAssistantDrafts.hidden = !chatAssistantDrafts.children.length;
+}
+
+async function loadChatAssistantDrafts() {
+  if (!chatAssistantDrafts) return;
+  try {
+    const result = await api("/api/assistant-outbound/drafts?limit=20");
+    renderChatAssistantDrafts(result.items || []);
+  } catch {
+    chatAssistantDrafts.replaceChildren();
+    const error = document.createElement("p");
+    error.className = "muted";
+    error.textContent = "待确认草稿暂时无法读取。";
+    chatAssistantDrafts.appendChild(error);
+    chatAssistantDrafts.hidden = false;
+  }
+}
+
+function renderAssistantIdentityDrafts(items = []) {
+  assistantIdentityDrafts.textContent = "";
+  const pending = items.filter((item) => item.channel === "gmail" && ["draft", "blocked"].includes(item.status));
+  for (const draft of pending.slice(0, 10)) {
+    const item = appendAssistantIdentityListItem(assistantIdentityDrafts, {
+      meta: `${assistantIdentityTimestamp(draft.updated_at || draft.created_at)} · ${assistantIdentityStatusLabel(draft.status)}`,
+      title: draft.subject || "无主题邮件",
+      body: `收件人：${draft.recipient || "未填写"}\n${draft.body_text || ""}`,
+      status: draft.status,
+    });
+    item.dataset.draftId = draft.draft_id;
+    const actions = document.createElement("div");
+    actions.className = "assistant-identity-actions compact";
+    if (draft.status === "draft") {
+      const confirm = button("确认并发送");
+      confirm.addEventListener("click", () => confirmAssistantDraft(draft.draft_id));
+      actions.appendChild(confirm);
+    }
+    if (["draft", "blocked"].includes(draft.status)) {
+      const edit = button("修改");
+      edit.className = "secondary";
+      edit.addEventListener("click", () => editAssistantDraft(draft.draft_id, draft));
+      const cancel = button("取消");
+      cancel.className = "secondary";
+      cancel.addEventListener("click", () => cancelAssistantDraft(draft.draft_id));
+      actions.append(edit, cancel);
+    }
+    item.appendChild(actions);
+  }
+  if (!assistantIdentityDrafts.children.length) assistantIdentityDrafts.appendChild(emptyCard("没有待确认草稿。"));
+}
+
+function renderAssistantIdentityHistory(items = []) {
+  assistantIdentityHistory.textContent = "";
+  for (const item of items.filter((entry) => entry.channel === "gmail").slice(0, 10)) {
+    appendAssistantIdentityListItem(assistantIdentityHistory, {
+      meta: `${assistantIdentityTimestamp(item.sent_at || item.updated_at || item.created_at)} · ${assistantIdentityStatusLabel(item.status)}`,
+      title: item.subject || "无主题邮件",
+      body: item.reason || item.provider_message_id || "提供方未返回消息编号",
+      status: item.status,
+    });
+  }
+  if (!assistantIdentityHistory.children.length) assistantIdentityHistory.appendChild(emptyCard("暂无发送记录。"));
+}
+
+function renderAssistantIdentityAudit(items = []) {
+  assistantIdentityAudit.textContent = "";
+  for (const item of items.slice(-10).reverse()) {
+    appendAssistantIdentityListItem(assistantIdentityAudit, {
+      meta: `${assistantIdentityTimestamp(item.created_at)} · ${item.actor || "system"}`,
+      title: item.action || "审计事件",
+      body: `${item.status || ""}${item.policy_result ? ` · ${item.policy_result}` : ""}`,
+      status: item.status,
+    });
+  }
+  if (!assistantIdentityAudit.children.length) assistantIdentityAudit.appendChild(emptyCard("暂无审计记录。"));
+}
+
+async function loadAssistantIdentities() {
+  if (!assistantIdentityGmail) return;
+  assistantIdentityStatus.textContent = "正在读取服务端状态...";
+  try {
+    const identitiesData = await api("/api/assistant-identities");
+    const gmail = (identitiesData.identities || []).find((item) => item.identity_id === "nomi_gmail_primary") || {
+      identity_id: "nomi_gmail_primary",
+      status: "unconfigured",
+    };
+    const identityId = gmail.identity_id;
+    const [healthResult, inboxResult, draftsResult, historyResult, auditResult] = await Promise.allSettled([
+      api(`/api/assistant-identities/${identityId}/health`),
+      api("/api/assistant-inbox?limit=20"),
+      api("/api/assistant-outbound/drafts?limit=20"),
+      api("/api/assistant-outbound/messages?limit=20"),
+      api("/api/assistant-audit?limit=30"),
+    ]);
+    renderAssistantIdentityGmail(gmail, healthResult.status === "fulfilled" ? healthResult.value : {});
+    renderAssistantIdentityInbox(inboxResult.status === "fulfilled" ? inboxResult.value.items : []);
+    renderAssistantIdentityDrafts(draftsResult.status === "fulfilled" ? draftsResult.value.items : []);
+    renderAssistantIdentityHistory(historyResult.status === "fulfilled" ? historyResult.value.items : []);
+    renderAssistantIdentityAudit(auditResult.status === "fulfilled" ? auditResult.value.items : []);
+    const failures = [healthResult, inboxResult, draftsResult, historyResult, auditResult]
+      .filter((result) => result.status === "rejected").length;
+    assistantIdentityStatus.textContent = failures
+      ? `${failures} 个数据区域暂时不可用，其余状态已从服务端刷新。`
+      : "状态已从服务端刷新。";
+  } catch (error) {
+    assistantIdentityGmail.textContent = "助理身份状态加载失败。";
+    assistantIdentityStatus.textContent = String(error?.message || "请检查服务端连接。");
+  }
+}
+
+async function connectAssistantGmail() {
+  assistantIdentityStatus.textContent = "正在创建 Gmail 授权链接...";
+  try {
+    const result = await api("/api/assistant-identities/nomi_gmail_primary/connect-link", { method: "POST" });
+    if (!result.redirect_url) throw new Error("授权服务未返回链接");
+    window.location.assign(result.redirect_url);
+  } catch (error) {
+    assistantIdentityStatus.textContent = `无法开始授权：${String(error?.message || error)}`;
+  }
+}
+
+async function verifyAssistantIdentity(identityId) {
+  assistantIdentityStatus.textContent = "正在向提供方核验账号...";
+  try {
+    await api(`/api/assistant-identities/${identityId}/verify`, { method: "POST" });
+  } finally {
+    await loadAssistantIdentities();
+  }
+}
+
+async function disableAssistantIdentity(identityId) {
+  await api(`/api/assistant-identities/${identityId}/disable`, { method: "POST" });
+  await loadAssistantIdentities();
+}
+
+async function enableAssistantIdentity(identityId) {
+  await api(`/api/assistant-identities/${identityId}/enable`, { method: "POST" });
+  await loadAssistantIdentities();
+}
+
+async function disconnectAssistantIdentity(identityId) {
+  if (!window.confirm("断开 Nomi Gmail？历史审计会保留，但授权引用会被清除。")) return;
+  await api(`/api/assistant-identities/${identityId}/disconnect`, { method: "POST" });
+  await loadAssistantIdentities();
 }
 
 async function loadTools() {
@@ -2904,6 +3702,24 @@ document.querySelectorAll(".nav-button").forEach((buttonNode) => {
 assistantSettingsToggle?.addEventListener("click", () => toggleAssistantSettings());
 assistantSettingsClose?.addEventListener("click", () => toggleAssistantSettings(false));
 assistantCloseButton?.addEventListener("click", closeAssistantWorkspace);
+webSearchProviderBack?.addEventListener("click", closeWebSearchProviderDetail);
+webSearchToggleKeyVisibility?.addEventListener("click", () => {
+  webSearchKeyInput.type = webSearchKeyInput.type === "password" ? "text" : "password";
+  const showing = webSearchKeyInput.type === "text";
+  webSearchToggleKeyVisibility.title = showing ? "隐藏本次输入" : "显示本次输入";
+  webSearchToggleKeyVisibility.setAttribute("aria-label", webSearchToggleKeyVisibility.title);
+});
+webSearchSaveAndTest?.addEventListener("click", () => saveAndTestWebSearchProvider(selectedWebSearchProvider));
+webSearchTestStored?.addEventListener("click", () => testStoredWebSearchProvider(selectedWebSearchProvider));
+webSearchDeleteKey?.addEventListener("click", () => deleteWebSearchProviderKey(selectedWebSearchProvider));
+webSearchEnabledToggle?.addEventListener("change", () => {
+  updateWebSearchProviderEnabled(selectedWebSearchProvider, webSearchEnabledToggle.checked);
+});
+webSearchSaveRouting?.addEventListener("click", saveWebSearchRouting);
+window.addEventListener("pagehide", clearWebSearchKeyInput);
+document.addEventListener?.("visibilitychange", () => {
+  if (document.hidden) clearWebSearchKeyInput();
+});
 document.querySelectorAll(".assistant-settings-item").forEach((buttonNode) => {
   buttonNode.addEventListener("click", () => {
     switchView(buttonNode.dataset.view);
@@ -2951,7 +3767,7 @@ function renderAssistantRetry(node) {
     if (!activeChatAttempt) return;
     const payload = AttachmentDraft.beginSend(activeChatAttempt.text, attachmentDraft);
     if (!payload) return;
-    activeChatAttempt.payload = { ...payload, conversation_id: chatConversationId || undefined };
+    activeChatAttempt.payload = { ...payload, conversation_id: chatConversationId || undefined, client_type: "web" };
     node.textContent = realtimePendingText;
     await submitChatOverHttp(activeChatAttempt.payload, node);
   });
@@ -2965,11 +3781,12 @@ async function submitChatOverHttp(payload, pendingNode) {
       body: JSON.stringify(payload),
     });
     if (result.conversation_id) setChatConversationId(result.conversation_id);
-    pendingNode.textContent = result.answer;
+    renderMessageContent(pendingNode, result.answer);
     if (result.sources?.length) pendingNode.appendChild(renderSources(result.sources));
     AttachmentDraft.commitSend(attachmentDraft, result.client_request_id || payload.client_request_id);
     activeChatAttempt = null;
     renderAttachmentTray();
+    void loadChatAssistantDrafts();
   } catch {
     pendingNode.textContent = "请求失败，请检查模型服务或访问密码。";
     AttachmentDraft.markTransportFailed(attachmentDraft);
@@ -3105,6 +3922,7 @@ careerResumeFileImportForm.addEventListener("submit", (event) => {
 });
 refreshSuggestions.addEventListener("click", () => loadSuggestions(currentSuggestionFocusId()));
 refreshCollectors.addEventListener("click", loadCollectors);
+refreshAssistantIdentities?.addEventListener("click", loadAssistantIdentities);
 refreshTools.addEventListener("click", loadTools);
 toolRouteForm?.addEventListener("submit", (event) => {
   event.preventDefault();

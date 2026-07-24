@@ -27,6 +27,26 @@ public final class WebWorkspaceKeyboardTest {
         assertTrue(activity.contains("SOFT_INPUT_ADJUST_RESIZE"));
         assertTrue(activity.contains("WebSettings.LOAD_NO_CACHE"));
         assertFalse(activity.contains("clearCache(true)"));
+        assertTrue(activity.contains("NomiForegroundUiState.enter()"));
+        assertTrue(activity.contains("NomiForegroundUiState.exit()"));
+        assertTrue(activity.contains("FloatingBallService.clearProactiveOverlayIntent(this)"));
+
+        String service = new String(
+                Files.readAllBytes(sourcePath("java/com/par/assistant/android/FloatingBallService.java")),
+                StandardCharsets.UTF_8
+        );
+        int clearActionStart = service.indexOf(
+                "if (intent != null && ACTION_CLEAR_PROACTIVE_OVERLAY.equals(intent.getAction()))"
+        );
+        int clearActionEnd = service.indexOf(
+                "if (windowManager != null && ballView == null)",
+                clearActionStart
+        );
+        assertTrue(clearActionStart >= 0);
+        assertTrue(clearActionEnd > clearActionStart);
+        String clearAction = service.substring(clearActionStart, clearActionEnd);
+        assertTrue(clearAction.contains("removeBubble();"));
+        assertTrue(clearAction.contains("closePanel();"));
     }
 
     @Test
@@ -204,6 +224,30 @@ public final class WebWorkspaceKeyboardTest {
         assertTrue(prefs.contains("KEY_CONVERSATION_ID"));
         assertTrue(prefs.contains("static String conversationId(Context context)"));
         assertTrue(prefs.contains("static void writeConversationId(Context context, String conversationId)"));
+    }
+
+    @Test
+    public void webWorkspaceArtifactLinkUsesTheDedicatedInternalViewer() throws Exception {
+        String activity = new String(
+                Files.readAllBytes(sourcePath("java/com/par/assistant/android/WebWorkspaceActivity.java")),
+                StandardCharsets.UTF_8
+        );
+        assertTrue(activity.contains("public void openFileViewer(String viewerUrl)"));
+        assertTrue(activity.contains("FileViewerUrls.isTrustedViewerUrl"));
+        assertTrue(activity.contains("NomiFileViewerActivity.intentFor"));
+        assertFalse(activity.contains("downloadArtifact(String url, String filename)"));
+    }
+
+    @Test
+    public void webWorkspaceLeavesArtifactRenderingToTheSharedWebImplementation() throws Exception {
+        String activity = new String(
+                Files.readAllBytes(sourcePath("java/com/par/assistant/android/WebWorkspaceActivity.java")),
+                StandardCharsets.UTF_8
+        );
+
+        assertFalse(activity.contains("installArtifactLinkBridge(view)"));
+        assertFalse(activity.contains("NomiAndroid.downloadArtifact"));
+        assertTrue(activity.contains("addJavascriptInterface(new WorkspaceBridge(), \"NomiAndroid\")"));
     }
 
     private static Path sourcePath(String relativePath) {

@@ -87,15 +87,25 @@ def test_embedding_probe_reports_actual_provider(monkeypatch):
 def test_lifespan_does_not_block_or_fail_on_embedding_warmup(monkeypatch):
     from app import main
 
+    class RecoverySpy:
+        def __init__(self):
+            self.calls = 0
+
+        def reconcile_stale_attempts(self):
+            self.calls += 1
+            return []
+
+    recovery_spy = RecoverySpy()
+
     for name in [
         "ensure_collector_settings_schema",
         "ensure_event_private_storage_schema",
         "ensure_private_event_gateway_schema",
         "ensure_assistant_identity_schema",
-        "ensure_memory_governance_schema",
-        "ensure_assistant_context_schema",
-        "ensure_attachment_schema",
-        "ensure_curated_assistant_memory_schema",
+            "ensure_memory_governance_schema",
+            "ensure_assistant_context_schema",
+            "ensure_attachment_schema",
+            "ensure_curated_assistant_memory_schema",
         "ensure_proactive_feedback_schema",
         "ensure_task_routing_schema",
         "ensure_task_orchestrator_schema",
@@ -105,12 +115,14 @@ def test_lifespan_does_not_block_or_fail_on_embedding_warmup(monkeypatch):
         "ensure_openclaw_execution_schema",
         "ensure_delegated_automation_schema",
         "ensure_model_gateway_schema",
-        "ensure_ios_live_activity_schema",
-    ]:
+            "ensure_ios_live_activity_schema",
+            "ensure_web_search_schema",
+        ]:
         monkeypatch.setattr(main, name, lambda: None)
     monkeypatch.setattr(main, "ENABLE_DAILY_MAINTENANCE", False)
     monkeypatch.setattr(main, "ENABLE_OPENCLAW_JOB_RUNNER", False)
     monkeypatch.setattr(main, "ENABLE_LONG_TAIL_RECOVERY_RUNNER", False)
+    monkeypatch.setattr(main, "_ASSISTANT_OUTBOUND_PIPELINE", recovery_spy)
 
     def failing_embedding(text):
         raise RuntimeError("warmup backend unavailable")
@@ -122,6 +134,7 @@ def test_lifespan_does_not_block_or_fail_on_embedding_warmup(monkeypatch):
             return "entered"
 
     assert asyncio.run(enter_lifespan()) == "entered"
+    assert recovery_spy.calls == 1
 
 
 def test_heuristic_rerank_prefers_exact_fact_match():

@@ -104,7 +104,8 @@ def test_long_tail_goal_routes_to_agent_but_only_allows_draft_tool():
 
     assert decision["route_type"] == "agent"
     assert decision["agent_allowed"] is True
-    assert decision["agent_allowed_tools"] == ["assistant.outbound.create_draft"]
+    assert decision["agent_allowed_tools"] == ["assistant.email.create_draft"]
+    assert "assistant.outbound.create_draft" not in str(decision)
     assert decision["confirmation_required"] is True
     assert "gmail.messages.send" in decision["forbidden_provider_tools"]
     assert "whatsapp.messages.send" in decision["forbidden_provider_tools"]
@@ -128,6 +129,6 @@ def test_agent_outbound_intent_returns_to_deterministic_draft_pipeline():
 
     assert decision["route_type"] == "core_pipeline"
     assert decision["pipeline_id"] == "outbound_message_pipeline"
-    assert decision["capability_id"] == "assistant.outbound.create_draft"
+    assert decision["capability_id"] == "assistant.email.create_draft"
     assert decision["agent_allowed"] is False
     assert decision["confirmation_required"] is True

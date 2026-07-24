@@ -29,4 +29,16 @@ public final class WorkbenchUrlsTest {
 
         assertEquals("http://206.119.171.141/?mode=compact&conversation_id=conv+1#chat", url);
     }
+
+    @Test
+    public void assistantIdentitiesUrlIsSeparateFromUserAccountConnections() {
+        assertEquals(
+                "http://206.119.171.141#assistant-identities",
+                WorkbenchUrls.assistantIdentitiesUrl("http://206.119.171.141#tools")
+        );
+        assertEquals(
+                "http://206.119.171.141#tools",
+                WorkbenchUrls.accountConnectionsUrl("http://206.119.171.141#assistant-identities")
+        );
+    }
 }

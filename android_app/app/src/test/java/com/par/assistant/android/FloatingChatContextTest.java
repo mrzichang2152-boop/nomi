@@ -71,4 +71,39 @@ public final class FloatingChatContextTest {
         assertEquals("assistant", snapshot.get(1).role);
         assertEquals("好的，我会继续核对成本与利润率。", snapshot.get(1).content);
     }
+
+    @Test
+    public void preservesServerMessageMetadataWhenReplacingHistory() {
+        FloatingChatContext context = new FloatingChatContext();
+
+        context.replaceWithHistory(List.of(
+                new ChatHistoryMessage("remote-user-1", "2026-07-09T12:00:00Z", "user", "需要"),
+                new ChatHistoryMessage("remote-assistant-1", "2026-07-09T12:00:03Z", "assistant", "好的")
+        ));
+
+        List<ChatHistoryMessage> persisted = LocalChatHistoryStore.fromTurns(context.snapshot(8));
+        assertEquals(2, persisted.size());
+        assertEquals("remote-user-1", persisted.get(0).id);
+        assertEquals("2026-07-09T12:00:00Z", persisted.get(0).createdAt);
+        assertEquals("remote-assistant-1", persisted.get(1).id);
+        assertEquals("2026-07-09T12:00:03Z", persisted.get(1).createdAt);
+    }
+
+    @Test
+    public void preservesRemoteMetadataWhenUserContinuesAfterHistorySync() {
+        FloatingChatContext context = new FloatingChatContext();
+        context.replaceWithHistory(List.of(
+                new ChatHistoryMessage("remote-user-1", "2026-07-09T12:00:00Z", "user", "需要"),
+                new ChatHistoryMessage("remote-assistant-1", "2026-07-09T12:00:03Z", "assistant", "好的")
+        ));
+
+        context.addUser("继续");
+
+        List<ChatHistoryMessage> persisted = LocalChatHistoryStore.fromTurns(context.snapshot(8));
+        assertEquals(3, persisted.size());
+        assertEquals("remote-user-1", persisted.get(0).id);
+        assertEquals("remote-assistant-1", persisted.get(1).id);
+        assertEquals("", persisted.get(2).id);
+        assertEquals("继续", persisted.get(2).content);
+    }
 }

@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "id": "document",
+  "version": "1.0.0",
+  "display_name": "Nomi Document Studio",
+  "artifact_types": ["docx"],
+  "default_agent": "document-producer",
+  "resource_paths": {
+    "skills": ["skills/document-quality/SKILL.md"],
+    "agents": ["agents/document-producer.md"],
+    "tools": ["tools/create_document.ts"],
+    "plugins": []
+  },
+  "quality_profile": {
+    "minimum_body_characters": 120,
+    "maximum_section_count": 40,
+    "require_heading_hierarchy": true,
+    "require_source_mapping": true,
+    "reject_placeholder_content": true,
+    "require_native_editable_content": true
+  }
+}

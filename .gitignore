@@ -30,3 +30,9 @@ coverage/
 *.log
 tmp/
 temp/
+
+# Web-search benchmark output can contain large third-party snippets.
+research/web-search/results/
+
+# Local Superpowers design previews and server state.
+.superpowers/

@@ -27,6 +27,7 @@ def retrieve_chat_context_parallel(route: ChatContextRoute, fetchers: Fetchers) 
         "agenda": route.needs_agenda,
         "tasks": route.needs_tasks,
         "external_tool_state": getattr(route, "needs_external_tool_state", False),
+        "web": getattr(route, "needs_web", False),
         "attachments": getattr(route, "needs_attachments", False),
     }
     result: dict[str, Any] = {key: [] for key in enabled}

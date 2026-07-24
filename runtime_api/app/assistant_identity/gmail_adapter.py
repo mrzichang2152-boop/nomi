@@ -1,11 +1,18 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import os
 import uuid
 from dataclasses import dataclass, field
 from email.message import EmailMessage
-from typing import Optional
+from typing import Any, Callable, Optional
+
+from app.assistant_identity.composio_gmail import (
+    ASSISTANT_GMAIL_COMPOSIO_USER_ID,
+    ASSISTANT_GMAIL_PROVIDER,
+    assistant_gmail_toolkit_version,
+)
 
 from app.assistant_identity.adapters import (
     HttpxProviderHttpClient,
@@ -57,6 +64,175 @@ class FakeAssistantGmailAdapter:
             "provider_message_id": "fake-gmail-" + str(uuid.uuid4()),
             "payload": payload,
         }
+
+
+def _composio_result_dict(value: object) -> dict[str, Any]:
+    if hasattr(value, "model_dump") and callable(value.model_dump):
+        value = value.model_dump()
+    elif hasattr(value, "dict") and callable(value.dict):
+        value = value.dict()
+    return value if isinstance(value, dict) else {}
+
+
+@dataclass
+class ComposioAssistantGmailAdapter:
+    sdk: object
+    connected_account_id: str
+    address: str
+
+    provider = ASSISTANT_GMAIL_PROVIDER
+
+    def send_message(
+        self,
+        *,
+        sender: str,
+        recipient: str,
+        subject: str,
+        body_text: str,
+        thread_id: Optional[str] = None,
+    ) -> dict[str, object]:
+        expected_sender = self.address.strip().lower()
+        requested_sender = str(sender or "").strip().lower() or expected_sender
+        if not expected_sender or requested_sender != expected_sender:
+            return {
+                "status": "blocked",
+                "reason": "assistant_gmail_sender_mismatch",
+                "provider": self.provider,
+                "provider_result": {"successful": False},
+            }
+        if not self.connected_account_id.strip():
+            return {
+                "status": "blocked",
+                "reason": "assistant_gmail_connected_account_missing",
+                "provider": self.provider,
+                "provider_result": {"successful": False},
+            }
+
+        normalized_thread_id = str(thread_id or "").strip()
+        if normalized_thread_id:
+            tool_slug = "GMAIL_REPLY_TO_THREAD"
+            arguments = {
+                "recipient_email": recipient,
+                "message_body": body_text,
+                "thread_id": normalized_thread_id,
+            }
+        else:
+            tool_slug = "GMAIL_SEND_EMAIL"
+            arguments = {
+                "recipient_email": recipient,
+                "subject": subject,
+                "body": body_text,
+            }
+        try:
+            raw_result = self.sdk.tools.execute(
+                tool_slug,
+                user_id=ASSISTANT_GMAIL_COMPOSIO_USER_ID,
+                connected_account_id=self.connected_account_id,
+                version=assistant_gmail_toolkit_version(),
+                arguments=arguments,
+            )
+        except Exception as exc:
+            return {
+                "status": "delivery_unknown",
+                "reason": "composio_gmail_delivery_requires_verification",
+                "provider": self.provider,
+                "provider_result": {
+                    "successful": None,
+                    "error_type": exc.__class__.__name__,
+                },
+            }
+        result = _composio_result_dict(raw_result)
+        data = result.get("data") if isinstance(result.get("data"), dict) else {}
+        successful = bool(result.get("successful"))
+        return {
+            "status": "sent" if successful else "failed",
+            "provider": self.provider,
+            "provider_message_id": str(
+                data.get("id") or data.get("message_id") or ""
+            ),
+            "provider_thread_id": str(
+                data.get("threadId") or data.get("thread_id") or normalized_thread_id
+            ),
+            "provider_result": {"successful": successful},
+            "request": {
+                "tool_slug": tool_slug,
+                "connected_account_id": self.connected_account_id,
+                "recipient": recipient,
+                "subject_present": bool(subject),
+                "body_sha256": hashlib.sha256(body_text.encode("utf-8")).hexdigest(),
+            },
+        }
+
+
+@dataclass
+class RegistryBackedComposioAssistantGmailAdapter:
+    registry: object
+    sdk_factory: Callable[[], object]
+
+    provider = ASSISTANT_GMAIL_PROVIDER
+
+    def send_message(
+        self,
+        *,
+        sender: str,
+        recipient: str,
+        subject: str,
+        body_text: str,
+        thread_id: Optional[str] = None,
+    ) -> dict[str, object]:
+        identity = self.registry.get("nomi_gmail_primary")
+        if (
+            identity is None
+            or getattr(identity, "kind", "") != "assistant_gmail"
+            or getattr(identity, "status", "") not in {"connected", "degraded"}
+            or "send" not in list(getattr(identity, "capabilities", []) or [])
+            or not str(getattr(identity, "address", "") or "").strip()
+        ):
+            return {
+                "status": "blocked",
+                "reason": "assistant_gmail_identity_not_verified",
+                "provider": self.provider,
+                "provider_result": {"successful": False},
+            }
+        metadata = dict(getattr(identity, "metadata", {}) or {})
+        connection = dict(metadata.get("provider_connection") or {})
+        connected_account_id = str(
+            connection.get("connected_account_id") or ""
+        ).strip()
+        if (
+            not connected_account_id
+            or str(connection.get("composio_user_id") or "")
+            != ASSISTANT_GMAIL_COMPOSIO_USER_ID
+        ):
+            return {
+                "status": "blocked",
+                "reason": "assistant_gmail_connected_account_missing",
+                "provider": self.provider,
+                "provider_result": {"successful": False},
+            }
+        try:
+            sdk = self.sdk_factory()
+        except Exception as exc:
+            return {
+                "status": "failed",
+                "reason": "composio_gmail_sdk_unavailable",
+                "provider": self.provider,
+                "provider_result": {
+                    "successful": False,
+                    "error_type": exc.__class__.__name__,
+                },
+            }
+        return ComposioAssistantGmailAdapter(
+            sdk=sdk,
+            connected_account_id=connected_account_id,
+            address=str(identity.address),
+        ).send_message(
+            sender=sender,
+            recipient=recipient,
+            subject=subject,
+            body_text=body_text,
+            thread_id=thread_id,
+        )
 
 
 @dataclass

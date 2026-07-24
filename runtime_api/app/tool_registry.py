@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+from app.assistant_identity.tool_gateway import assistant_tool_manifest
+
 
 CONFIRMATION_PERMISSIONS = {
     "external_message",
@@ -12,6 +14,12 @@ CONFIRMATION_PERMISSIONS = {
     "write",
     "destructive",
 }
+
+
+def opencode_assistant_tool_manifest() -> list[dict[str, Any]]:
+    """Return the sole assistant-owned capability surface visible to OpenCode."""
+
+    return assistant_tool_manifest()
 
 
 @dataclass(frozen=True)

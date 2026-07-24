@@ -49,6 +49,13 @@
 | Task 14 本地历史与附件对账聚焦测试 | `gradle -p android_app :app:testDebugUnitTest --tests '*LocalChatAttachmentHistoryTest' --tests '*AssistantApiClientTest' --tests '*FloatingChatContextTest'`；`python3 -m pytest -q tests/test_attachment_history_contract.py tests/test_attachment_history_and_retry.py` | Android 通过；后端 11 tests 通过 | 核对服务端稳定消息 ID、显式附件 ordinal、只按 `(message_id, attachment_id)` 归属附件、同名附件不串线、重复正文按出现次数消费已提交 pending、本地无原始字节/Base64/文件路径 |
 | Task 14 Android 全量单测与 APK | `gradle -p android_app :app:testDebugUnitTest :app:assembleDebug` | 通过，121 tests；APK 构建成功 | 本地安全镜像、悬浮窗恢复、远端权威对账、附件元数据卡与既有上传/聊天/键盘行为组合回归；`git diff --check` 通过 |
 | Task 14 隔离检查点后端全量 | `python3 -m pytest -q runtime_api/tests` | 2 failed、853 passed | 两个失败仍为既有 `test_chat_response_uses_explicit_memory_layer_fetchers` 与 `test_context_pack_pipeline_retrieves_local_memory_agenda_and_turns`，和 Task 7-13 隔离基线相同；Task 14 未新增失败 |
+| Task 15 provenance/security/trace 聚焦回归 | Task 15 三个 runtime 测试文件；`worker/tests/test_attachment_memory_provenance.py` | runtime 13 tests、worker 2 tests 通过 | 核对 15 轮前不直接落附件长期记忆、批次及 fact 保留 attachment/turn/locator/hash/version、无文本 chunk 的视觉附件回退到整文件 hash、重处理版本追加不覆盖、注入/路径/HTML/密钥/base64 不进入 trace、鉴权预览/下载、检索与正式首字耗时回填 |
+| Task 15 worker 全量 | `cd worker && python3 -m pytest -q tests` | 135 tests 通过 | 事实图谱、日程、语义抽取与新附件 provenance 合并组合回归无新增失败 |
+| Task 15 隔离检查点后端全量 | `python3 -m pytest -q runtime_api/tests --tb=short` | 2 failed、867 passed | 两个失败仍为 Task 7-14 已记录的既有上下文层测试；Task 15 未新增失败 |
+| Task 18 查看器聚焦回归 | `python3 -m pytest -q runtime_api/tests/test_static_file_viewer.py`；Node URL helper；Android FileViewer/入口契约 | 通过 | 覆盖 source allowlist、密码不入 URL、自托管资产、Blob-to-File、内部 Activity、相对 URL 归一化和版本资源 immutable 缓存 |
+| Task 18 本地真实格式渲染 | Playwright，`412x915` | PNG、PDF、DOCX、PPTX、XLSX 均通过 | 核对真实内容、移动端无横向溢出、PPTX 多页和缩放工具条；不是转 PDF 后预览 |
+| Task 18 云端/Android 真机 | 私有云真实原件 + `DQYTCYFMO7VSEAJB` | PPTX 真机通过 | 真机直接打开多页 PPTX、关闭返回 App、悬浮球保留；未弹 WPS/小米查看器/系统选择器 |
+| Task 18 最终主工作区回归 | `python3 -m pytest -q runtime_api/tests`；Node；`gradle -p android_app clean testDebugUnitTest assembleDebug`；`docker compose build runtime-api`；Compose；`git diff --check` | 后端 1094 passed；Node 11 passed；Android BUILD SUCCESSFUL；fresh Docker 镜像构建成功；其余通过 | 最终 APK 已覆盖安装到真机，真实 PPTX 再次打开并在 5 秒内显示多页，关闭返回完整 App；镜像仅含六个 renderer、docx/libarchive/pdf/pptx/xlsx vendor，无 EPUB/node_modules |
 | 工作区 | `git status --short` | 脏工作区 | 存在既有 OpenCode、Web Search、Android 等改动；不得重置或整体暂存 |
 
 ## 规格覆盖状态
@@ -70,15 +77,16 @@
 | 256K 上下文与附件 64K 配额 | 代码与自动化完成，未部署 | attachment section 独立上限 64K，并受 256K 总预算、已保留上下文和输出预算共同限制；保留既有最近 15 轮上下文；排除原因进入 evidence plan | 无 | 尚未用真实长 PDF/PPTX 测 token 估算、首 token 和内存峰值 | 云环境部署待 Task 16 | Task 10、16、17 |
 | Qwen 结构化多模态与非 thinking | 代码与自动化完成，未部署 | 文本 content 保持字符串；视觉 content 为有序 `text/image_url`；私有相对路径只在 provider 边界校验后读取并转 data URL；输入不变；Qwen 请求显式 `enable_thinking=false`/`reasoning_effort=none`；正式响应忽略 reasoning；安全 trace 不含 base64/path | 无 | 尚未向线上 `qwen3.6` 发真实图文请求并核对首字、正式答案与视觉事实；未验证上游是否完整支持当前 data URL 契约 | 云环境与模型端待 Task 16/17 | Task 16、17 |
 | 稳定引用与覆盖声明 | 代码与自动化完成，未部署 | PDF 页、PPTX 张、DOCX 章节、XLSX sheet/range、图片和文本行号有稳定 label；答案只能引用本轮选中 label，未选页引用会被移除并产生 validation trace；partial coverage 明确未覆盖位置 | 无 | 尚未用真实 Qwen 输出验证引用服从率；逐页终态摘要尚未在双客户端展示验收 | 云环境部署待 Task 16 | Task 10、16、17 |
-| 长期记忆来源 | 未开始 | 无 | 无 | 未保存 attachment/turn/locator/version 来源 | 无 | Task 15 |
+| 长期记忆来源 | 代码与自动化完成，未部署 | 只有正常 15 轮 dialogue batch 可携带附件来源；worker 将 attachment/turn/locator/hash/version 写入 fact metadata；相同事实重处理时对 provenance 做 JSONB 去重追加而非覆盖；runtime/worker 聚焦 5 tests 通过 | 无 | 当前 provenance 以对话批次为归属边界；尚未在真实 PostgreSQL 验证冲突更新和真实附件对话形成的 fact | 云环境部署待 Task 16 | Task 16、17 |
 | Web 完整 App 交互 | 代码与自动化完成，未部署 | 8 个纯 JS 状态机测试、4 个静态契约、101 个 Web/附件组合回归；真实 Chromium 桌面/390px 响应式检查通过 | 本地真实 Chromium 已核对布局；上传接口使用静态服务器故意得到失败态，只验证失败 UI，不冒充真实上传成功 | 尚未连接真实 PostgreSQL/Redis/worker 完成上传、ready、纯附件/混合发送、鉴权预览下载和服务端历史重载 | 云环境部署待 Task 16 | Task 13-16、17 |
 | Android 完整 App WebView 选择器 | 代码与自动化完成，未部署 | 4 条 chooser 行为/契约测试；Android 全量 103 tests；`ACTION_OPEN_DOCUMENT` 多选、允许 MIME、旧回调取消、单/多 URI 有序返回、持久读权限、状态恢复和无相机入口 | 无 | 尚未在真机点击完整 App 回形针并选择单文件、多文件和取消；尚未验证具体文档 provider 是否授予可持久权限 | 真机待 Task 16 | Task 16、17 |
 | Android 悬浮窗交互 | 代码与自动化完成，未部署 | 19 条聚焦测试、116 条 Android 全量测试和 debug APK 构建通过；原生 `ACTION_OPEN_DOCUMENT`、允许格式、持久读权限、分块流式上传、进度/取消、ready 轮询、失败重试/移除、图片缩略图/文档图标、纯附件/混合发送、HTTP/WS 同序附件 ID 均已接入 | 无 | 尚未在真机核对不同文档 provider 的 URI 授权、旋转/服务重建、真实上传/解析 ready、失败重试、纯附件与混合发送以及服务端历史重载 | 真机与云环境待 Task 16 | Task 16、17 |
 | 双界面历史一致性 | 代码与自动化完成，未部署 | 服务端历史 DTO 与 Android 本地镜像保留相同有序安全附件元数据；服务端稳定 ID 权威覆盖已发送消息，删除项不在本地复活；本地只保留尚未被服务端同角色/正文出现次数消费的无 ID pending，且草稿附件始终留在原控制器；Android 全量 121 tests、后端聚焦 11 tests 通过 | 无 | 尚未在真实服务器、完整 App 与悬浮窗之间执行上传后切换、进程重启、离线 pending、服务端删除和附件卡重载；历史附件卡当前只展示安全元数据，真实鉴权下载/打开由 Task 16/17 验收 | 云环境与真机待 Task 16 | Task 16、17 |
-| 安全与提示注入防护 | 文件入口、解析失败隔离和鉴权下载完成，未部署 | hostile-file 测试验证 ZIP bomb、ZIP traversal、加密/损坏容器、脚本与伪装可执行文件；解析异常不回显路径；持久化失败清除未提交衍生文件；物理删除失败可恢复；预览/原件无密码返回 401 且不含文件字节，响应含 `nosniff` 与私有缓存头 | 无 | 文档内提示注入、审计和真实恶意样本待后续任务 | 无 | Task 8、14、17 |
-| 隐私安全 Trace | 未开始 | 无 | 无 | 无附件证据和耗时 trace | 无 | Task 15 |
-| 2 核 4G 性能与部署 | 容器预算契约完成，未实测 | 自动化锁定 attachment-worker `0.75 CPU / 768MB`、分类并发 `2/1/1`、非 root 和只读根文件系统；`docker compose config --quiet` 通过 | 无 | 尚未构建镜像并以 25MB 上传、31 页解析和并发聊天做资源实测 | 云环境部署待 Task 16 | Task 16、17 |
+| 安全与提示注入防护 | 代码与自动化完成，未部署 | hostile-file、ZIP traversal、加密/损坏容器、脚本伪装、parser timeout、鉴权下载均有回归；模型系统提示将附件作为不可信证据；trace 严格 allowlist，拒绝正文、绝对路径、HTML、base64、API key 和文档内工具指令 | 无 | 尚未以真实恶意文件和线上模型验证提示注入服从率 | 云环境部署待 Task 16 | Task 16、17 |
+| 隐私安全 Trace | 代码与自动化完成但生产计时仍有 Gap，未部署 | trace 输出 request/client/turn ID、重试数、附件类型/状态/版本、selected/excluded locator、hash、视觉数；检索耗时及 HTTP/WS 正式首字和总耗时已回填；聚焦 trace/security tests 通过 | 无 | 上传/hash/store/parse/chunk/embed/render 的生产者尚未逐阶段产出真实耗时，当前字段为 `null` 而不是伪造 0；附件 chunk embedding 当前也没有生产写入路径，因此 `embed_ms` 无真实值 | 云环境部署待 Task 16 | Task 16 先测量并决定是否新增持久化/遥测载体，Task 17 核对线上 trace |
+| 4 核 8G 性能与部署 | 容器预算契约完成，未完整负载实测 | 自动化锁定 attachment-worker 并发、非 root、只读根文件系统和 Compose 资源上限；`docker compose config --quiet` 通过；核心解析、Chromium 采集和后台任务未因 2C4G 兼容而删除 | 云端本次真实五格式上传/解析和聊天期间 API 保持健康 | 尚未以 25MB 上传、31 页/幻灯片解析和并发聊天采集完整 CPU/RSS/P95 数据 | 无 | Task 17 完成生产负载矩阵 |
 | 云端、真实文件、Qwen、Android 真机 | 未开始 | 无 | 无 | 全部真实验收尚未执行 | 需要后续真机在线 | Task 17 |
+| Nomi 内置原格式查看器 | 核心功能完成，真机格式矩阵部分完成 | 查看器/API/URL/Android 契约、7 条静态资源测试、11 条 URL helper、Android 全量与 APK 构建通过；精简 Flyfish 资产固定为 `2.1.29`；fresh runtime-api 镜像构建通过并核对无 EPUB/node_modules；`Pillow==10.4.0` 与 `fastembed==0.4.2` 兼容性已有回归测试 | 云端真实 PNG/PDF/DOCX/PPTX/XLSX 均 ready 且内容解析合理；本地移动端 Chromium 五格式直接渲染；真机真实 PPTX 多页查看、二次打开、关闭返回 App 均通过 | CSV/TXT/MD 和 PNG/PDF/DOCX/XLSX 尚未逐一在真机 UI 打开；旋转、离线/损坏错误页、连续十次开关和内存观测未完成；首次 PPTX 会下载约 1.9MB renderer/worker，弱网首开较慢，已增加一年 immutable 缓存但新版缓存响应头待再次云端部署后复测 | SSH 当前偶发 banner timeout，不影响已部署版本的真机访问，但阻塞本轮缓存头增量部署 | 完成剩余 Task 18 Step 10 矩阵并采集首开/复开时延 |
 
 ## 执行纪律
 

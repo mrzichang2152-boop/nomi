@@ -1189,7 +1189,7 @@ class LongTailGraphRunner:
         task["current_step_id"] = step_id
         return dict(packet)
 
-    def recover_task(self, task_id: str) -> dict[str, Any]:
+    def recover_task(self, task_id: str, *, record_restore_event: bool = True) -> dict[str, Any]:
         events = self.event_store.task_events(task_id)
         if not events:
             raise KeyError(f"No events for task {task_id}")
@@ -1206,6 +1206,7 @@ class LongTailGraphRunner:
         latest_checkpoint: dict[str, Any] = {}
         pending_executor_result: dict[str, Any] | None = None
         pending_human_input: dict[str, Any] | None = None
+        failure_reason = ""
 
         for event in events:
             event_type = str(event.get("event_type") or "")
@@ -1260,6 +1261,8 @@ class LongTailGraphRunner:
                 fallback = dict(payload.get("fallback_decision") or {})
                 current_node = "select_step" if fallback.get("action") == "retry" else "blocked"
                 status = "running" if current_node == "select_step" else "blocked"
+                if current_node == "blocked":
+                    failure_reason = str(fallback.get("reason") or "")
                 pending_executor_result = None
             elif event_type == "human_input.requested":
                 request_step_id = event_step_id or str(payload.get("step_id") or current_step_id)
@@ -1270,6 +1273,7 @@ class LongTailGraphRunner:
                     "question": str(payload.get("question") or ""),
                     "options": list(payload.get("options") or []),
                     "status": "waiting",
+                    "created_at": str(event.get("created_at") or ""),
                 }
                 current_node = "waiting_for_human_input"
             elif event_type == "human_input.received":
@@ -1306,25 +1310,28 @@ class LongTailGraphRunner:
             task["pending_executor_result"] = pending_executor_result
         if pending_human_input is not None:
             task["pending_human_input"] = pending_human_input
+        if failure_reason:
+            task["failure_reason"] = failure_reason
 
         self.state_by_task[task_id] = task
         if plan:
             self.plans_by_task[task_id] = plan
 
-        last_sequence = int(events[-1].get("sequence") or len(events))
-        self.event_store.append_event(
-            task_id=task_id,
-            event_type="checkpoint.restored",
-            step_id=current_step_id or None,
-            payload={
-                "current_node": current_node,
-                "current_step_id": current_step_id,
-                "completed_steps": completed_steps,
-                "latest_checkpoint": latest_checkpoint,
-                "after_event_sequence": last_sequence,
-            },
-            idempotency_key=f"{task_id}:checkpoint.restored:{last_sequence}",
-        )
+        if record_restore_event:
+            last_sequence = int(events[-1].get("sequence") or len(events))
+            self.event_store.append_event(
+                task_id=task_id,
+                event_type="checkpoint.restored",
+                step_id=current_step_id or None,
+                payload={
+                    "current_node": current_node,
+                    "current_step_id": current_step_id,
+                    "completed_steps": completed_steps,
+                    "latest_checkpoint": latest_checkpoint,
+                    "after_event_sequence": last_sequence,
+                },
+                idempotency_key=f"{task_id}:checkpoint.restored:{last_sequence}",
+            )
         return dict(task)
 
     def complete_current_step(self, task_id: str, *, executor_result: dict[str, Any]) -> dict[str, Any]:
@@ -1471,13 +1478,6 @@ class LongTailGraphRunner:
     ) -> dict[str, Any]:
         task = self.state_by_task[task_id]
         normalized_options = [dict(option) for option in list(options or [])]
-        pending_human_input = {
-            "step_id": step_id or "",
-            "input_type": input_type,
-            "question": question,
-            "options": normalized_options,
-            "status": "waiting",
-        }
         event = self.event_store.append_event(
             task_id=task_id,
             event_type="human_input.requested",
@@ -1491,6 +1491,14 @@ class LongTailGraphRunner:
             },
             idempotency_key=f"{task_id}:{step_id or 'task'}:human_input.requested:{len(self.event_store.task_events(task_id))}",
         )
+        pending_human_input = {
+            "step_id": step_id or "",
+            "input_type": input_type,
+            "question": question,
+            "options": normalized_options,
+            "status": "waiting",
+            "created_at": str(event.get("created_at") or ""),
+        }
         task["current_node"] = "waiting_for_human_input"
         task["pending_human_input"] = pending_human_input
         if step_id:

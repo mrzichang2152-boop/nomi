@@ -44,13 +44,59 @@ services:
       timeout: 5s
       retries: 5
 
+  attachment-secret-init:
+    image: alpine:3.21
+    restart: "no"
+    cpus: "0.02"
+    mem_limit: 32m
+    logging: *default-logging
+    network_mode: none
+    read_only: true
+    command:
+      - sh
+      - -ec
+      - |
+        umask 077
+        if [ ! -s /run/nomi-secrets/render-token ]; then
+          head -c 32 /dev/urandom | base64 > /run/nomi-secrets/render-token.tmp
+          chown 65532:65532 /run/nomi-secrets/render-token.tmp
+          chmod 0400 /run/nomi-secrets/render-token.tmp
+          mv /run/nomi-secrets/render-token.tmp /run/nomi-secrets/render-token
+        fi
+    volumes:
+      - attachment_render_secret:/run/nomi-secrets
+
+  artifact-volume-init:
+    image: alpine:3.21
+    restart: "no"
+    cpus: "0.02"
+    mem_limit: 32m
+    logging: *default-logging
+    network_mode: none
+    read_only: true
+    command:
+      - sh
+      - -ec
+      - |
+        mkdir -p /app/artifacts
+        chown 65532:65532 /app/artifacts
+        chmod 0770 /app/artifacts
+    volumes:
+      - artifact_data:/app/artifacts
+
   runtime-api:
+    image: nomi-runtime-api:local
     build:
       context: ./runtime_api
+      target: api-runtime
     restart: unless-stopped
     cpus: "1.00"
     mem_limit: 1280m
     logging: *default-logging
+    user: "65532:65532"
+    read_only: true
+    tmpfs:
+      - /tmp:size=256m,mode=1777
     environment:
       <<: *model-cache-env
       DATABASE_URL: postgresql://par:par_dev_password@postgres:5432/par
@@ -59,14 +105,54 @@ services:
       MODEL_BASE_URL: ${MODEL_BASE_URL:-http://81.70.177.246:9161/v1}
       MODEL_NAME: ${MODEL_NAME:-qwen3.6}
       APP_PASSWORD: ${APP_PASSWORD:-par-dev}
-      NOMI_ATTACHMENT_ROOT: /app/data/attachments
+      NOMI_ATTACHMENT_ROOT: ${NOMI_ATTACHMENT_ROOT:-/app/data/attachments}
+      ATTACHMENT_MAX_FILE_BYTES: ${ATTACHMENT_MAX_FILE_BYTES:-26214400}
+      ATTACHMENT_MAX_MESSAGE_BYTES: ${ATTACHMENT_MAX_MESSAGE_BYTES:-67108864}
+      ATTACHMENT_MAX_PER_MESSAGE: ${ATTACHMENT_MAX_PER_MESSAGE:-8}
+      ATTACHMENT_DRAFT_TTL_SECONDS: ${ATTACHMENT_DRAFT_TTL_SECONDS:-86400}
+      ATTACHMENT_RENDER_URL: http://attachment-renderer:9170/render/pdf
+      ATTACHMENT_RENDER_SECRET_FILE: /run/nomi-secrets/render-token
+      WEB_SEARCH_CONFIG_ENCRYPTION_SECRET: ${WEB_SEARCH_CONFIG_ENCRYPTION_SECRET:-}
+      ARTIFACT_STORAGE_DIR: ${ARTIFACT_STORAGE_DIR:-/app/artifacts}
+      ARTIFACT_PUBLIC_BASE_URL: ${ARTIFACT_PUBLIC_BASE_URL:-}
+      OPENCODE_ARTIFACT_COMMAND: ${OPENCODE_ARTIFACT_COMMAND:-python /app/scripts/nomi_opencode_cli_adapter.py}
+      OPENCODE_ARTIFACT_TIMEOUT_SECONDS: ${OPENCODE_ARTIFACT_TIMEOUT_SECONDS:-600}
+      OPENCODE_ARTIFACT_FALLBACK_COMMAND: ${OPENCODE_ARTIFACT_FALLBACK_COMMAND:-python /app/scripts/nomi_opencode_artifact_command.py}
+      NOMI_CAPABILITY_PACKS_DIR: ${NOMI_CAPABILITY_PACKS_DIR:-/app/opencode_capabilities}
+      NOMI_OPENCODE_MODEL_BASE_URL: ${NOMI_OPENCODE_MODEL_BASE_URL:-http://81.70.177.246:9161/v1}
+      NOMI_OPENCODE_MODEL: ${NOMI_OPENCODE_MODEL:-qwen/qwen3.6-27b}
+      NOMI_OPENCODE_MODEL_API_KEY: ${NOMI_OPENCODE_MODEL_API_KEY:-nomi-local}
+      ENABLE_OPENCODE_ARTIFACT_INLINE_RUN: ${ENABLE_OPENCODE_ARTIFACT_INLINE_RUN:-false}
+      ENABLE_OPENCODE_ARTIFACT_WORKER: ${ENABLE_OPENCODE_ARTIFACT_WORKER:-false}
+      OPENCODE_ARTIFACT_WORKER_INTERVAL_SECONDS: ${OPENCODE_ARTIFACT_WORKER_INTERVAL_SECONDS:-5}
+      OPENCODE_ARTIFACT_WORKER_BATCH_SIZE: ${OPENCODE_ARTIFACT_WORKER_BATCH_SIZE:-1}
+      OPENCODE_ARTIFACT_WORKER_LEASE_SECONDS: ${OPENCODE_ARTIFACT_WORKER_LEASE_SECONDS:-900}
+      NOMI_OPENCODE_MAX_ATTEMPTS: ${NOMI_OPENCODE_MAX_ATTEMPTS:-2}
       RAW_DATA_ENCRYPTION_KEY: ${RAW_DATA_ENCRYPTION_KEY:-}
+      NOMI_SECRET_MASTER_KEY: ${NOMI_SECRET_MASTER_KEY:-}
       COMPOSIO_API_KEY: ${COMPOSIO_API_KEY:-}
       COMPOSIO_API_BASE_URL: ${COMPOSIO_API_BASE_URL:-https://backend.composio.dev}
       COMPOSIO_USER_ID: ${COMPOSIO_USER_ID:-nomi_owner}
       COMPOSIO_CALLBACK_URL: ${COMPOSIO_CALLBACK_URL:-}
+      ASSISTANT_GMAIL_CALLBACK_URL: ${ASSISTANT_GMAIL_CALLBACK_URL:-}
+      COMPOSIO_GMAIL_TOOLKIT_VERSION: ${COMPOSIO_GMAIL_TOOLKIT_VERSION:-20260721_00}
+      ENABLE_ASSISTANT_GMAIL_SYNC: ${ENABLE_ASSISTANT_GMAIL_SYNC:-true}
+      ASSISTANT_GMAIL_SYNC_INTERVAL_SECONDS: ${ASSISTANT_GMAIL_SYNC_INTERVAL_SECONDS:-90}
       COMPOSIO_READONLY_TOOLKITS: ${COMPOSIO_READONLY_TOOLKITS:-gmail,googlecalendar,googledrive,googledocs,googlesheets,googletasks,google_maps,github,slack,notion}
       COMPOSIO_WRITE_TOOLKITS: ${COMPOSIO_WRITE_TOOLKITS:-gmail,googlecalendar,googledrive,googledocs,googlesheets,googletasks,github,slack,notion,todoist,linear,jira}
+      WEB_SEARCH_ENABLED: ${WEB_SEARCH_ENABLED:-true}
+      WEB_SEARCH_PROVIDER_ORDER: ${WEB_SEARCH_PROVIDER_ORDER:-exa,tavily,bocha,brave,searxng}
+      BOCHA_API_KEY: ${BOCHA_API_KEY:-}
+      BOCHA_MIN_REQUEST_INTERVAL_SECONDS: ${BOCHA_MIN_REQUEST_INTERVAL_SECONDS:-0.55}
+      BOCHA_MAX_RETRIES: ${BOCHA_MAX_RETRIES:-2}
+      EXA_API_KEY: ${EXA_API_KEY:-}
+      TAVILY_API_KEY: ${TAVILY_API_KEY:-}
+      BRAVE_SEARCH_API_KEY: ${BRAVE_SEARCH_API_KEY:-}
+      SEARXNG_BASE_URL: ${SEARXNG_BASE_URL:-}
+      WEB_SEARCH_PROVIDER_TIMEOUT_SECONDS: ${WEB_SEARCH_PROVIDER_TIMEOUT_SECONDS:-6}
+      WEB_FETCH_TIMEOUT_SECONDS: ${WEB_FETCH_TIMEOUT_SECONDS:-8}
+      WEB_FETCH_MAX_BYTES: ${WEB_FETCH_MAX_BYTES:-2097152}
+      WEB_FETCH_MAX_REDIRECTS: ${WEB_FETCH_MAX_REDIRECTS:-3}
       EMBEDDING_PROVIDER: ${EMBEDDING_PROVIDER:-fastembed}
       FASTEMBED_MODEL: ${FASTEMBED_MODEL:-sentence-transformers/all-MiniLM-L6-v2}
       ASR_PROVIDER: ${ASR_PROVIDER:-volcengine}
@@ -87,19 +173,92 @@ services:
       RAW_RETENTION_DAYS: ${RAW_RETENTION_DAYS:-30}
       LOW_VALUE_RAW_RETENTION_DAYS: ${LOW_VALUE_RAW_RETENTION_DAYS:-7}
     depends_on:
+      artifact-volume-init:
+        condition: service_completed_successfully
       postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
+      attachment-renderer:
+        condition: service_healthy
     expose:
       - "8080"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=2).read()"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
     volumes:
       - model_cache:/models
-      - attachment_data:/app/data/attachments
+      - artifact_data:/app/artifacts
+      - attachment_data:${NOMI_ATTACHMENT_ROOT:-/app/data/attachments}
+      - attachment_render_secret:/run/nomi-secrets:ro
+    networks:
+      - default
+      - attachment-render
+
+  opencode-artifact-worker:
+    image: nomi-runtime-api:local
+    build:
+      context: ./runtime_api
+      target: api-runtime
+    restart: unless-stopped
+    cpus: "0.75"
+    mem_limit: 1536m
+    logging: *default-logging
+    command: ["python", "-m", "app.opencode_artifact_worker_entrypoint"]
+    user: "65532:65532"
+    read_only: true
+    tmpfs:
+      - /tmp:size=256m,mode=1777
+    environment:
+      <<: *model-cache-env
+      DATABASE_URL: postgresql://par:par_dev_password@postgres:5432/par
+      REDIS_URL: redis://redis:6379/0
+      MODEL_MODE: standard
+      MODEL_BASE_URL: ${MODEL_BASE_URL:-http://81.70.177.246:9161/v1}
+      MODEL_NAME: ${MODEL_NAME:-qwen3.6}
+      APP_PASSWORD: ${APP_PASSWORD:-par-dev}
+      ARTIFACT_STORAGE_DIR: ${ARTIFACT_STORAGE_DIR:-/app/artifacts}
+      ARTIFACT_PUBLIC_BASE_URL: ${ARTIFACT_PUBLIC_BASE_URL:-}
+      OPENCODE_ARTIFACT_COMMAND: ${OPENCODE_ARTIFACT_COMMAND:-python /app/scripts/nomi_opencode_cli_adapter.py}
+      OPENCODE_ARTIFACT_TIMEOUT_SECONDS: ${OPENCODE_ARTIFACT_TIMEOUT_SECONDS:-600}
+      OPENCODE_ARTIFACT_FALLBACK_COMMAND: ${OPENCODE_ARTIFACT_FALLBACK_COMMAND:-python /app/scripts/nomi_opencode_artifact_command.py}
+      NOMI_CAPABILITY_PACKS_DIR: ${NOMI_CAPABILITY_PACKS_DIR:-/app/opencode_capabilities}
+      NOMI_OPENCODE_MODEL_BASE_URL: ${NOMI_OPENCODE_MODEL_BASE_URL:-http://81.70.177.246:9161/v1}
+      NOMI_OPENCODE_MODEL: ${NOMI_OPENCODE_MODEL:-qwen/qwen3.6-27b}
+      NOMI_OPENCODE_MODEL_API_KEY: ${NOMI_OPENCODE_MODEL_API_KEY:-nomi-local}
+      RUNTIME_API_URL: http://runtime-api:8080
+      RUNTIME_API_PASSWORD: ${APP_PASSWORD:-par-dev}
+      ENABLE_OPENCODE_ARTIFACT_INLINE_RUN: "false"
+      ENABLE_OPENCODE_ARTIFACT_WORKER: "true"
+      OPENCODE_ARTIFACT_WORKER_INTERVAL_SECONDS: ${OPENCODE_ARTIFACT_WORKER_INTERVAL_SECONDS:-5}
+      OPENCODE_ARTIFACT_WORKER_BATCH_SIZE: ${OPENCODE_ARTIFACT_WORKER_BATCH_SIZE:-1}
+      OPENCODE_ARTIFACT_WORKER_LEASE_SECONDS: ${OPENCODE_ARTIFACT_WORKER_LEASE_SECONDS:-900}
+      NOMI_OPENCODE_MAX_ATTEMPTS: ${NOMI_OPENCODE_MAX_ATTEMPTS:-2}
+      RAW_DATA_ENCRYPTION_KEY: ${RAW_DATA_ENCRYPTION_KEY:-}
+      EMBEDDING_PROVIDER: ${EMBEDDING_PROVIDER:-fastembed}
+      FASTEMBED_MODEL: ${FASTEMBED_MODEL:-sentence-transformers/all-MiniLM-L6-v2}
+      ENABLE_DAILY_MAINTENANCE: "false"
+      ENABLE_OPENCLAW_JOB_RUNNER: "false"
+      ENABLE_LONG_TAIL_RECOVERY_RUNNER: "false"
+      ENABLE_GMAIL_COMPOSIO_SYNC: "false"
+      ENABLE_IOS_LIVE_ACTIVITY_BRIDGE: "false"
+    depends_on:
+      artifact-volume-init:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - model_cache:/models
+      - artifact_data:/app/artifacts
 
   attachment-worker:
     build:
       context: ./runtime_api
+      target: attachment-worker-runtime
     restart: unless-stopped
     cpus: "0.75"
     mem_limit: 768m
@@ -108,11 +267,19 @@ services:
     user: "65532:65532"
     read_only: true
     tmpfs:
-      - /tmp:size=128m,mode=1777
+      - /tmp:size=512m,mode=1777
+    healthcheck:
+      test: ["CMD-SHELL", "kill -0 1 && test -w \"$${NOMI_ATTACHMENT_ROOT}\""]
+      interval: 15s
+      timeout: 5s
+      retries: 5
     environment:
       DATABASE_URL: postgresql://par:par_dev_password@postgres:5432/par
       REDIS_URL: redis://redis:6379/0
-      NOMI_ATTACHMENT_ROOT: /app/data/attachments
+      NOMI_ATTACHMENT_ROOT: ${NOMI_ATTACHMENT_ROOT:-/app/data/attachments}
+      ATTACHMENT_MAX_FILE_BYTES: ${ATTACHMENT_MAX_FILE_BYTES:-26214400}
+      ATTACHMENT_MAX_MESSAGE_BYTES: ${ATTACHMENT_MAX_MESSAGE_BYTES:-67108864}
+      ATTACHMENT_MAX_PER_MESSAGE: ${ATTACHMENT_MAX_PER_MESSAGE:-8}
       PYTHONDONTWRITEBYTECODE: "1"
       ATTACHMENT_LIGHTWEIGHT_CONCURRENCY: ${ATTACHMENT_LIGHTWEIGHT_CONCURRENCY:-2}
       ATTACHMENT_OFFICE_CONCURRENCY: ${ATTACHMENT_OFFICE_CONCURRENCY:-1}
@@ -125,7 +292,46 @@ services:
       redis:
         condition: service_healthy
     volumes:
-      - attachment_data:/app/data/attachments
+      - attachment_data:${NOMI_ATTACHMENT_ROOT:-/app/data/attachments}
+
+  attachment-renderer:
+    build:
+      context: ./runtime_api
+      target: attachment-worker-runtime
+    restart: unless-stopped
+    cpus: "0.20"
+    mem_limit: 384m
+    logging: *default-logging
+    command: ["python", "-m", "app.attachments.render_entrypoint"]
+    user: "65532:65532"
+    read_only: true
+    tmpfs:
+      - /tmp:size=256m,mode=1777
+    environment:
+      NOMI_ATTACHMENT_ROOT: ${NOMI_ATTACHMENT_ROOT:-/app/data/attachments}
+      ATTACHMENT_RENDER_SECRET_FILE: /run/nomi-secrets/render-token
+      ATTACHMENT_RENDER_HOST: 0.0.0.0
+      ATTACHMENT_RENDER_PORT: "9170"
+    depends_on:
+      attachment-secret-init:
+        condition: service_completed_successfully
+    volumes:
+      - attachment_data:${NOMI_ATTACHMENT_ROOT:-/app/data/attachments}:ro
+      - attachment_render_secret:/run/nomi-secrets:ro
+    expose:
+      - "9170"
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "/bin/bash -ec 'exec 3<>/dev/tcp/127.0.0.1/9170; printf \"GET /health HTTP/1.0\\r\\nHost: localhost\\r\\n\\r\\n\" >&3; grep -m1 -q \" 200 \" <&3'",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    networks:
+      - attachment-render
 
   worker:
     build:
@@ -134,6 +340,10 @@ services:
     cpus: "1.00"
     mem_limit: 1280m
     logging: *default-logging
+    user: "65532:65532"
+    read_only: true
+    tmpfs:
+      - /tmp:size=256m,mode=1777
     environment:
       <<: *model-cache-env
       DATABASE_URL: postgresql://par:par_dev_password@postgres:5432/par
@@ -224,4 +434,11 @@ volumes:
   redis_data:
   chromium_profile:
   model_cache:
+  artifact_data:
   attachment_data:
+  attachment_render_secret:
+
+networks:
+  default:
+  attachment-render:
+    internal: true

@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "id": "spreadsheet",
+  "version": "1.0.0",
+  "display_name": "Nomi Spreadsheet Studio",
+  "artifact_types": ["xlsx"],
+  "default_agent": "spreadsheet-producer",
+  "resource_paths": {
+    "skills": ["skills/spreadsheet-quality/SKILL.md"],
+    "agents": ["agents/spreadsheet-producer.md"],
+    "tools": ["tools/create_spreadsheet.ts"],
+    "plugins": []
+  },
+  "quality_profile": {
+    "maximum_sheet_count": 20,
+    "maximum_column_count": 50,
+    "maximum_total_rows": 100000,
+    "require_formula_cached_values": true,
+    "require_filters": true,
+    "require_freeze_panes": true,
+    "require_source_mapping": true
+  }
+}

@@ -63,6 +63,64 @@ def test_reply_pipeline_execution_returns_draft_ready_contract(monkeypatch):
     assert result["missing_slots"] == []
 
 
+def test_pipeline_provider_attachment_materializes_explicit_nomi_gmail_draft(monkeypatch):
+    monkeypatch.setenv("APP_PASSWORD", "secret")
+    from app import main
+    from app.assistant_identity.models import AssistantIdentity
+    from app.assistant_identity.outbound import OutboundMessagePipeline
+    from app.assistant_identity.registry import AssistantIdentityRegistry
+    from app.assistant_identity.tool_gateway import AssistantToolGateway
+
+    registry = AssistantIdentityRegistry()
+    registry.add(
+        AssistantIdentity(
+            identity_id="nomi_gmail_primary",
+            kind="assistant_gmail",
+            provider="composio_gmail",
+            display_name="Nomi",
+            address="nomi@example.com",
+            status="connected",
+            capabilities=["receive", "draft", "send", "thread_reply"],
+        )
+    )
+    gateway = AssistantToolGateway(
+        registry=registry,
+        outbound=OutboundMessagePipeline(),
+        contacts={
+            "contact_alice": {
+                "display_name": "Alice",
+                "gmail": "alice@example.com",
+            }
+        },
+    )
+    monkeypatch.setattr(main, "assistant_email_tool_gateway", lambda: gateway, raising=False)
+    context = {
+        "pipeline_id": "reply_pipeline",
+        "assistant_identity_id": "nomi_gmail_primary",
+        "recipient_contact_id": "contact_alice",
+        "recipient": "Alice",
+        "channel": "email",
+        "message_intent": "周五八点可以",
+        "email_subject": "确认时间",
+        "source_event_ids": ["evt_pipeline_1"],
+    }
+
+    result = main.run_core_pipeline("用 Nomi 邮箱回复 Alice，说周五八点可以", context)
+    attached = main.attach_pipeline_provider_execution(result, context)
+
+    assert attached["assistant_draft"]["status"] == "confirmation_required"
+    assert attached["assistant_draft"]["policy_checks"] == [
+        "identity_connected",
+        "recipient_resolved",
+        "evidence_scope_passed",
+        "idempotency_passed",
+    ]
+    draft = gateway.outbound.get_draft(attached["assistant_draft"]["draft_id"])
+    assert draft["recipient"] == "alice@example.com"
+    assert draft["body_text"] == "周五八点可以"
+    assert draft["send_called"] is False
+
+
 def test_route_pipeline_execution_returns_read_only_contract(monkeypatch):
     monkeypatch.setenv("APP_PASSWORD", "secret")
     from app import main

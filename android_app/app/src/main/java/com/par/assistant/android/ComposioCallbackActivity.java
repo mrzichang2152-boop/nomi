@@ -22,6 +22,28 @@ public final class ComposioCallbackActivity extends Activity {
         Uri uri = intent == null ? null : intent.getData();
         String toolkit = uri == null ? "" : uri.getQueryParameter("toolkit");
         String status = uri == null ? "" : uri.getQueryParameter("status");
+        String assistantIdentityId = ComposioCallbackPayload.assistantIdentityId(
+                uri == null ? "" : uri.getQueryParameter("assistant_identity")
+        );
+        if (!assistantIdentityId.isEmpty()) {
+            returnToAssistantIdentityPage();
+            return;
+        }
+        returnToUserAccountList(toolkit, status);
+    }
+
+    private void returnToAssistantIdentityPage() {
+        startForegroundService(new Intent(this, FloatingBallService.class));
+        String assistantIdentityUrl = WorkbenchUrls.assistantIdentitiesUrl(ConfigPrefs.baseUrlOrDefault(this));
+        Intent workspace = new Intent(this, WebWorkspaceActivity.class);
+        workspace.putExtra(WebWorkspaceActivity.EXTRA_URL, assistantIdentityUrl);
+        workspace.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP);
+        startActivity(workspace);
+        finish();
+        overridePendingTransition(0, 0);
+    }
+
+    private void returnToUserAccountList(String toolkit, String status) {
         Intent service = new Intent(this, FloatingBallService.class);
         service.setAction(FloatingBallService.ACTION_SHOW_ACCOUNTS);
         service.putExtra(

@@ -289,6 +289,70 @@ def test_job_discovery_pipeline_normalizes_public_ats_pages_without_external_act
     assert result["writeback_plan"][1]["payload"]["source_event_ids"] == ["ats_evt_2"]
 
 
+def test_job_discovery_pipeline_accepts_audited_web_search_candidates(monkeypatch):
+    monkeypatch.setenv("APP_PASSWORD", "secret")
+    from app import main
+
+    result = main.run_core_pipeline(
+        "帮我找上海 Go 后端岗位",
+        {
+            "pipeline_id": "job_discovery_pipeline",
+            "query": "Shanghai Go backend engineer jobs",
+            "web_context": [
+                {
+                    "source_id": "websrc_job_1",
+                    "layer": "web_evidence",
+                    "provider": "exa",
+                    "title": "Senior Go Backend Engineer - Acme",
+                    "url": "https://jobs.lever.co/acme/go-backend",
+                    "snippet": "Senior Go Backend Engineer\nAcme\nLocation: Shanghai\nGo, Kubernetes and PostgreSQL required.",
+                    "trust_tier": "authoritative",
+                }
+            ],
+        },
+    )
+
+    jobs = result["output"]["job_opportunities"]
+    assert result["status"] == "completed_read_only"
+    assert len(jobs) == 1
+    assert jobs[0]["url"] == "https://jobs.lever.co/acme/go-backend"
+    assert jobs[0]["source"] == "lever_public"
+    assert jobs[0]["source_event_ids"] == ["websrc_job_1"]
+    assert "Go" in jobs[0]["requirements"]
+
+
+def test_job_discovery_pipeline_fetches_public_web_when_no_candidates_are_supplied(monkeypatch):
+    monkeypatch.setenv("APP_PASSWORD", "secret")
+    from app import main
+
+    calls = []
+
+    def fake_web_search(query, route, *, trace_context=None):
+        calls.append((query, route.web_mode, trace_context))
+        return [
+            {
+                "source_id": "websrc_auto_job",
+                "layer": "web_evidence",
+                "provider": "exa",
+                "title": "Go Backend Engineer - Acme",
+                "url": "https://boards.greenhouse.io/acme/jobs/456",
+                "snippet": "Go Backend Engineer\nAcme\nLocation: Shanghai\nGo and distributed systems required.",
+            }
+        ]
+
+    monkeypatch.setattr(main, "fetch_web_search_context", fake_web_search)
+
+    result = main.run_core_pipeline(
+        "帮我找上海 Go 后端岗位",
+        {"pipeline_id": "job_discovery_pipeline", "query": "Shanghai Go backend engineer jobs"},
+    )
+
+    assert calls[0][1] == "balanced"
+    assert calls[0][2]["pipeline_id"] == "job_discovery_pipeline"
+    assert result["status"] == "completed_read_only"
+    assert result["output"]["job_opportunities"][0]["source_event_ids"] == ["websrc_auto_job"]
+
+
 def test_job_discovery_pipeline_preserves_linkedin_structured_location(monkeypatch):
     monkeypatch.setenv("APP_PASSWORD", "secret")
     from app import main

@@ -1,0 +1,11 @@
+{
+  "name": "nomi-file-viewer-assets",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "node build-assets.mjs ../app/static/vendor/file-viewer"
+  },
+  "dependencies": {
+    "@file-viewer/web-full": "2.1.29"
+  }
+}

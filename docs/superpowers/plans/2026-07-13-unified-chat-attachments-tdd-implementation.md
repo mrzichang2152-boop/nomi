@@ -1041,19 +1041,19 @@ git commit -m "feat: reconcile attachment history across chat surfaces"
 - Create: `runtime_api/tests/test_attachment_security.py`
 - Create: `runtime_api/tests/test_attachment_trace.py`
 
-- [ ] **Step 1: Write failing memory provenance tests**
+- [x] **Step 1: Write failing memory provenance tests**
 
 Verify upload/parse does not directly create long-term memory; a normal 15-round batch may create a durable fact; every fact derived from an attachment contains `attachment_id`, `turn_id`, locator, and processing version; reprocessing does not silently rewrite old provenance.
 
-- [ ] **Step 2: Write failing security and privacy tests**
+- [x] **Step 2: Write failing security and privacy tests**
 
 Test prompt injection, path traversal, malicious Markdown HTML, unauthorized preview/content, logs/traces without content/base64/absolute paths/API keys, safe error messages, parser timeout isolation, and no tool route caused only by document instructions.
 
-- [ ] **Step 3: Write failing trace tests**
+- [x] **Step 3: Write failing trace tests**
 
 Assert upload/hash/store/parse/chunk/embed/retrieve/render timings; selected/excluded locators; visual count; upstream first chunk, formal first character, total latency; request/client/turn IDs; retry count; and no raw private content.
 
-- [ ] **Step 4: Run RED tests**
+- [x] **Step 4: Run RED tests**
 
 ```bash
 python3 -m pytest -q \
@@ -1064,15 +1064,15 @@ python3 -m pytest -q \
 
 Expected: FAIL because provenance/trace integration is incomplete.
 
-- [ ] **Step 5: Implement provenance and trace integration**
+- [x] **Step 5: Implement provenance and trace integration**
 
 Add attachment provenance to existing 15-round memory batch inputs only when a selected durable fact depends on it. Emit IDs, types, counts, locators, hashes, versions, statuses, timing, and exclusion reasons; never emit extracted text, original filenames when unnecessary, base64, credentials, or paths.
 
-- [ ] **Step 6: Run GREEN tests**
+- [x] **Step 6: Run GREEN tests**
 
 Run Task 15 command. Expected: PASS; privacy scan finds no forbidden material.
 
-- [ ] **Step 7: Commit Task 15**
+- [x] **Step 7: Commit Task 15**
 
 ```bash
 git add runtime_api/app/attachments/trace.py \
@@ -1095,7 +1095,7 @@ git commit -m "feat: trace attachment evidence and memory provenance"
 
 - [ ] **Step 1: Write failing deployment contract tests**
 
-Assert non-root worker, LibreOffice present only where needed, attachment root outside static/source directories, shared named volume, concurrency settings, no nginx volume exposure, health checks, and 2-core/4GB-safe resource ceilings.
+Assert non-root worker, LibreOffice present only where needed, attachment root outside static/source directories, shared named volume, concurrency settings, no nginx volume exposure, health checks, and 4-core/8GB production resource ceilings. A 2-core/4GB host may be documented as a non-acceptance compatibility profile, but tests must not remove core capabilities to fit it.
 
 - [ ] **Step 2: Write failing backend E2E tests**
 
@@ -1206,6 +1206,95 @@ git add docs/superpowers/reports/2026-07-13-unified-chat-attachments-real-device
 git commit -m "test: verify chat attachments on cloud and android"
 ```
 
+## Task 18: Nomi Built-In Direct File Viewer
+
+**Files:**
+- Create: `runtime_api/file_viewer/package.json`
+- Create: `runtime_api/file_viewer/package-lock.json`
+- Create: `runtime_api/file_viewer/build-assets.mjs`
+- Create: `runtime_api/app/static/file-viewer-links.js`
+- Create: `runtime_api/app/static/viewer.html`
+- Create: `runtime_api/app/static/viewer.css`
+- Create: `runtime_api/app/static/viewer.js`
+- Create: `runtime_api/tests/test_static_file_viewer.py`
+- Create: `runtime_api/tests_js/file_viewer_links.test.cjs`
+- Create: `android_app/app/src/main/java/com/par/assistant/android/FileViewerUrls.java`
+- Create: `android_app/app/src/main/java/com/par/assistant/android/NomiFileViewerActivity.java`
+- Create: `android_app/app/src/test/java/com/par/assistant/android/FileViewerUrlsTest.java`
+- Create: `android_app/app/src/test/java/com/par/assistant/android/NomiFileViewerContractTest.java`
+- Modify: `runtime_api/Dockerfile`
+- Modify: `runtime_api/app/main.py`
+- Modify: `runtime_api/app/static/index.html`
+- Modify: `runtime_api/app/static/app.js`
+- Modify: `android_app/app/src/main/AndroidManifest.xml`
+- Modify: `android_app/app/src/main/java/com/par/assistant/android/FloatingBallService.java`
+- Modify: `android_app/app/src/main/java/com/par/assistant/android/WebWorkspaceActivity.java`
+- Modify: existing static and Android contract tests that require external download/open behavior
+
+- [x] **Step 1: Write failing source and viewer URL tests**
+
+Test that only the two approved relative API forms are accepted, UUID/artifact IDs are canonicalized, query values are encoded, external/protocol-relative/traversal/arbitrary API paths are rejected, and passwords never appear in the viewer URL.
+
+- [x] **Step 2: Write failing Web/API deployment tests**
+
+Assert `/viewer` exists; HTML loads only self-hosted assets; JS fetches the original with `X-Par-Password`, constructs a `File`, mounts Flyfish, destroys it on unload, exposes Chinese loading/error/retry states, and never converts to PDF or calls a CDN. Assert Docker pins `@file-viewer/web-full@2.1.29` and copies only the six approved renderer groups and four vendor groups.
+
+- [x] **Step 3: Write failing Android contract tests**
+
+Assert `NomiFileViewerActivity` is registered, uses `adjustResize`, exposes password/close bridges only to the trusted origin, blocks external navigation, restores the floating service on close, and accepts both attachment and artifact source URLs. Assert default artifact/attachment clicks no longer use `Intent.ACTION_VIEW` or `ArtifactOpenActivity`.
+
+- [x] **Step 4: Run RED tests**
+
+```bash
+python3 -m pytest -q runtime_api/tests/test_static_file_viewer.py runtime_api/tests/test_static_workbench_agenda_tab.py -k 'viewer or artifact'
+node --test runtime_api/tests_js/file_viewer_links.test.cjs
+gradle -p android_app :app:testDebugUnitTest --tests '*FileViewer*' --tests '*FloatingPanelAppEntryContractTest*'
+```
+
+Expected: failures identify every missing viewer route, asset, URL helper, Android Activity, bridge, and click integration. No production implementation is written before these failures are observed.
+
+- [x] **Step 5: Implement the self-hosted viewer asset build**
+
+Pin the exact Flyfish package and generate a reproducible npm lock. The asset script copies only `flyfish-file-viewer-web-full.iife.js`, image/pdf/word/presentation/spreadsheet/text renderers, and docx/pdf/pptx/xlsx vendor assets into `/static/vendor/file-viewer`. Docker performs this at image build time; generated vendor files are not committed.
+
+- [x] **Step 6: Implement the authenticated viewer page**
+
+Add `/viewer`, strict CSP, source allowlisting, Blob-to-File handoff, Flyfish lifecycle cleanup, and deterministic loading/error/retry/close UI. Run Step 4 Web tests to GREEN, then inspect actual renderer network requests to confirm all assets stay same-origin.
+
+- [x] **Step 7: Replace Web download-first interactions**
+
+Attachment cards and generated artifact links open the internal viewer. Preserve a separately named download action only where explicitly offered; viewing must never imply downloading. Fix the attachment size helper so it is a normal callable declaration.
+
+- [x] **Step 8: Implement Android internal viewing**
+
+Add the URL helper and dedicated Activity/WebView. Wire WebWorkspace bridge, floating generated-artifact cards, floating historical attachment cards, system back, viewer close, and floating-ball restoration. Remove the external-viewer default path and its manifest registration after references reach zero.
+
+- [x] **Step 9: Run GREEN and regression suites**
+
+```bash
+python3 -m pytest -q runtime_api/tests/test_static_file_viewer.py runtime_api/tests/test_static_chat_attachments.py runtime_api/tests/test_static_workbench_agenda_tab.py
+node --test runtime_api/tests_js/file_viewer_links.test.cjs runtime_api/tests_js/chat_attachments.test.cjs
+gradle -p android_app clean testDebugUnitTest assembleDebug
+docker compose config --quiet
+docker compose build runtime-api
+git diff --check
+```
+
+Review actual outputs: viewer URLs, auth headers, error text, rendered filenames, page/slide/sheet navigation, close behavior, and absence of external viewer intents. A green status without correct content does not pass.
+
+- [ ] **Step 10: Deploy and run cloud/real-device format acceptance**
+
+Use the existing real-file matrix on the private cloud and Android device. Verify every V1 format, content fidelity, sheet/slide/page navigation, repeated open/close, rotation, offline/error states, Web/full App/floating consistency, no CDN calls, and no WPS/Xiaomi/system chooser. Record screenshots, source IDs, actual facts inspected, timing, memory/restart observations, and every residual gap.
+
+**2026-07-15 执行记录：** 查看器代码已部署至私有云，云端真实 PNG、PDF、DOCX、PPTX、
+XLSX 原件均完成上传、解析和原件读取；本地移动端 Chromium 已逐一直接渲染五种格式。
+Android 真机已从真实聊天产物卡打开 PPTX、滚动查看多张幻灯片、关闭返回完整 App，且未
+出现系统文件选择器或小米文档查看器。Step 10 暂不勾选，因为 CSV/TXT/MD、旋转、离线错误、
+十次连续打开以及其余格式的真机 UI 矩阵尚未全部执行。最终 fresh Docker 构建也已通过；
+镜像核对为六个 renderer、四个格式 vendor 加 libarchive 共享 runtime，不含 EPUB 或
+`node_modules`。后端全量为 `1094 passed`，Web/JS 为 `11 passed`，Android clean build
+成功。
+
 ---
 
 ## Specification Coverage Matrix
@@ -1230,7 +1319,7 @@ git commit -m "test: verify chat attachments on cloud and android"
 | Error/retry behavior | 4, 6, 8, 11, 13 | Failure injection without duplicates |
 | Security | 2, 10, 15, 16 | Hostile fixtures, prompt injection, auth/path tests |
 | Observability | 15, 17 | Privacy-safe trace with evidence and latency |
-| 2-core/4GB performance | 4, 16, 17 | Resource metrics and P95 measurements |
+| 4-core/8GB performance | 4, 16, 17 | Resource metrics and P95 measurements without removing core capabilities |
 | Real output correctness | 5, 9, 17 | Known facts, citations, screenshots, and trace IDs |
 
 ## Definition of Done
@@ -1244,7 +1333,7 @@ git commit -m "test: verify chat attachments on cloud and android"
 - [ ] Local/server history and both Android surfaces converge without filename-based guesses.
 - [ ] Upload, parse, model, network, and restart failures do not duplicate files or turns.
 - [ ] Security and privacy scans show no base64, secrets, raw private content, or absolute paths in durable stores or traces.
-- [ ] Cloud load on the target 2-core/4GB profile meets health and latency targets or the gap report states the measured residual limitation.
+- [ ] Cloud load on the target 4-core/8GB production profile meets health and latency targets without disabling core parsing, browser collection, or background processing; otherwise the gap report states the measured residual limitation.
 - [ ] Real-device report contains actual outputs and verdicts for every acceptance case.
 - [ ] Gap report explicitly lists every skipped, mocked-only, provider-blocked, performance-missed, or partially implemented item.
 

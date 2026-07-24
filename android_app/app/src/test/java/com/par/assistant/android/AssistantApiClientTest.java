@@ -9,6 +9,9 @@ import org.junit.After;
 import org.junit.Before;
 import org.junit.Test;
 
+import java.util.Arrays;
+import java.util.List;
+
 import okhttp3.mockwebserver.MockResponse;
 import okhttp3.mockwebserver.MockWebServer;
 import okhttp3.mockwebserver.RecordedRequest;
@@ -38,8 +41,18 @@ public final class AssistantApiClientTest {
                         .setBody("{"
                                 + "\"conversation_id\":\"11111111-1111-1111-1111-111111111111\","
                                 + "\"messages\":["
-                                + "{\"role\":\"user\",\"content\":\"需要\"},"
-                                + "{\"role\":\"assistant\",\"content\":\"好的，我会继续核对成本与利润率。\"}"
+                                + "{"
+                                + "\"id\":\"22222222-2222-2222-2222-222222222222\","
+                                + "\"created_at\":\"2026-05-29T08:00:00+00:00\","
+                                + "\"role\":\"user\","
+                                + "\"content\":\"需要\""
+                                + "},"
+                                + "{"
+                                + "\"id\":\"44444444-4444-4444-4444-444444444444\","
+                                + "\"created_at\":\"2026-05-29T08:00:05+00:00\","
+                                + "\"role\":\"assistant\","
+                                + "\"content\":\"好的，我会继续核对成本与利润率。\""
+                                + "}"
                                 + "]"
                                 + "}")
         );
@@ -52,8 +65,12 @@ public final class AssistantApiClientTest {
         assertEquals("secret", request.getHeader("x-par-password"));
         assertEquals("11111111-1111-1111-1111-111111111111", result.conversationId);
         assertEquals(2, result.messages.size());
+        assertEquals("22222222-2222-2222-2222-222222222222", result.messages.get(0).id);
+        assertEquals("2026-05-29T08:00:00+00:00", result.messages.get(0).createdAt);
         assertEquals("user", result.messages.get(0).role);
         assertEquals("需要", result.messages.get(0).content);
+        assertEquals("44444444-4444-4444-4444-444444444444", result.messages.get(1).id);
+        assertEquals("2026-05-29T08:00:05+00:00", result.messages.get(1).createdAt);
         assertEquals("assistant", result.messages.get(1).role);
         assertEquals("好的，我会继续核对成本与利润率。", result.messages.get(1).content);
     }
@@ -114,6 +131,166 @@ public final class AssistantApiClientTest {
         assertTrue(requestBody.contains("\"conversation_id\":\"conv-1\""));
         assertEquals("pong", result.answer);
         assertEquals("conv-1", result.conversationId);
+    }
+
+    @Test
+    public void chatParsesArtifactCardsFromResponse() throws Exception {
+        server.enqueue(
+                new MockResponse()
+                        .setResponseCode(200)
+                        .setHeader("content-type", "application/json")
+                        .setBody("{"
+                                + "\"answer\":\"PPT 已生成，可以下载。\","
+                                + "\"conversation_id\":\"conv-artifact\","
+                                + "\"artifacts\":[{"
+                                + "\"artifact_id\":\"artifact_1\","
+                                + "\"task_run_id\":\"lta_1\","
+                                + "\"artifact_type\":\"pptx\","
+                                + "\"filename\":\"普通人也能理解_LLM.pptx\","
+                                + "\"mime_type\":\"application/vnd.openxmlformats-officedocument.presentationml.presentation\","
+                                + "\"download_url\":\"/api/artifacts/artifact_1/download\","
+                                + "\"verification_status\":\"verified\""
+                                + "}]"
+                                + "}")
+        );
+        AssistantApiClient client = new AssistantApiClient(ServerConfig.create(server.url("/").toString(), "secret"));
+
+        ChatResult result = client.chat("做一个 PPT", "conv-artifact", java.util.List.of(), "android-artifact-1");
+
+        assertEquals("PPT 已生成，可以下载。", result.answer);
+        assertEquals("conv-artifact", result.conversationId);
+        assertEquals(1, result.artifacts.size());
+        ChatArtifact artifact = result.artifacts.get(0);
+        assertEquals("artifact_1", artifact.artifactId);
+        assertEquals("lta_1", artifact.taskRunId);
+        assertEquals("pptx", artifact.artifactType);
+        assertEquals("普通人也能理解_LLM.pptx", artifact.filename);
+        assertEquals("/api/artifacts/artifact_1/download", artifact.downloadUrl);
+        assertEquals("verified", artifact.verificationStatus);
+        assertEquals("PPTX · 已校验", artifact.statusLine());
+    }
+
+    @Test
+    public void chatParsesArtifactCardsFromNestedTaskResponse() throws Exception {
+        server.enqueue(
+                new MockResponse()
+                        .setResponseCode(200)
+                        .setHeader("content-type", "application/json")
+                        .setBody("{"
+                                + "\"answer\":\"已生成 PPT 文件：LLM工作原理.pptx\","
+                                + "\"conversation_id\":\"conv-artifact\","
+                                + "\"task\":{"
+                                + "\"task_run_id\":\"task_1\","
+                                + "\"status\":\"completed\","
+                                + "\"artifacts\":[{"
+                                + "\"artifact_id\":\"artifact_nested\","
+                                + "\"task_run_id\":\"task_1\","
+                                + "\"artifact_type\":\"pptx\","
+                                + "\"filename\":\"LLM工作原理.pptx\","
+                                + "\"mime_type\":\"application/vnd.openxmlformats-officedocument.presentationml.presentation\","
+                                + "\"download_url\":\"http://testserver/api/artifacts/artifact_nested/download\","
+                                + "\"verification_status\":\"verified\""
+                                + "}]"
+                                + "}"
+                                + "}")
+        );
+        AssistantApiClient client = new AssistantApiClient(ServerConfig.create(server.url("/").toString(), "secret"));
+
+        ChatResult result = client.chat("帮我做一个 PPT", "conv-artifact", java.util.List.of(), "android-artifact-nested");
+
+        assertEquals("已生成 PPT 文件：LLM工作原理.pptx", result.answer);
+        assertEquals(1, result.artifacts.size());
+        ChatArtifact artifact = result.artifacts.get(0);
+        assertEquals("artifact_nested", artifact.artifactId);
+        assertEquals("task_1", artifact.taskRunId);
+        assertEquals("LLM工作原理.pptx", artifact.filename);
+        assertEquals("http://testserver/api/artifacts/artifact_nested/download", artifact.downloadUrl);
+        assertEquals("PPTX · 已校验", artifact.statusLine());
+    }
+
+    @Test
+    public void chatParsesTaskRunIdFromNestedTaskWhenArtifactIsGeneratedLater() throws Exception {
+        server.enqueue(
+                new MockResponse()
+                        .setResponseCode(200)
+                        .setHeader("content-type", "application/json")
+                        .setBody("{"
+                                + "\"answer\":\"我已把 PPT 任务交给 OpenCode 处理。\","
+                                + "\"conversation_id\":\"conv-later-artifact\","
+                                + "\"task\":{"
+                                + "\"task_run_id\":\"lta_async_1\","
+                                + "\"status\":\"running\""
+                                + "}"
+                                + "}")
+        );
+        AssistantApiClient client = new AssistantApiClient(ServerConfig.create(server.url("/").toString(), "secret"));
+
+        ChatResult result = client.chat("帮我生成 PPT", "conv-later-artifact", java.util.List.of(), "android-later-artifact");
+
+        assertEquals("我已把 PPT 任务交给 OpenCode 处理。", result.answer);
+        assertEquals("conv-later-artifact", result.conversationId);
+        assertEquals("lta_async_1", result.taskRunId);
+        assertEquals(0, result.artifacts.size());
+    }
+
+    @Test
+    public void chatDoesNotPollArtifactsForClarificationTask() throws Exception {
+        server.enqueue(
+                new MockResponse()
+                        .setResponseCode(200)
+                        .setHeader("content-type", "application/json")
+                        .setBody("{"
+                                + "\"answer\":\"可以。我先确认两点：讲给谁？偏科普还是技术？\","
+                                + "\"conversation_id\":\"conv-clarify\","
+                                + "\"task\":{"
+                                + "\"task_run_id\":\"lta_clarify_1\","
+                                + "\"status\":\"waiting_user\","
+                                + "\"current_node\":\"waiting_for_human_input\","
+                                + "\"clarification\":{\"missing_fields\":[\"audience\",\"depth\"]}"
+                                + "}"
+                                + "}")
+        );
+        AssistantApiClient client = new AssistantApiClient(ServerConfig.create(server.url("/").toString(), "secret"));
+
+        ChatResult result = client.chat("帮我做一个 PPT", "conv-clarify", java.util.List.of(), "android-clarify");
+
+        assertEquals("可以。我先确认两点：讲给谁？偏科普还是技术？", result.answer);
+        assertEquals("conv-clarify", result.conversationId);
+        assertEquals("", result.taskRunId);
+        assertEquals(0, result.artifacts.size());
+    }
+
+    @Test
+    public void taskArtifactsFetchesVerifiedArtifactsForAsyncLongTailTask() throws Exception {
+        server.enqueue(
+                new MockResponse()
+                        .setResponseCode(200)
+                        .setHeader("content-type", "application/json")
+                        .setBody("{"
+                                + "\"task_run_id\":\"lta_async_1\","
+                                + "\"artifacts\":[{"
+                                + "\"artifact_id\":\"artifact_async\","
+                                + "\"task_run_id\":\"lta_async_1\","
+                                + "\"artifact_type\":\"pptx\","
+                                + "\"filename\":\"RAG_for_small_business.pptx\","
+                                + "\"download_url\":\"/api/artifacts/artifact_async/download\","
+                                + "\"verification_status\":\"verified\""
+                                + "}]"
+                                + "}")
+        );
+        AssistantApiClient client = new AssistantApiClient(ServerConfig.create(server.url("/").toString(), "secret"));
+
+        java.util.List<ChatArtifact> artifacts = client.taskArtifacts("lta_async_1");
+
+        RecordedRequest request = server.takeRequest();
+        assertEquals("/api/tasks/lta_async_1/artifacts", request.getPath());
+        assertEquals("secret", request.getHeader("x-par-password"));
+        assertEquals(1, artifacts.size());
+        ChatArtifact artifact = artifacts.get(0);
+        assertEquals("artifact_async", artifact.artifactId);
+        assertEquals("lta_async_1", artifact.taskRunId);
+        assertEquals("RAG_for_small_business.pptx", artifact.filename);
+        assertEquals("PPTX · 已校验", artifact.statusLine());
     }
 
     @Test
@@ -304,6 +481,87 @@ public final class AssistantApiClientTest {
     }
 
     @Test
+    public void assistantIdentitiesParseProviderLifecycleCapabilitiesAndRedactedSecretState() throws Exception {
+        server.enqueue(
+                new MockResponse()
+                        .setResponseCode(200)
+                        .setHeader("content-type", "application/json")
+                        .setBody("{"
+                                + "\"count\":1,"
+                                + "\"identities\":[{"
+                                + "\"identity_id\":\"nomi_gmail_primary\","
+                                + "\"kind\":\"assistant_gmail\","
+                                + "\"display_name\":\"Nomi\","
+                                + "\"address\":\"nomi.assistant@gmail.com\","
+                                + "\"provider\":\"composio_gmail\","
+                                + "\"capabilities\":[\"receive\",\"draft\",\"send\"],"
+                                + "\"status\":\"degraded\","
+                                + "\"version\":7,"
+                                + "\"last_verified_at\":\"2026-07-22T06:00:00Z\","
+                                + "\"last_error_code\":\"gmail_inbound_stale\","
+                                + "\"secret_presence\":{\"stored\":true}"
+                                + "}]}" )
+        );
+        AssistantApiClient client = new AssistantApiClient(ServerConfig.create(server.url("/").toString(), "secret"));
+
+        AssistantIdentity identity = client.assistantIdentities().get(0);
+
+        assertEquals("composio_gmail", identity.provider);
+        assertEquals(java.util.List.of("receive", "draft", "send"), identity.capabilities);
+        assertEquals(7L, identity.version);
+        assertEquals("2026-07-22T06:00:00Z", identity.lastVerifiedAt);
+        assertEquals("gmail_inbound_stale", identity.lastErrorCode);
+        assertTrue(identity.secretStored);
+        assertEquals("Nomi Gmail · nomi.assistant@gmail.com · 连接异常", identity.subtitle());
+    }
+
+    @Test
+    public void assistantGmailConnectLinkUsesDedicatedIdentityEndpoint() throws Exception {
+        server.enqueue(
+                new MockResponse()
+                        .setResponseCode(200)
+                        .setHeader("content-type", "application/json")
+                        .setBody("{"
+                                + "\"status\":\"authorization_pending\","
+                                + "\"identity_id\":\"nomi_gmail_primary\","
+                                + "\"redirect_url\":\"https://connect.composio.dev/link/nomi-gmail\","
+                                + "\"version\":3"
+                                + "}")
+        );
+        AssistantApiClient client = new AssistantApiClient(ServerConfig.create(server.url("/").toString(), "secret"));
+
+        String redirectUrl = client.assistantGmailConnectUrl();
+
+        RecordedRequest request = server.takeRequest();
+        assertEquals("/api/assistant-identities/nomi_gmail_primary/connect-link", request.getPath());
+        assertEquals("secret", request.getHeader("x-par-password"));
+        assertEquals("https://connect.composio.dev/link/nomi-gmail", redirectUrl);
+    }
+
+    @Test
+    public void assistantIdentityLifecycleActionsUseExplicitEndpoints() throws Exception {
+        for (int index = 0; index < 4; index++) {
+            server.enqueue(
+                    new MockResponse()
+                            .setResponseCode(200)
+                            .setHeader("content-type", "application/json")
+                            .setBody("{\"status\":\"ok\"}")
+            );
+        }
+        AssistantApiClient client = new AssistantApiClient(ServerConfig.create(server.url("/").toString(), "secret"));
+
+        client.verifyAssistantIdentity("nomi_gmail_primary");
+        client.disableAssistantIdentity("nomi_gmail_primary");
+        client.enableAssistantIdentity("nomi_gmail_primary");
+        client.disconnectAssistantIdentity("nomi_gmail_primary");
+
+        assertEquals("/api/assistant-identities/nomi_gmail_primary/verify", server.takeRequest().getPath());
+        assertEquals("/api/assistant-identities/nomi_gmail_primary/disable", server.takeRequest().getPath());
+        assertEquals("/api/assistant-identities/nomi_gmail_primary/enable", server.takeRequest().getPath());
+        assertEquals("/api/assistant-identities/nomi_gmail_primary/disconnect", server.takeRequest().getPath());
+    }
+
+    @Test
     public void createAssistantDraftPostsConfirmationPayload() throws Exception {
         server.enqueue(
                 new MockResponse()
@@ -334,7 +592,10 @@ public final class AssistantApiClientTest {
         assertEquals("secret", request.getHeader("x-par-password"));
         assertTrue(request.getBody().readUtf8().contains("\"identity_id\":\"nomi_gmail_primary\""));
         assertEquals("draft-1", draft.draftId);
-        assertEquals("将使用：Nomi Gmail\n收件人：alice@example.com\n主题：报价\n\n我是 Nomi。\n\n发送 / 编辑 / 取消", draft.cardText());
+        assertEquals(
+                "将使用：Nomi Gmail\n状态：待确认\n收件人：alice@example.com\n主题：报价\n\n我是 Nomi。\n\n依据：0 条\n\n发送 / 编辑 / 取消",
+                draft.cardText()
+        );
     }
 
     @Test
@@ -370,6 +631,126 @@ public final class AssistantApiClientTest {
         assertTrue(draft.cardText().contains("将使用：Nomi Phone"));
         assertTrue(draft.cardText().contains("电话只会播放这段语音，不会实时对话"));
         assertTrue(draft.cardText().contains("拨打 / 编辑 / 取消"));
+    }
+
+    @Test
+    public void assistantDraftsReadServerBackedIdentityStateAndStableDraftId() throws Exception {
+        server.enqueue(
+                new MockResponse()
+                        .setResponseCode(200)
+                        .setHeader("content-type", "application/json")
+                        .setBody("{"
+                                + "\"count\":1,"
+                                + "\"items\":[{"
+                                + "\"draft_id\":\"draft-shared-1\","
+                                + "\"identity_id\":\"nomi_gmail_primary\","
+                                + "\"channel\":\"gmail\","
+                                + "\"recipient\":\"alice@example.com\","
+                                + "\"subject\":\"会议确认\","
+                                + "\"body_text\":\"周五下午三点见。\","
+                                + "\"status\":\"draft\","
+                                + "\"confirmation_required\":true,"
+                                + "\"updated_at\":\"2026-07-22T10:00:00Z\""
+                                + "}]}" )
+        );
+        AssistantApiClient client = new AssistantApiClient(ServerConfig.create(server.url("/").toString(), "secret"));
+
+        List<AssistantDraft> drafts = client.assistantDrafts(20);
+
+        RecordedRequest request = server.takeRequest();
+        assertEquals("/api/assistant-outbound/drafts?limit=20", request.getPath());
+        assertEquals("secret", request.getHeader("x-par-password"));
+        assertEquals(1, drafts.size());
+        AssistantDraft draft = drafts.get(0);
+        assertEquals("draft-shared-1", draft.draftId);
+        assertEquals("nomi_gmail_primary", draft.identityId);
+        assertEquals("draft", draft.status);
+        assertTrue(draft.confirmationRequired);
+        assertEquals("2026-07-22T10:00:00Z", draft.updatedAt);
+    }
+
+    @Test
+    public void assistantDraftConfirmationAndSendUseTheSameServerDraftId() throws Exception {
+        server.enqueue(
+                new MockResponse()
+                        .setResponseCode(200)
+                        .setHeader("content-type", "application/json")
+                        .setBody("{\"confirmation_token\":\"confirm-one-use\"}")
+        );
+        server.enqueue(
+                new MockResponse()
+                        .setResponseCode(200)
+                        .setHeader("content-type", "application/json")
+                        .setBody("{\"draft_id\":\"draft-shared-1\",\"status\":\"sent\"}")
+        );
+        AssistantApiClient client = new AssistantApiClient(ServerConfig.create(server.url("/").toString(), "secret"));
+
+        String confirmationToken = client.confirmAssistantDraft("draft-shared-1");
+        AssistantDraft sent = client.sendAssistantDraft("draft-shared-1", confirmationToken);
+
+        RecordedRequest confirmRequest = server.takeRequest();
+        RecordedRequest sendRequest = server.takeRequest();
+        assertEquals("/api/assistant-outbound/drafts/draft-shared-1/confirm", confirmRequest.getPath());
+        assertEquals("/api/assistant-outbound/drafts/draft-shared-1/send", sendRequest.getPath());
+        assertTrue(sendRequest.getBody().readUtf8().contains("\"confirmation_token\":\"confirm-one-use\""));
+        assertEquals("draft-shared-1", sent.draftId);
+        assertEquals("sent", sent.status);
+    }
+
+    @Test
+    public void assistantDraftsParseEvidenceAndEditTheSameServerDraftId() throws Exception {
+        server.enqueue(
+                new MockResponse()
+                        .setResponseCode(200)
+                        .setHeader("content-type", "application/json")
+                        .setBody("{"
+                                + "\"count\":1,"
+                                + "\"items\":[{"
+                                + "\"draft_id\":\"draft-edit-1\","
+                                + "\"identity_id\":\"nomi_gmail_primary\","
+                                + "\"channel\":\"gmail\","
+                                + "\"recipient\":\"alice@example.com\","
+                                + "\"subject\":\"旧主题\","
+                                + "\"body_text\":\"旧正文\","
+                                + "\"status\":\"draft\","
+                                + "\"confirmation_required\":true,"
+                                + "\"source_evidence_ids\":[\"evt-1\",\"evt-2\"]"
+                                + "}]}" )
+        );
+        server.enqueue(
+                new MockResponse()
+                        .setResponseCode(200)
+                        .setHeader("content-type", "application/json")
+                        .setBody("{"
+                                + "\"draft_id\":\"draft-edit-1\","
+                                + "\"identity_id\":\"nomi_gmail_primary\","
+                                + "\"channel\":\"gmail\","
+                                + "\"recipient\":\"alice@example.com\","
+                                + "\"subject\":\"新主题\","
+                                + "\"body_text\":\"新正文\","
+                                + "\"status\":\"draft\","
+                                + "\"confirmation_required\":true,"
+                                + "\"source_evidence_ids\":[\"evt-1\",\"evt-2\"]"
+                                + "}")
+        );
+        AssistantApiClient client = new AssistantApiClient(ServerConfig.create(server.url("/").toString(), "secret"));
+
+        AssistantDraft original = client.assistantDrafts(20).get(0);
+        AssistantDraft edited = client.editAssistantDraft("draft-edit-1", "新主题", "新正文");
+
+        RecordedRequest listRequest = server.takeRequest();
+        RecordedRequest editRequest = server.takeRequest();
+        assertEquals("/api/assistant-outbound/drafts?limit=20", listRequest.getPath());
+        assertEquals(Arrays.asList("evt-1", "evt-2"), original.sourceEvidenceIds);
+        assertEquals("PATCH", editRequest.getMethod());
+        assertEquals("/api/assistant-outbound/drafts/draft-edit-1", editRequest.getPath());
+        String editBody = editRequest.getBody().readUtf8();
+        assertTrue(editBody.contains("\"subject\":\"新主题\""));
+        assertTrue(editBody.contains("\"body_text\":\"新正文\""));
+        assertEquals("draft-edit-1", edited.draftId);
+        assertEquals("新主题", edited.subject);
+        assertEquals("新正文", edited.bodyText);
+        assertEquals(Arrays.asList("evt-1", "evt-2"), edited.sourceEvidenceIds);
     }
 
     @Test

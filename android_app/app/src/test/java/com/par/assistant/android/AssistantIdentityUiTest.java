@@ -3,6 +3,8 @@ package com.par.assistant.android;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
 
+import java.util.Arrays;
+
 import org.junit.Test;
 
 public final class AssistantIdentityUiTest {
@@ -68,5 +70,83 @@ public final class AssistantIdentityUiTest {
         assertTrue(card.contains("收件人：+15551234567"));
         assertTrue(card.contains("电话只会播放这段语音，不会实时对话"));
         assertTrue(card.contains("拨打 / 编辑 / 取消"));
+    }
+
+    @Test
+    public void gmailDraftCardShowsEvidenceCountAndBlockedRetryGuidance() {
+        AssistantDraft draft = new AssistantDraft(
+                "draft-blocked-1",
+                "nomi_gmail_primary",
+                "Nomi Gmail",
+                "gmail",
+                "alice@example.com",
+                "会议确认",
+                "周五下午三点见。",
+                "blocked",
+                false,
+                "2026-07-22T10:00:00Z",
+                Arrays.asList("evt-1", "evt-2")
+        );
+
+        String card = draft.cardText();
+
+        assertTrue(card.contains("依据：2 条"));
+        assertTrue(card.contains("邮件已被策略拦截，请修改后重新确认"));
+        assertTrue(card.contains("编辑 / 取消"));
+        assertTrue(!card.contains("发送 / 编辑 / 取消"));
+    }
+
+    @Test
+    public void terminalDraftCardDoesNotOfferDraftActions() {
+        AssistantDraft draft = new AssistantDraft(
+                "draft-sent-1",
+                "nomi_gmail_primary",
+                "Nomi Gmail",
+                "gmail",
+                "alice@example.com",
+                "会议确认",
+                "周五下午三点见。",
+                "sent",
+                false,
+                "2026-07-22T10:00:00Z"
+        );
+
+        String card = draft.cardText();
+
+        assertTrue(card.contains("状态：已发送"));
+        assertTrue(!card.contains("发送 / 编辑 / 取消"));
+        assertTrue(!card.contains("编辑 / 取消"));
+    }
+
+    @Test
+    public void sendResultMessageReflectsPersistedProviderState() {
+        AssistantDraft unknown = new AssistantDraft(
+                "draft-unknown-1",
+                "nomi_gmail_primary",
+                "Nomi Gmail",
+                "gmail",
+                "alice@example.com",
+                "会议确认",
+                "周五下午三点见。",
+                "delivery_unknown",
+                false,
+                "2026-07-22T10:00:00Z"
+        );
+        AssistantDraft sent = new AssistantDraft(
+                "draft-sent-2",
+                "nomi_gmail_primary",
+                "Nomi Gmail",
+                "gmail",
+                "alice@example.com",
+                "会议确认",
+                "周五下午三点见。",
+                "sent",
+                false,
+                "2026-07-22T10:00:00Z"
+        );
+
+        assertEquals("邮件已发送。", sent.actionResultMessage());
+        assertTrue(unknown.actionResultMessage().contains("送达状态未知"));
+        assertTrue(unknown.actionResultMessage().contains("不会自动重发"));
     }
 }

@@ -1,0 +1,119 @@
+:root {
+  color-scheme: light;
+  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  color: #172033;
+  background: #edf1f4;
+}
+
+* { box-sizing: border-box; }
+
+html,
+body,
+.viewer-shell { width: 100%; height: 100%; margin: 0; overflow: hidden; }
+
+.viewer-shell {
+  position: relative;
+  display: grid;
+  grid-template-rows: 58px minmax(0, 1fr);
+  background: #edf1f4;
+}
+
+.viewer-topbar {
+  z-index: 4;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+  padding: max(8px, env(safe-area-inset-top)) 14px 8px;
+  border-bottom: 1px solid #cbd5df;
+  background: #f9fafb;
+}
+
+.topbar-actions {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 8px;
+}
+
+.icon-button {
+  display: grid;
+  flex: 0 0 40px;
+  width: 40px;
+  height: 40px;
+  place-items: center;
+  border: 1px solid #c7d0da;
+  border-radius: 6px;
+  background: #e7edf2;
+  color: #172033;
+  font-size: 26px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.icon-button:disabled {
+  cursor: default;
+  opacity: 0.42;
+}
+
+.file-heading { min-width: 0; flex: 1 1 auto; display: grid; gap: 2px; }
+.file-heading strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 15px; }
+.file-heading span { color: #64748b; font-size: 12px; }
+
+.viewer-root { min-width: 0; min-height: 0; overflow: hidden; background: #dfe5ea; }
+
+#viewerRoot [part~="toolbar"] {
+  position: absolute;
+  z-index: 8;
+  right: 12px;
+  bottom: 12px;
+  display: flex;
+  max-width: calc(100% - 24px);
+  min-height: 44px;
+  padding: 5px;
+  overflow-x: auto;
+  border: 1px solid #d6dde5;
+  border-radius: 6px;
+  background: rgba(249, 250, 251, 0.96);
+  box-shadow: 0 8px 22px rgba(15, 23, 42, 0.14);
+}
+
+#viewerRoot [part~="toolbar-group"] {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+
+#viewerRoot [part~="button"] {
+  display: inline-grid;
+  min-width: 36px;
+  min-height: 32px;
+  place-items: center;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: #20304a;
+  font: 600 12px/1 system-ui, sans-serif;
+}
+
+.viewer-error {
+  position: absolute;
+  inset: 58px 0 0;
+  display: grid;
+  align-content: center;
+  justify-items: center;
+  gap: 10px;
+  padding: 28px;
+  text-align: center;
+  background: #f4f6f8;
+}
+
+.viewer-error[hidden] { display: none; }
+.viewer-error p { max-width: 560px; margin: 0; color: #64748b; line-height: 1.55; }
+.viewer-error button { min-height: 42px; padding: 0 18px; border: 0; border-radius: 6px; background: #087f72; color: #fff; font: inherit; cursor: pointer; }
+
+@media (max-width: 600px) {
+  .viewer-shell { grid-template-rows: 54px minmax(0, 1fr); }
+  .viewer-topbar { padding-inline: 10px; }
+  .viewer-error { inset-block-start: 54px; }
+}

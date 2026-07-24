@@ -22,6 +22,11 @@ final class ComposioCallbackPayload {
         return label + " 授权已完成，正在刷新账号状态。";
     }
 
+    static String assistantIdentityId(String rawIdentityId) {
+        String identityId = clean(rawIdentityId);
+        return "nomi_gmail_primary".equals(identityId) ? identityId : "";
+    }
+
     private static String toolkitLabel(String toolkitSlug) {
         String slug = clean(toolkitSlug).toLowerCase();
         switch (slug) {

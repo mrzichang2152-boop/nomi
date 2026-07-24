@@ -9,8 +9,8 @@ import android.os.Looper;
 import org.json.JSONArray;
 import org.json.JSONObject;
 
+import java.util.ArrayList;
 import java.util.List;
-
 
 import okhttp3.OkHttpClient;
 import okhttp3.Request;
@@ -27,6 +27,14 @@ final class RealtimeClient {
         }
 
         default void onChatDone(String answer, String conversationId) {
+        }
+
+        default void onChatDone(String answer, String conversationId, List<ChatArtifact> artifacts) {
+            onChatDone(answer, conversationId);
+        }
+
+        default void onChatDone(String answer, String conversationId, List<ChatArtifact> artifacts, String taskRunId) {
+            onChatDone(answer, conversationId, artifacts);
         }
     }
 
@@ -131,7 +139,7 @@ final class RealtimeClient {
             } else if ("chat_delta".equals(event.type)) {
                 callback.onChatDelta(event.chatDelta);
             } else if ("chat_done".equals(event.type)) {
-                callback.onChatDone(event.chatAnswer, event.conversationId);
+                callback.onChatDone(event.chatAnswer, event.conversationId, event.artifacts, event.taskId);
             } else if ("error".equals(event.type)) {
                 callback.onError(event.chatError.isEmpty() ? "实时通道异常" : event.chatError);
             }
@@ -206,21 +214,71 @@ final class RealtimeClient {
             );
         }
         if ("chat_done".equals(type)) {
+            JSONArray artifactsJson = json.optJSONArray("artifacts");
+            JSONObject taskJson = json.optJSONObject("task");
+            if (artifactsJson == null && taskJson != null) {
+                artifactsJson = taskJson.optJSONArray("artifacts");
+            }
+            String taskRunId = taskRunIdFromPayload(json, taskJson);
+            List<ChatArtifact> artifacts = parseArtifacts(artifactsJson);
+            if (taskRunId.isEmpty() && !artifacts.isEmpty()) {
+                taskRunId = artifacts.get(0).taskRunId;
+            }
             return new ServerEvent(
                     type,
-                    "",
+                    taskRunId,
                     text,
                     null,
                     json.optString("conversation_id"),
                     "",
                     json.optString("answer"),
-                    ""
+                    "",
+                    artifacts
             );
         }
         if ("error".equals(type)) {
             return new ServerEvent(type, "", text, null, "", "", "", json.optString("message"));
         }
         return null;
+    }
+
+    private static List<ChatArtifact> parseArtifacts(JSONArray artifactsJson) {
+        List<ChatArtifact> artifacts = new ArrayList<>();
+        if (artifactsJson == null) return artifacts;
+        for (int index = 0; index < artifactsJson.length(); index++) {
+            JSONObject item = artifactsJson.optJSONObject(index);
+            if (item == null) continue;
+            String artifactId = item.optString("artifact_id", "").trim();
+            String filename = item.optString("filename", "").trim();
+            String downloadUrl = item.optString("download_url", "").trim();
+            if (artifactId.isEmpty() || filename.isEmpty() || downloadUrl.isEmpty()) continue;
+            artifacts.add(
+                    new ChatArtifact(
+                            artifactId,
+                            item.optString("task_run_id", ""),
+                            item.optString("artifact_type", ""),
+                            filename,
+                            item.optString("mime_type", ""),
+                            downloadUrl,
+                            item.optString("verification_status", "")
+                    )
+            );
+        }
+        return artifacts;
+    }
+
+    private static String taskRunIdFromPayload(JSONObject root, JSONObject taskJson) {
+        if (taskJson != null && isWaitingForUserTask(taskJson)) return "";
+        String fromRoot = root == null ? "" : root.optString("task_run_id", root.optString("task_id", "")).trim();
+        if (!fromRoot.isEmpty()) return fromRoot;
+        if (taskJson == null) return "";
+        return taskJson.optString("task_run_id", taskJson.optString("task_id", "")).trim();
+    }
+
+    private static boolean isWaitingForUserTask(JSONObject taskJson) {
+        String status = taskJson.optString("status", "").trim();
+        String currentNode = taskJson.optString("current_node", "").trim();
+        return "waiting_user".equals(status) || "waiting_for_human_input".equals(currentNode);
     }
 
     private String wsUrl() {
@@ -297,6 +355,7 @@ final class RealtimeClient {
         final boolean isFirstDelta;
         final int streamFirstTokenMs;
         final int modelFirstTokenMs;
+        final List<ChatArtifact> artifacts;
 
         ServerEvent(String type, String taskId, String rawJson, ProactiveMessage message) {
             this(type, taskId, rawJson, message, "", "", "", "");
@@ -324,10 +383,56 @@ final class RealtimeClient {
                 String chatDelta,
                 String chatAnswer,
                 String chatError,
+                List<ChatArtifact> artifacts
+        ) {
+            this(type, taskId, rawJson, message, conversationId, chatDelta, chatAnswer, chatError, -1, false, -1, -1, artifacts);
+        }
+
+        ServerEvent(
+                String type,
+                String taskId,
+                String rawJson,
+                ProactiveMessage message,
+                String conversationId,
+                String chatDelta,
+                String chatAnswer,
+                String chatError,
                 int elapsedMs,
                 boolean isFirstDelta,
                 int streamFirstTokenMs,
                 int modelFirstTokenMs
+        ) {
+            this(
+                    type,
+                    taskId,
+                    rawJson,
+                    message,
+                    conversationId,
+                    chatDelta,
+                    chatAnswer,
+                    chatError,
+                    elapsedMs,
+                    isFirstDelta,
+                    streamFirstTokenMs,
+                    modelFirstTokenMs,
+                    List.of()
+            );
+        }
+
+        ServerEvent(
+                String type,
+                String taskId,
+                String rawJson,
+                ProactiveMessage message,
+                String conversationId,
+                String chatDelta,
+                String chatAnswer,
+                String chatError,
+                int elapsedMs,
+                boolean isFirstDelta,
+                int streamFirstTokenMs,
+                int modelFirstTokenMs,
+                List<ChatArtifact> artifacts
         ) {
             this.type = type == null ? "" : type;
             this.taskId = taskId == null ? "" : taskId;
@@ -341,6 +446,7 @@ final class RealtimeClient {
             this.isFirstDelta = isFirstDelta;
             this.streamFirstTokenMs = streamFirstTokenMs;
             this.modelFirstTokenMs = modelFirstTokenMs;
+            this.artifacts = artifacts == null ? List.of() : List.copyOf(artifacts);
         }
     }
 }

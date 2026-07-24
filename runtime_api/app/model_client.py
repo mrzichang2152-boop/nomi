@@ -22,6 +22,7 @@ def qwen_non_thinking_options(model: str) -> dict[str, Any]:
     return {
         "reasoning_effort": "none",
         "enable_thinking": False,
+        "chat_template_kwargs": {"enable_thinking": False},
     }
 
 
@@ -106,6 +107,8 @@ class ChatCompletionClient:
             payload["reasoning_effort"] = reasoning_effort
         if self.enable_thinking is not None:
             payload["enable_thinking"] = bool(self.enable_thinking)
+            if "qwen" in self.model.lower():
+                payload["chat_template_kwargs"] = {"enable_thinking": bool(self.enable_thinking)}
         headers: dict[str, str] = {}
         if self.config.api_key.strip():
             headers["Accept"] = "application/json"

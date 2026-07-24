@@ -19,7 +19,12 @@ class ChatContextRoute:
     needs_memory_rag: bool = False
     needs_timeline: bool = False
     needs_external_tool_state: bool = False
+    needs_web: bool = False
     needs_attachments: bool = False
+    web_mode: str = "quick"
+    web_freshness: str = "none"
+    web_max_queries: int = 1
+    web_max_sources: int = 5
     confidence: float = 1.0
     reason: str = ""
     entities: tuple[dict[str, Any], ...] = ()
@@ -56,7 +61,14 @@ class ChatContextRoute:
                 "agenda": self.needs_agenda,
                 "tasks": self.needs_tasks,
                 "external_tool_state": self.needs_external_tool_state,
+                "web": self.needs_web,
                 "attachments": self.needs_attachments,
+            },
+            "web": {
+                "mode": self.web_mode,
+                "freshness": self.web_freshness,
+                "max_queries": self.web_max_queries,
+                "max_sources": self.web_max_sources,
             },
             "entities": list(self.entities),
             "scope": dict(self.scope),
@@ -92,6 +104,59 @@ JOB_RE = re.compile(
     r"\bjobs?\b|\bjob opportunities?\b|\bsuitable jobs?\b|\bresume\b|\bCV\b|\bcareer\b|\bpositions?\b|\bapply\b|\bsubmit application\b)",
     re.IGNORECASE,
 )
+WEB_EXPLICIT_RE = re.compile(
+    r"(搜索一下|搜一下|帮我搜索|帮我搜|网上查|上网查|联网查|查一下最新|查查最新|"
+    r"web\s*search|search\s+the\s+web|look\s+up)",
+    re.IGNORECASE,
+)
+WEB_CURRENT_FACT_RE = re.compile(
+    r"(当前最新|现在最新|最新版本|最新发布|最近发布|今日|今天的新闻|实时|截至目前|"
+    r"current\s+latest|latest\s+(?:version|release|news)|as\s+of\s+today)",
+    re.IGNORECASE,
+)
+WEB_DYNAMIC_FACT_RE = re.compile(
+    r"(天气|气温|降雨|降水|空气质量|空气污染|AQI|汇率|外汇|股价|股票指数|上证指数|深证成指|"
+    r"航班状态|航班动态|列车状态|列车动态|路况|交通拥堵|比赛比分|比赛结果|赛果|油价|金价|"
+    r"weather|temperature|forecast|air\s+quality|exchange\s+rate|stock\s+price|market\s+index|"
+    r"flight\s+status|train\s+status|traffic|match\s+score|game\s+score|oil\s+price|gold\s+price)",
+    re.IGNORECASE,
+)
+WEB_TIME_SENSITIVE_TOPIC_RE = re.compile(
+    r"(新闻|热点|政策|法规|法律|税率|利率|价格|售价|票价|多少钱|限行|限号|开放时间|营业时间|"
+    r"几点(?:开放|关门|闭馆)|开放吗|营业吗|关门|闭馆|展览|演出|活动|榜单|排名|"
+    r"CEO|首席执行官|现任|负责人|董事长|总裁|任职|总统|总理|首相|部长|市长|州长|议长|"
+    r"news|headline|policy|regulation|law|tax\s+rate|interest\s+rate|price|opening\s+hours|"
+    r"open\s+today|close(?:s|d)?\s+at|exhibition|event|ranking|chief\s+executive|"
+    r"president|prime\s+minister|minister|governor|mayor|speaker|who\s+is\s+the\s+(?:current\s+)?CEO)",
+    re.IGNORECASE,
+)
+AGENDA_SUBJECT_RE = re.compile(
+    r"(日程|安排|会议|开会|要开的会|会面|见面|约会|截止|提醒|取消|"
+    r"meeting|appointment|interview|schedule|calendar|reminder)",
+    re.IGNORECASE,
+)
+WEB_FRESHNESS_RE = re.compile(
+    r"(最新|最近|当前|现在|今日|今天|明天|后天|本周|这周|周末|本月|实时|"
+    r"latest|current|recent|today|tomorrow|this\s+week|this\s+weekend)",
+    re.IGNORECASE,
+)
+WEB_DAY_FRESHNESS_RE = re.compile(
+    r"(当前|现在|今日|今天|明天|后天|今晚|实时|此刻|"
+    r"current|today|tomorrow|tonight|real[ -]?time|right\s+now)",
+    re.IGNORECASE,
+)
+PRIVATE_SELF_CONTEXT_RE = re.compile(
+    r"(我的|我有哪些|我有什么|我收到|我发的|我(?:最近|今天|现在|明天|后天|和|跟|与)|"
+    r"我们(?:的|有哪些|有什么|部门|项目|公司|团队)|咱们(?:的|有哪些|有什么|部门|项目|公司|团队)|"
+    r"刚才|刚刚|之前|上次|对方|王总|客户|同事|朋友|家人|"
+    r"my\s+(?:email|message|schedule|calendar|meeting|contact)|our\s+(?:schedule|meeting))",
+    re.IGNORECASE,
+)
+JOB_DISCOVERY_RE = re.compile(
+    r"(找.*(?:工作|岗位|职位|机会)|工作机会|求职机会|招聘信息|岗位推荐|职位推荐|适合我的.*(?:工作|岗位|职位)|"
+    r"find.*(?:job|position|role)|job\s+opportunit|open\s+role)",
+    re.IGNORECASE,
+)
 IMPLICIT_REFERENCE_RE = re.compile(r"(那件事|后来|刚刚|刚才|这个|那个|她|他|他们|她们|回了吗|回复了吗|还要继续|继续吗)")
 RELATIONSHIP_RE = re.compile(r"(回复|联系|关系|认识|介绍|HR|客户|朋友|同事|recruiter|hiring manager)", re.IGNORECASE)
 FAMILY_RELATION_RE = re.compile(
@@ -118,6 +183,7 @@ VALID_ROUTE_INTENTS = {
     "task_request",
     "relationship_query",
     "job_query",
+    "web_query",
     "source_question",
     "action_confirmation",
 }
@@ -170,6 +236,7 @@ def _route_from_semantic_decision(decision: dict[str, Any]) -> ChatContextRoute 
     normalized_entities = tuple(item for item in entities if isinstance(item, dict))
     scope = decision.get("scope") if isinstance(decision.get("scope"), dict) else {}
     risk = decision.get("risk") if isinstance(decision.get("risk"), dict) else {}
+    web = decision.get("web") if isinstance(decision.get("web"), dict) else {}
     try:
         confidence = float(decision.get("confidence") or 0.0)
     except (TypeError, ValueError):
@@ -188,7 +255,12 @@ def _route_from_semantic_decision(decision: dict[str, Any]) -> ChatContextRoute 
         needs_memory_rag=bool(needs.get("memory_rag", False)),
         needs_timeline=bool(needs.get("timeline", False)),
         needs_external_tool_state=bool(needs.get("external_tool_state", False)),
+        needs_web=bool(needs.get("web", False)),
         needs_attachments=bool(needs.get("attachments", False)),
+        web_mode=str(web.get("mode") or "quick"),
+        web_freshness=str(web.get("freshness") or "none"),
+        web_max_queries=max(1, min(int(web.get("max_queries") or 1), 5)),
+        web_max_sources=max(1, min(int(web.get("max_sources") or 5), 15)),
         confidence=confidence,
         reason=str(decision.get("reason") or "semantic_router"),
         entities=normalized_entities,
@@ -255,6 +327,63 @@ def route_chat_context(
     if SHORT_REPLY_RE.search(text):
         return _finalize_route(text, ui_state, ChatContextRoute(intent="simple_chat", needs_dialogue=True, needs_source=has_ui_source, reason="short_reply"), semantic_router)
 
+    explicit_web_search = bool(WEB_EXPLICIT_RE.search(text))
+    current_public_fact = bool(WEB_CURRENT_FACT_RE.search(text))
+    dynamic_public_fact = bool(WEB_DYNAMIC_FACT_RE.search(text))
+    time_sensitive_public_topic = bool(WEB_TIME_SENSITIVE_TOPIC_RE.search(text))
+    freshness_signal = bool(WEB_FRESHNESS_RE.search(text))
+    private_agenda_subject = bool(AGENDA_SUBJECT_RE.search(text))
+    private_source_subject = bool(SOURCE_CONTEXT_RE.search(text) or MEMORY_RE.search(text))
+    private_self_context = bool(PRIVATE_SELF_CONTEXT_RE.search(text))
+    private_relationship_subject = bool(
+        RELATIONSHIP_RE.search(text)
+        and (_extract_latin_entities(text) or private_self_context or IMPLICIT_REFERENCE_RE.search(text))
+    )
+    strong_public_signal = dynamic_public_fact or time_sensitive_public_topic
+    freshness_public_query = bool(
+        freshness_signal
+        and not private_source_subject
+        and not private_self_context
+        and not private_relationship_subject
+        and (not private_agenda_subject or strong_public_signal)
+    )
+    if (
+        (explicit_web_search or current_public_fact or strong_public_signal or freshness_public_query)
+        and not JOB_RE.search(text)
+        and not private_source_subject
+        and (not private_self_context or explicit_web_search)
+        and (not private_relationship_subject or strong_public_signal)
+        and (not private_agenda_subject or strong_public_signal)
+    ):
+        if dynamic_public_fact or WEB_DAY_FRESHNESS_RE.search(text):
+            web_freshness = "day"
+        elif WEB_FRESHNESS_RE.search(text):
+            web_freshness = "month"
+        else:
+            web_freshness = "none"
+        return ChatContextRoute(
+            intent="web_query",
+            needs_dialogue=True,
+            needs_web=True,
+            web_mode="balanced" if explicit_web_search else "quick",
+            web_freshness=web_freshness,
+            web_max_queries=2 if explicit_web_search else 1,
+            web_max_sources=8 if explicit_web_search else 5,
+            confidence=0.9,
+            reason=(
+                "explicit_web_search"
+                if explicit_web_search
+                else "dynamic_public_fact"
+                if dynamic_public_fact
+                else "time_sensitive_public_topic"
+                if time_sensitive_public_topic
+                else "current_public_fact"
+                if current_public_fact
+                else "freshness_public_query"
+            ),
+            risk={"privacy_level": "public_query_only"},
+        )
+
     if INFO_REQUEST_RE.search(text) and not JOB_RE.search(text) and not MEMORY_RE.search(text) and not AGENDA_RE.search(text):
         return _finalize_route(text, ui_state, ChatContextRoute(
             intent="simple_chat",
@@ -301,6 +430,7 @@ def route_chat_context(
         ), semantic_router)
 
     if JOB_RE.search(text):
+        needs_web = bool(JOB_DISCOVERY_RE.search(text) or WEB_EXPLICIT_RE.search(text))
         return _finalize_route(text, ui_state, ChatContextRoute(
             intent="job_query",
             needs_dialogue=True,
@@ -311,6 +441,11 @@ def route_chat_context(
             needs_memory_rag=True,
             needs_timeline=False,
             needs_tasks=True,
+            needs_web=needs_web,
+            web_mode="balanced" if needs_web else "quick",
+            web_freshness="month" if needs_web else "none",
+            web_max_queries=3 if needs_web else 1,
+            web_max_sources=10 if needs_web else 5,
             confidence=0.88,
             reason="job_context",
             entities=_extract_latin_entities(text),
@@ -464,7 +599,19 @@ def context_fetch_limits(route: ChatContextRoute, requested_limit: int = 12) -> 
             "agenda": 0,
             "tasks": 8 if route.needs_tasks else 0,
             "external_tool_state": 0,
+            "web": 10 if route.needs_web else 0,
             "input_target_tokens": 96000,
+        }
+    if route.intent == "web_query":
+        return {
+            "source": 0,
+            **detailed_memory_limits(memory=0, kv=0, graph=0, rag=0, timeline=0),
+            "dialogue": 20 if route.needs_dialogue else 0,
+            "agenda": 0,
+            "tasks": 0,
+            "external_tool_state": 0,
+            "web": 8 if route.needs_web else 0,
+            "input_target_tokens": 32000,
         }
     if route.intent == "relationship_query":
         return {

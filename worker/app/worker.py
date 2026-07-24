@@ -2077,6 +2077,81 @@ def maybe_dispatch_due_agenda_reminders(redis_client: Any, last_scan_at: float) 
     return _dispatch_due_agenda_reminders_if_due(redis_client, last_scan_at)
 
 
+ATTACHMENT_PROVENANCE_KEYS = {
+    "attachment_id",
+    "turn_id",
+    "mime_type",
+    "status",
+    "processing_version",
+    "locator",
+    "content_hash",
+    "chunk_ordinal",
+}
+ATTACHMENT_LOCATOR_KEYS = {
+    "page",
+    "slide",
+    "sheet",
+    "cell",
+    "cell_range",
+    "row",
+    "row_start",
+    "row_end",
+    "paragraph",
+    "paragraph_start",
+    "paragraph_end",
+    "section",
+    "item",
+    "ordinal",
+}
+
+
+def safe_attachment_locator(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    result: dict[str, Any] = {}
+    for key in sorted(ATTACHMENT_LOCATOR_KEYS):
+        item = value.get(key)
+        if isinstance(item, bool):
+            continue
+        if isinstance(item, (int, float)) and item >= 0:
+            result[key] = item
+        elif isinstance(item, str):
+            cleaned = re.sub(r"<[^>]*>", "", item).strip()[:120]
+            if cleaned and ".." not in cleaned and not cleaned.startswith(("/", "\\")):
+                result[key] = cleaned
+    return result
+
+
+def safe_attachment_provenance(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    result: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for raw in value:
+        if not isinstance(raw, dict):
+            continue
+        item: dict[str, Any] = {}
+        for key in sorted(ATTACHMENT_PROVENANCE_KEYS - {"locator", "chunk_ordinal"}):
+            text = re.sub(r"[^A-Za-z0-9_.:+/@-]", "", str(raw.get(key) or ""))[:200]
+            if text:
+                item[key] = text
+        ordinal = raw.get("chunk_ordinal")
+        if isinstance(ordinal, int) and ordinal >= 0:
+            item["chunk_ordinal"] = ordinal
+        locator = safe_attachment_locator(raw.get("locator"))
+        if locator:
+            item["locator"] = locator
+        required = {"attachment_id", "turn_id", "processing_version", "content_hash", "locator"}
+        if not required.issubset(item):
+            continue
+        fingerprint = json.dumps(item, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        if fingerprint in seen:
+            continue
+        seen.add(fingerprint)
+        result.append(item)
+    return result
+
+
 def fact_from_semantic(event_id: str, semantic: dict[str, Any]) -> dict[str, Any]:
     entities = semantic.get("entities", {})
     raw_data = semantic.get("raw_data") if isinstance(semantic.get("raw_data"), dict) else {}
@@ -2104,17 +2179,21 @@ def fact_from_semantic(event_id: str, semantic: dict[str, Any]) -> dict[str, Any
             or entities.get("event_type")
             or semantic.get("intent")
         )
+    metadata = {
+        "summary": semantic.get("summary"),
+        "entities": entities,
+        "source_event_id": event_id,
+        "memory_scope": memory_scope_for_event(source, event_type, raw_data, semantic),
+    }
+    attachment_provenance = safe_attachment_provenance(raw_data.get("attachment_provenance"))
+    if attachment_provenance:
+        metadata["attachment_provenance"] = attachment_provenance
     return {
         "subject": normalize_entity_name(str(subject)),
         "predicate": predicate,
         "object": normalize_entity_name(str(obj)) if len(str(obj)) < 180 else str(obj)[:500],
         "confidence": min(max(float(semantic.get("importance", 0.2)), 0), 1),
-        "metadata": {
-            "summary": semantic.get("summary"),
-            "entities": entities,
-            "source_event_id": event_id,
-            "memory_scope": memory_scope_for_event(source, event_type, raw_data, semantic),
-        },
+        "metadata": metadata,
     }
 
 
@@ -2329,7 +2408,21 @@ def persist_fact_graph_and_state(
           source_event_ids = (
             SELECT ARRAY(SELECT DISTINCT unnest(facts.source_event_ids || EXCLUDED.source_event_ids))
           ),
-          metadata = EXCLUDED.metadata,
+          metadata =
+            (EXCLUDED.metadata - 'attachment_provenance') ||
+            jsonb_build_object(
+              'attachment_provenance',
+              (
+                SELECT COALESCE(jsonb_agg(item), '[]'::jsonb)
+                FROM (
+                  SELECT DISTINCT value AS item
+                  FROM jsonb_array_elements(
+                    COALESCE(facts.metadata->'attachment_provenance', '[]'::jsonb) ||
+                    COALESCE(EXCLUDED.metadata->'attachment_provenance', '[]'::jsonb)
+                  ) AS provenance(value)
+                ) AS unique_provenance
+              )
+            ),
           updated_at = now()
         RETURNING id
         """,

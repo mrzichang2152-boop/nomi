@@ -32,4 +32,14 @@ public final class ComposioCallbackPayloadTest {
                 ComposioCallbackPayload.statusMessage("gmail", "error")
         );
     }
+
+    @Test
+    public void identifiesAssistantOwnedGmailCallbackWithoutReadingAnyToken() {
+        assertEquals(
+                "nomi_gmail_primary",
+                ComposioCallbackPayload.assistantIdentityId("nomi_gmail_primary")
+        );
+        assertEquals("", ComposioCallbackPayload.assistantIdentityId("user_gmail_primary"));
+        assertEquals("", ComposioCallbackPayload.assistantIdentityId(null));
+    }
 }

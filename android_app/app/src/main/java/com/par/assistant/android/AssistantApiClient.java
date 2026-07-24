@@ -110,10 +110,73 @@ final class AssistantApiClient {
         }
         body.put("attachment_ids", attachments);
         JSONObject json = requestChatWithTransientRetry(body);
+        JSONArray artifactsJson = json.optJSONArray("artifacts");
+        JSONObject taskJson = json.optJSONObject("task");
+        if (artifactsJson == null && taskJson != null) {
+            artifactsJson = taskJson.optJSONArray("artifacts");
+        }
+        String taskRunId = taskRunIdFromPayload(json, taskJson);
+        List<ChatArtifact> artifacts = parseChatArtifacts(artifactsJson);
+        if (taskRunId.isEmpty() && !artifacts.isEmpty()) {
+            taskRunId = artifacts.get(0).taskRunId;
+        }
         return new ChatResult(
                 json.optString("answer", json.optString("message", "")),
-                json.optString("conversation_id", conversationId == null ? "" : conversationId)
+                json.optString("conversation_id", conversationId == null ? "" : conversationId),
+                artifacts,
+                taskRunId
         );
+    }
+
+    private List<ChatArtifact> parseChatArtifacts(JSONArray artifactsJson) {
+        List<ChatArtifact> artifacts = new ArrayList<>();
+        if (artifactsJson == null) return artifacts;
+        for (int index = 0; index < artifactsJson.length(); index++) {
+            JSONObject item = artifactsJson.optJSONObject(index);
+            if (item == null) continue;
+            String artifactId = item.optString("artifact_id", "").trim();
+            String filename = item.optString("filename", "").trim();
+            String downloadUrl = item.optString("download_url", "").trim();
+            if (artifactId.isEmpty() || filename.isEmpty() || downloadUrl.isEmpty()) continue;
+            artifacts.add(
+                    new ChatArtifact(
+                            artifactId,
+                            item.optString("task_run_id", ""),
+                            item.optString("artifact_type", ""),
+                            filename,
+                            item.optString("mime_type", ""),
+                            downloadUrl,
+                            item.optString("verification_status", "")
+                    )
+            );
+        }
+        return artifacts;
+    }
+
+    private String taskRunIdFromPayload(JSONObject root, JSONObject taskJson) {
+        if (taskJson != null && isWaitingForUserTask(taskJson)) return "";
+        String fromRoot = root == null ? "" : root.optString("task_run_id", root.optString("task_id", "")).trim();
+        if (!fromRoot.isEmpty()) return fromRoot;
+        if (taskJson == null) return "";
+        return taskJson.optString("task_run_id", taskJson.optString("task_id", "")).trim();
+    }
+
+    private boolean isWaitingForUserTask(JSONObject taskJson) {
+        String status = taskJson.optString("status", "").trim();
+        String currentNode = taskJson.optString("current_node", "").trim();
+        return "waiting_user".equals(status) || "waiting_for_human_input".equals(currentNode);
+    }
+
+    List<ChatArtifact> taskArtifacts(String taskRunId) throws Exception {
+        String clean = taskRunId == null ? "" : taskRunId.trim();
+        if (clean.isEmpty()) return List.of();
+        JSONObject json = request(
+                "GET",
+                "/api/tasks/" + UrlEncoding.queryComponent(clean) + "/artifacts",
+                null,
+                true
+        );
+        return parseChatArtifacts(json.optJSONArray("artifacts"));
     }
 
     ChatAttachment uploadAttachment(AttachmentDraft draft, RequestBody fileBody) throws Exception {
@@ -180,42 +243,33 @@ final class AssistantApiClient {
         if (messagesJson != null) {
             for (int index = 0; index < messagesJson.length(); index++) {
                 JSONObject item = messagesJson.getJSONObject(index);
+                String id = item.optString("id", "").trim();
+                String createdAt = item.optString("created_at", "").trim();
                 String role = item.optString("role", "").trim();
                 String content = item.optString("content", "").trim();
                 if (role.isEmpty() || content.isEmpty()) continue;
                 if (!"user".equals(role) && !"assistant".equals(role)) continue;
-                String messageId = item.optString("id", "").trim();
                 JSONArray attachmentsJson = item.optJSONArray("attachments");
                 List<ChatHistoryAttachment> attachments = new ArrayList<>();
                 if (attachmentsJson != null) {
                     for (int attachmentIndex = 0; attachmentIndex < attachmentsJson.length(); attachmentIndex++) {
                         JSONObject attachment = attachmentsJson.optJSONObject(attachmentIndex);
                         if (attachment == null) continue;
-                        attachments.add(
-                                new ChatHistoryAttachment(
-                                        messageId,
-                                        attachment.optString("attachment_id"),
-                                        attachment.optString("filename"),
-                                        attachment.optString("mime_type"),
-                                        attachment.optLong("byte_size", 0L),
-                                        attachment.optString("status"),
-                                        attachment.optString("kind"),
-                                        attachment.optString("preview_url"),
-                                        attachment.optString("content_url"),
-                                        attachment.optInt("ordinal", attachmentIndex)
-                                )
-                        );
+                        attachments.add(new ChatHistoryAttachment(
+                                id,
+                                attachment.optString("attachment_id"),
+                                attachment.optString("filename"),
+                                attachment.optString("mime_type"),
+                                attachment.optLong("byte_size", 0L),
+                                attachment.optString("status"),
+                                attachment.optString("kind"),
+                                attachment.optString("preview_url"),
+                                attachment.optString("content_url"),
+                                attachment.optInt("ordinal", attachmentIndex)
+                        ));
                     }
                 }
-                messages.add(
-                        new ChatHistoryMessage(
-                                messageId,
-                                item.optString("created_at", ""),
-                                role,
-                                content,
-                                attachments
-                        )
-                );
+                messages.add(new ChatHistoryMessage(id, createdAt, role, content, attachments));
             }
         }
         return new ChatHistoryResult(json.optString("conversation_id", ""), messages);
@@ -228,17 +282,67 @@ final class AssistantApiClient {
         if (identitiesJson == null) return identities;
         for (int index = 0; index < identitiesJson.length(); index++) {
             JSONObject item = identitiesJson.getJSONObject(index);
+            JSONObject secretPresence = item.optJSONObject("secret_presence");
             identities.add(
                     new AssistantIdentity(
                             item.optString("identity_id"),
                             item.optString("kind"),
                             item.optString("display_name"),
                             item.optString("address"),
-                            item.optString("status")
+                            item.optString("provider"),
+                            stringList(item.optJSONArray("capabilities")),
+                            item.optString("status"),
+                            item.optLong("version", 1L),
+                            item.optString("last_verified_at"),
+                            item.optString("last_error_code"),
+                            secretPresence != null && secretPresence.optBoolean("stored", false)
                     )
             );
         }
         return identities;
+    }
+
+    String assistantGmailConnectUrl() throws Exception {
+        JSONObject json = request(
+                "POST",
+                "/api/assistant-identities/nomi_gmail_primary/connect-link",
+                null,
+                true
+        );
+        String redirectUrl = json.optString("redirect_url", "").trim();
+        if (redirectUrl.isEmpty()) {
+            throw new IllegalStateException("Nomi Gmail did not return an authorization link");
+        }
+        return redirectUrl;
+    }
+
+    void verifyAssistantIdentity(String identityId) throws Exception {
+        mutateAssistantIdentity(identityId, "verify");
+    }
+
+    void disableAssistantIdentity(String identityId) throws Exception {
+        mutateAssistantIdentity(identityId, "disable");
+    }
+
+    void enableAssistantIdentity(String identityId) throws Exception {
+        mutateAssistantIdentity(identityId, "enable");
+    }
+
+    void disconnectAssistantIdentity(String identityId) throws Exception {
+        mutateAssistantIdentity(identityId, "disconnect");
+    }
+
+    private void mutateAssistantIdentity(String identityId, String action) throws Exception {
+        String cleanIdentityId = identityId == null ? "" : identityId.trim();
+        if (!cleanIdentityId.matches("[A-Za-z0-9_-]+")) {
+            throw new IllegalArgumentException("assistant identity id is invalid");
+        }
+        request(
+                "POST",
+                "/api/assistant-identities/" + cleanIdentityId + "/" + action,
+                null,
+                true
+        );
     }
 
     AssistantDraft createAssistantDraft(
@@ -255,13 +359,97 @@ final class AssistantApiClient {
                 .put("subject", subject == null ? "" : subject)
                 .put("body_text", bodyText == null ? "" : bodyText);
         JSONObject json = request("POST", "/api/assistant-outbound/drafts", body, true);
+        return parseAssistantDraft(json);
+    }
+
+    List<AssistantDraft> assistantDrafts(int limit) throws Exception {
+        int safeLimit = Math.max(1, Math.min(200, limit));
+        JSONObject json = request("GET", "/api/assistant-outbound/drafts?limit=" + safeLimit, null, true);
+        JSONArray items = json.optJSONArray("items");
+        List<AssistantDraft> drafts = new ArrayList<>();
+        if (items == null) return drafts;
+        for (int index = 0; index < items.length(); index++) {
+            JSONObject item = items.optJSONObject(index);
+            if (item != null) drafts.add(parseAssistantDraft(item));
+        }
+        return drafts;
+    }
+
+    AssistantDraft editAssistantDraft(String draftId, String subject, String bodyText) throws Exception {
+        String id = requiredDraftId(draftId);
+        String cleanBody = bodyText == null ? "" : bodyText.trim();
+        if (cleanBody.isEmpty()) throw new IllegalArgumentException("draft body is required");
+        JSONObject json = request(
+                "PATCH",
+                "/api/assistant-outbound/drafts/" + id,
+                new JSONObject()
+                        .put("subject", subject == null ? "" : subject.trim())
+                        .put("body_text", cleanBody),
+                true
+        );
+        return parseAssistantDraft(json);
+    }
+
+    String confirmAssistantDraft(String draftId) throws Exception {
+        String id = requiredDraftId(draftId);
+        JSONObject json = request(
+                "POST",
+                "/api/assistant-outbound/drafts/" + id + "/confirm",
+                null,
+                true
+        );
+        String confirmationToken = json.optString("confirmation_token", "").trim();
+        if (confirmationToken.isEmpty()) {
+            throw new IllegalStateException("assistant draft confirmation token is missing");
+        }
+        return confirmationToken;
+    }
+
+    AssistantDraft sendAssistantDraft(String draftId, String confirmationToken) throws Exception {
+        String id = requiredDraftId(draftId);
+        String token = confirmationToken == null ? "" : confirmationToken.trim();
+        if (token.isEmpty()) throw new IllegalArgumentException("confirmation token is required");
+        JSONObject json = request(
+                "POST",
+                "/api/assistant-outbound/drafts/" + id + "/send",
+                new JSONObject().put("confirmation_token", token),
+                true
+        );
+        return parseAssistantDraft(json);
+    }
+
+    void cancelAssistantDraft(String draftId) throws Exception {
+        String id = requiredDraftId(draftId);
+        request("POST", "/api/assistant-outbound/drafts/" + id + "/cancel", null, true);
+    }
+
+    private String requiredDraftId(String draftId) {
+        String id = draftId == null ? "" : draftId.trim();
+        if (!id.matches("[A-Za-z0-9_-]+")) {
+            throw new IllegalArgumentException("assistant draft id is invalid");
+        }
+        return id;
+    }
+
+    private AssistantDraft parseAssistantDraft(JSONObject json) {
+        String identityId = json.optString("identity_id", "");
+        String channel = json.optString("channel", "");
         return new AssistantDraft(
                 json.optString("draft_id"),
-                assistantIdentityLabel(json.optString("identity_id"), json.optString("channel")),
-                json.optString("channel"),
+                identityId,
+                assistantIdentityLabel(identityId, channel),
+                channel,
                 json.optString("recipient"),
                 json.optString("subject"),
-                json.optString("body_text")
+                json.optString("body_text"),
+                json.optString("status"),
+                json.optBoolean("confirmation_required", false),
+                json.optString("updated_at"),
+                stringList(json.optJSONArray("source_evidence_ids")),
+                json.optString("reason"),
+                json.optJSONObject("policy_result") == null
+                        ? ""
+                        : json.optJSONObject("policy_result").optString("guidance")
         );
     }
 
@@ -736,10 +924,63 @@ final class BrowserCommandStatus {
 final class ChatResult {
     final String answer;
     final String conversationId;
+    final List<ChatArtifact> artifacts;
+    final String taskRunId;
 
     ChatResult(String answer, String conversationId) {
+        this(answer, conversationId, List.of());
+    }
+
+    ChatResult(String answer, String conversationId, List<ChatArtifact> artifacts) {
+        this(answer, conversationId, artifacts, "");
+    }
+
+    ChatResult(String answer, String conversationId, List<ChatArtifact> artifacts, String taskRunId) {
         this.answer = answer == null ? "" : answer;
         this.conversationId = conversationId == null ? "" : conversationId;
+        this.artifacts = artifacts == null ? List.of() : List.copyOf(artifacts);
+        this.taskRunId = taskRunId == null ? "" : taskRunId;
+    }
+}
+
+final class ChatArtifact {
+    final String artifactId;
+    final String taskRunId;
+    final String artifactType;
+    final String filename;
+    final String mimeType;
+    final String downloadUrl;
+    final String verificationStatus;
+
+    ChatArtifact(
+            String artifactId,
+            String taskRunId,
+            String artifactType,
+            String filename,
+            String mimeType,
+            String downloadUrl,
+            String verificationStatus
+    ) {
+        this.artifactId = artifactId == null ? "" : artifactId;
+        this.taskRunId = taskRunId == null ? "" : taskRunId;
+        this.artifactType = artifactType == null ? "" : artifactType;
+        this.filename = filename == null ? "" : filename;
+        this.mimeType = mimeType == null ? "" : mimeType;
+        this.downloadUrl = downloadUrl == null ? "" : downloadUrl;
+        this.verificationStatus = verificationStatus == null ? "" : verificationStatus;
+    }
+
+    String statusLine() {
+        String typeLabel = artifactType.trim().isEmpty() ? "文件" : artifactType.trim().toUpperCase();
+        String statusLabel;
+        if ("verified".equals(verificationStatus)) {
+            statusLabel = "已校验";
+        } else if ("generated".equals(verificationStatus)) {
+            statusLabel = "已生成";
+        } else {
+            statusLabel = verificationStatus.trim().isEmpty() ? "待校验" : verificationStatus.trim();
+        }
+        return typeLabel + " · " + statusLabel;
     }
 }
 

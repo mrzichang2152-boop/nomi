@@ -39,6 +39,16 @@ final class ConfigPrefs {
                 .apply();
     }
 
+    static boolean hasSavedServerConfig(Context context) {
+        SharedPreferences prefs = prefs(context);
+        String baseUrl = prefs.getString(KEY_BASE_URL, "");
+        return prefs.contains(KEY_BASE_URL)
+                && baseUrl != null
+                && !baseUrl.trim().isEmpty()
+                && prefs.contains(KEY_PASSWORD)
+                && !password(context).trim().isEmpty();
+    }
+
     static String baseUrlOrDefault(Context context) {
         return prefs(context).getString(KEY_BASE_URL, DEFAULT_BASE_URL);
     }

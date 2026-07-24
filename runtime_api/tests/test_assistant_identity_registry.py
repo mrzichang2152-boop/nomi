@@ -17,12 +17,15 @@ def test_default_registry_bootstraps_nomi_gmail_whatsapp_and_phone():
         "nomi_phone_primary",
     ]
     assert identities[0].kind == "assistant_gmail"
-    assert "send" in identities[0].capabilities
+    assert identities[0].capabilities == []
+    assert "send" in identities[0].metadata["supported_capabilities"]
     assert identities[1].kind == "assistant_whatsapp"
-    assert "send_text" in identities[1].capabilities
+    assert identities[1].capabilities == []
+    assert "send_text" in identities[1].metadata["supported_capabilities"]
     assert identities[2].kind == "assistant_phone"
-    assert "send_sms" in identities[2].capabilities
-    assert "outbound_call_playback" in identities[2].capabilities
+    assert identities[2].capabilities == []
+    assert "send_sms" in identities[2].metadata["supported_capabilities"]
+    assert "outbound_call_playback" in identities[2].metadata["supported_capabilities"]
 
 
 def test_registry_rejects_user_owned_identity_kind():
@@ -46,7 +49,7 @@ def test_registry_rejects_user_owned_identity_kind():
         raise AssertionError("registry accepted a user-owned identity kind")
 
 
-def test_registry_connects_nomi_phone_identity_kind():
+def test_registry_connect_begins_authorization_for_nomi_phone_identity_kind():
     from app.assistant_identity.registry import AssistantIdentityRegistry
 
     registry = AssistantIdentityRegistry()
@@ -54,4 +57,4 @@ def test_registry_connects_nomi_phone_identity_kind():
 
     assert identity.identity_id == "nomi_phone_primary"
     assert identity.kind == "assistant_phone"
-    assert identity.status == "connected"
+    assert identity.status == "authorization_pending"

@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Nomi Task Detail</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body class="task-detail-page">
+    <main id="taskDetailRoot" class="task-detail-shell">
+      <header class="task-detail-hero">
+        <div>
+          <p class="eyebrow">Nomi Open Task</p>
+          <h1>任务详情</h1>
+          <p id="taskSubtitle">正在读取任务状态、执行步骤、证据和交付文件。</p>
+        </div>
+        <a class="task-detail-home" href="/">返回工作台</a>
+      </header>
+
+      <section id="taskError" class="task-detail-error hidden"></section>
+
+      <section class="task-detail-grid">
+        <article class="task-detail-card task-summary-card">
+          <h2>任务概览</h2>
+          <dl id="taskSummary" class="task-summary-list"></dl>
+        </article>
+
+        <article class="task-detail-card">
+          <h2>任务步骤</h2>
+          <div id="taskSteps" class="task-detail-list"></div>
+        </article>
+
+        <article class="task-detail-card">
+          <h2>证据链接</h2>
+          <div id="taskEvidence" class="task-detail-list"></div>
+        </article>
+
+        <article class="task-detail-card">
+          <h2>交付文件</h2>
+          <div id="taskArtifacts" class="task-detail-list"></div>
+        </article>
+      </section>
+    </main>
+    <script src="/static/task-detail.js"></script>
+  </body>
+</html>

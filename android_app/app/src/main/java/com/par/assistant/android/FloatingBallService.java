@@ -1,11 +1,13 @@
 package com.par.assistant.android;
 
 import android.Manifest;
+import android.app.AlertDialog;
 import android.app.Notification;
 import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import android.app.PendingIntent;
 import android.app.Service;
+import android.content.Context;
 import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.content.pm.ServiceInfo;
@@ -37,27 +39,30 @@ import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.TextView;
+import android.widget.Toast;
 
 import com.par.assistant.core.AssistantSuggestion;
 import com.par.assistant.core.ServerConfig;
 import com.par.assistant.core.SuggestionDeduper;
 
+import java.util.HashSet;
 import java.util.List;
 import java.util.ArrayList;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.Set;
 
 public final class FloatingBallService extends Service {
     static final String ACTION_SHOW_ACCOUNTS = "com.par.assistant.android.SHOW_ACCOUNTS";
     static final String ACTION_SHOW_EXTERNAL_AUTH_CLOSE = "com.par.assistant.android.SHOW_EXTERNAL_AUTH_CLOSE";
+    static final String EXTRA_AUTH_MESSAGE = "com.par.assistant.android.AUTH_MESSAGE";
     static final String ACTION_ATTACHMENTS_SELECTED = "com.par.assistant.android.ATTACHMENTS_SELECTED";
     static final String ACTION_ATTACHMENTS_CANCELLED = "com.par.assistant.android.ATTACHMENTS_CANCELLED";
-    static final String EXTRA_AUTH_MESSAGE = "com.par.assistant.android.AUTH_MESSAGE";
+    static final String ACTION_CLEAR_PROACTIVE_OVERLAY = "com.par.assistant.android.CLEAR_PROACTIVE_OVERLAY";
     static final String EXTRA_ATTACHMENT_URIS = "com.par.assistant.android.ATTACHMENT_URIS";
     static final String EXTRA_ATTACHMENT_FILENAMES = "com.par.assistant.android.ATTACHMENT_FILENAMES";
     static final String EXTRA_ATTACHMENT_MIME_TYPES = "com.par.assistant.android.ATTACHMENT_MIME_TYPES";
@@ -66,8 +71,16 @@ public final class FloatingBallService extends Service {
     private static final int NOTIFICATION_ID = 1001;
     private static final long STREAMING_CHAT_FALLBACK_TIMEOUT_MS =
             StreamingChatFallbackPolicy.FIRST_DELTA_FALLBACK_TIMEOUT_MS;
+    private static final int TASK_ARTIFACT_POLL_INTERVAL_MS = 5000;
+    private static final int TASK_ARTIFACT_POLL_MAX_ATTEMPTS = 72;
 
     private final ExecutorService executor = Executors.newSingleThreadExecutor();
+    private final ExecutorService chatHistoryExecutor = Executors.newSingleThreadExecutor();
+    private final Set<String> activeArtifactPollTaskIds = new HashSet<>();
+    private final Set<String> displayedArtifactKeys = new HashSet<>();
+    private final Set<String> displayedProactiveIds = new HashSet<>();
+    private final AssistantDraftActionGuard draftActionGuard = new AssistantDraftActionGuard();
+    private final List<View> assistantDraftCardViews = new ArrayList<>();
     private final ExecutorService attachmentExecutor = Executors.newSingleThreadExecutor();
     private final ExecutorService thumbnailExecutor = Executors.newSingleThreadExecutor();
     private final Map<String, AtomicBoolean> uploadCancellations = new ConcurrentHashMap<>();
@@ -99,6 +112,7 @@ public final class FloatingBallService extends Service {
     private TextView settingsStatusView;
     private LinearLayout chatHistoryView;
     private ScrollView chatScrollView;
+    private TextView chatHistorySyncView;
     private int unreadCount;
     private SuggestionPoller poller;
     private RealtimeClient realtimeClient;
@@ -155,6 +169,11 @@ public final class FloatingBallService extends Service {
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
+        if (intent != null && ACTION_CLEAR_PROACTIVE_OVERLAY.equals(intent.getAction())) {
+            removeBubble();
+            closePanel();
+            return START_STICKY;
+        }
         if (windowManager != null && ballView == null) {
             showBall();
         }
@@ -175,11 +194,16 @@ public final class FloatingBallService extends Service {
         return START_STICKY;
     }
 
+    static Intent clearProactiveOverlayIntent(Context context) {
+        return new Intent(context, FloatingBallService.class).setAction(ACTION_CLEAR_PROACTIVE_OVERLAY);
+    }
+
     @Override
     public void onDestroy() {
         if (attachmentController != null) retainedAttachmentSnapshot = attachmentController.snapshot();
         if (poller != null) poller.stop();
         if (realtimeClient != null) realtimeClient.stop();
+        chatHistoryExecutor.shutdownNow();
         for (AtomicBoolean cancellation : uploadCancellations.values()) cancellation.set(true);
         attachmentExecutor.shutdownNow();
         thumbnailExecutor.shutdownNow();
@@ -405,14 +429,8 @@ public final class FloatingBallService extends Service {
         chatScrollView.addView(chatHistoryView);
         chatContentView.addView(chatScrollView, new LinearLayout.LayoutParams(-1, 0, 1));
 
-        List<ChatHistoryMessage> cachedHistory = LocalChatHistoryStore.load(this, activeConversationId);
-        if (cachedHistory.isEmpty()) {
-            cachedHistory = LocalChatHistoryStore.fromTurns(chatContext.snapshot(80));
-        }
-        if (cachedHistory.isEmpty()) {
-            addChatMessage("Nomi", "我在这里。你可以直接发消息，也可以点右上角查看日程或进入完整 App。");
-        } else {
-            renderChatHistory(cachedHistory);
+        if (!renderCachedChatHistory()) {
+            chatHistorySyncView = addChatMessage("Nomi", "正在同步最近对话...");
         }
 
         EditText input = new EditText(this);
@@ -641,10 +659,11 @@ public final class FloatingBallService extends Service {
         if ((text == null || text.trim().isEmpty()) && attachmentIds.isEmpty()) return;
         String trimmed = text == null ? "" : text.trim();
         String displayMessage = attachmentDisplayMessage(trimmed, attachmentController == null ? List.of() : attachmentController.drafts());
+        clearChatHistorySyncMessage();
         List<FloatingChatContext.Turn> clientContext = chatContext.snapshotDelta(12000);
         addChatMessage("你", displayMessage);
         chatContext.addUser(displayMessage);
-        persistLocalChatHistory();
+        persistChatContext();
         TextView pending = addChatMessage("Nomi", "正在思考...");
         responseView.setText("");
         String conversationId = activeConversationId;
@@ -697,8 +716,13 @@ public final class FloatingBallService extends Service {
                     String answer = result.answer.isEmpty() ? "已发送，但没有返回内容。" : result.answer;
                     pending.setText(messageText("Nomi", answer));
                     chatContext.addAssistant(answer);
-                    persistLocalChatHistory();
+                    persistChatContext();
+                    for (ChatArtifact artifact : result.artifacts) {
+                        addArtifactCardOnce(artifact);
+                    }
+                    maybeStartTaskArtifactPolling(result.taskRunId);
                     clearSentAttachments();
+                    loadAssistantDraftCards();
                 });
             } catch (Exception error) {
                 runOnMain(() -> pending.setText(messageText("Nomi", "发送失败：" + error.getMessage())));
@@ -766,6 +790,14 @@ public final class FloatingBallService extends Service {
     }
 
     private void completeStreamingChat(String answer, String conversationId) {
+        completeStreamingChat(answer, conversationId, List.of(), "");
+    }
+
+    private void completeStreamingChat(String answer, String conversationId, List<ChatArtifact> artifacts) {
+        completeStreamingChat(answer, conversationId, artifacts, "");
+    }
+
+    private void completeStreamingChat(String answer, String conversationId, List<ChatArtifact> artifacts, String taskRunId) {
         if (streamingPendingView == null) return;
         if (conversationId != null && !conversationId.trim().isEmpty()) {
             rememberActiveConversationId(conversationId);
@@ -778,9 +810,58 @@ public final class FloatingBallService extends Service {
         }
         streamingPendingView.setText(messageText("Nomi", finalAnswer));
         chatContext.addAssistant(finalAnswer);
-        persistLocalChatHistory();
+        persistChatContext();
+        for (ChatArtifact artifact : artifacts == null ? List.<ChatArtifact>of() : artifacts) {
+            addArtifactCardOnce(artifact);
+        }
+        maybeStartTaskArtifactPolling(taskRunId);
         clearSentAttachments();
         clearStreamingChatState();
+        loadAssistantDraftCards();
+    }
+
+    private void maybeStartTaskArtifactPolling(String taskRunId) {
+        String clean = taskRunId == null ? "" : taskRunId.trim();
+        if (clean.isEmpty() || activeArtifactPollTaskIds.contains(clean)) return;
+        activeArtifactPollTaskIds.add(clean);
+        pollTaskArtifacts(clean, 0);
+    }
+
+    private void pollTaskArtifacts(String taskRunId, int attempt) {
+        executor.execute(() -> {
+            try {
+                List<ChatArtifact> artifacts = api().taskArtifacts(taskRunId);
+                runOnMain(() -> {
+                    boolean displayed = false;
+                    for (ChatArtifact artifact : artifacts) {
+                        displayed = addArtifactCardOnce(artifact) || displayed;
+                    }
+                    if (displayed || attempt >= TASK_ARTIFACT_POLL_MAX_ATTEMPTS) {
+                        activeArtifactPollTaskIds.remove(taskRunId);
+                        return;
+                    }
+                    scheduleNextTaskArtifactPoll(taskRunId, attempt + 1);
+                });
+            } catch (Exception error) {
+                runOnMain(() -> {
+                    if (attempt >= TASK_ARTIFACT_POLL_MAX_ATTEMPTS) {
+                        activeArtifactPollTaskIds.remove(taskRunId);
+                        addChatMessage("Nomi", "文件生成状态查询失败：" + error.getMessage());
+                        return;
+                    }
+                    scheduleNextTaskArtifactPoll(taskRunId, attempt + 1);
+                });
+            }
+        });
+    }
+
+    private void scheduleNextTaskArtifactPoll(String taskRunId, int nextAttempt) {
+        View anchor = chatHistoryView == null ? panelView : chatHistoryView;
+        if (anchor == null) {
+            activeArtifactPollTaskIds.remove(taskRunId);
+            return;
+        }
+        anchor.postDelayed(() -> pollTaskArtifacts(taskRunId, nextAttempt), TASK_ARTIFACT_POLL_INTERVAL_MS);
     }
 
     private void failStreamingChat(String message) {
@@ -1027,16 +1108,24 @@ public final class FloatingBallService extends Service {
 
     private void loadRemoteChatHistory() {
         int localSizeAtRequest = chatContext.size();
-        String conversationId = activeConversationId;
-        executor.execute(() -> {
+        String conversationId = ConfigPrefs.conversationId(this);
+        if (conversationId == null || conversationId.trim().isEmpty()) {
+            conversationId = activeConversationId;
+        }
+        final String historyConversationId = conversationId;
+        chatHistoryExecutor.execute(() -> {
             try {
-                ChatHistoryResult history = api().chatHistory(conversationId, 80);
+                ChatHistoryResult history = api().chatHistory(historyConversationId, 80);
                 runOnMain(() -> applyRemoteChatHistory(history, localSizeAtRequest));
             } catch (Exception error) {
                 runOnMain(() -> {
+                    if (chatContext.size() == localSizeAtRequest && chatHistorySyncView != null) {
+                        chatHistorySyncView.setText(messageText("Nomi", "历史对话同步失败，稍后会继续使用当前会话。"));
+                    }
                     if (responseView != null) {
                         responseView.setText("历史对话加载失败：" + error.getMessage());
                     }
+                    loadAssistantDraftCards();
                 });
             }
         });
@@ -1044,31 +1133,275 @@ public final class FloatingBallService extends Service {
 
     private void applyRemoteChatHistory(ChatHistoryResult history, int localSizeAtRequest) {
         if (panelView == null || chatHistoryView == null || history == null) return;
-        if (chatContext.size() != localSizeAtRequest) {
-            return;
-        }
         if (!history.conversationId.trim().isEmpty()) {
             rememberActiveConversationId(history.conversationId);
         }
-        List<ChatHistoryMessage> local = LocalChatHistoryStore.fromTurns(chatContext.snapshot(80));
-        List<ChatHistoryMessage> reconciled = LocalChatHistoryStore.reconcile(local, history.messages, 80);
-        renderChatHistory(reconciled);
-        LocalChatHistoryStore.save(this, activeConversationId, reconciled);
+        List<ChatHistoryMessage> localMessages = LocalChatHistoryStore.fromTurns(chatContext.snapshot(80));
+        List<ChatHistoryMessage> mergedMessages =
+                LocalChatHistoryStore.reconcile(localMessages, history.messages, 80);
+        if (chatContext.size() != localSizeAtRequest) {
+            LocalChatHistoryStore.save(this, activeConversationId, mergedMessages);
+            return;
+        }
+        clearChatHistorySyncMessage();
+        if (mergedMessages.isEmpty()) {
+            chatHistoryView.removeAllViews();
+            addChatMessage("Nomi", "我在这里。你可以直接发消息，也可以点右上角查看日程或进入完整 App。");
+            chatContext.replaceWithHistory(List.of());
+        } else {
+            renderChatHistoryMessages(mergedMessages);
+            chatContext.replaceWithHistory(mergedMessages);
+        }
+        persistChatContext();
+        scrollChatToLatest();
         if (responseView != null) {
             responseView.setText("");
         }
+        loadAssistantDraftCards();
     }
 
-    private void renderChatHistory(List<ChatHistoryMessage> messages) {
+    private void scrollChatToLatest() {
+        ScrollView target = chatScrollView;
+        if (target == null) return;
+        target.post(() -> {
+            if (chatScrollView != target) return;
+            target.fullScroll(View.FOCUS_DOWN);
+            target.postDelayed(() -> {
+                if (chatScrollView == target) {
+                    target.fullScroll(View.FOCUS_DOWN);
+                }
+            }, 120L);
+        });
+    }
+
+    private boolean renderCachedChatHistory() {
+        List<ChatHistoryMessage> cachedMessages = LocalChatHistoryStore.load(this, activeConversationId);
+        if (cachedMessages.isEmpty()) {
+            return false;
+        }
+        chatContext.replaceWithHistory(cachedMessages);
+        renderChatHistoryMessages(cachedMessages);
+        return true;
+    }
+
+    private void renderChatHistoryMessages(List<ChatHistoryMessage> messages) {
         if (chatHistoryView == null) return;
         chatHistoryView.removeAllViews();
-        chatContext.replaceWithHistory(messages);
-        for (ChatHistoryMessage message : messages) {
+        assistantDraftCardViews.clear();
+        displayedArtifactKeys.clear();
+        for (ChatHistoryMessage message : messages == null ? List.<ChatHistoryMessage>of() : messages) {
             addChatMessage(speakerForHistoryRole(message.role), message.content);
+            ChatArtifact artifact = artifactFromHistoryMessage(message.content);
+            if (artifact != null) {
+                addArtifactCardOnce(artifact);
+            }
             for (ChatHistoryAttachment attachment : message.attachments) {
                 addHistoryAttachmentCard(attachment);
             }
         }
+    }
+
+    private void loadAssistantDraftCards() {
+        executor.execute(() -> {
+            try {
+                List<AssistantDraft> drafts = api().assistantDrafts(20);
+                runOnMain(() -> renderAssistantDraftCards(drafts));
+            } catch (Exception error) {
+                runOnMain(() -> {
+                    if (responseView != null) {
+                        responseView.setText("待确认草稿加载失败：" + error.getMessage());
+                    }
+                });
+            }
+        });
+    }
+
+    private void renderAssistantDraftCards(List<AssistantDraft> drafts) {
+        if (chatHistoryView == null) return;
+        for (View card : assistantDraftCardViews) {
+            if (card.getParent() == chatHistoryView) chatHistoryView.removeView(card);
+        }
+        assistantDraftCardViews.clear();
+        for (AssistantDraft draft : drafts == null ? List.<AssistantDraft>of() : drafts) {
+            if (draft.isVisibleGmailDraftCard()) addAssistantDraftCard(draft);
+        }
+        scrollChatToLatest();
+    }
+
+    private void addAssistantDraftCard(AssistantDraft draft) {
+        if (chatHistoryView == null || draft == null) return;
+        LinearLayout card = new LinearLayout(this);
+        card.setOrientation(LinearLayout.VERTICAL);
+        card.setPadding(dp(12), dp(10), dp(12), dp(10));
+        card.setBackground(rounded(Color.rgb(240, 253, 250), Color.rgb(20, 184, 166), 12));
+
+        TextView title = new TextView(this);
+        title.setText(draft.statusLabel() + "邮件 · " + (draft.subject.isEmpty() ? "无主题" : draft.subject));
+        title.setTextSize(14);
+        title.setTextColor(Color.rgb(15, 23, 42));
+        card.addView(title);
+
+        TextView body = new TextView(this);
+        body.setText(draft.cardText());
+        body.setSingleLine(false);
+        body.setTextSize(12);
+        body.setTextColor(Color.rgb(51, 65, 85));
+        body.setPadding(0, dp(6), 0, dp(8));
+        card.addView(body);
+
+        LinearLayout actions = new LinearLayout(this);
+        actions.setOrientation(LinearLayout.HORIZONTAL);
+        actions.setGravity(Gravity.END);
+        if ("draft".equals(draft.status) && draft.confirmationRequired) {
+            Button send = new Button(this);
+            send.setText("确认发送");
+            stylePrimaryButton(send);
+            send.setOnClickListener(view -> sendAssistantDraftFromCard(draft, send));
+            actions.addView(send, new LinearLayout.LayoutParams(-2, dp(42)));
+        }
+        if (draft.isEditable()) {
+            Button edit = new Button(this);
+            edit.setText("修改");
+            styleSecondaryButton(edit);
+            edit.setOnClickListener(view -> editAssistantDraftFromCard(draft));
+            LinearLayout.LayoutParams editParams = new LinearLayout.LayoutParams(-2, dp(42));
+            editParams.setMargins(dp(6), 0, 0, 0);
+            actions.addView(edit, editParams);
+
+            Button cancel = new Button(this);
+            cancel.setText("取消");
+            styleSecondaryButton(cancel);
+            cancel.setOnClickListener(view -> cancelAssistantDraftFromCard(draft, cancel));
+            LinearLayout.LayoutParams cancelParams = new LinearLayout.LayoutParams(-2, dp(42));
+            cancelParams.setMargins(dp(6), 0, 0, 0);
+            actions.addView(cancel, cancelParams);
+        }
+        card.addView(actions);
+
+        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(-1, -2);
+        params.setMargins(0, 0, 0, dp(8));
+        chatHistoryView.addView(card, params);
+        assistantDraftCardViews.add(card);
+    }
+
+    private void editAssistantDraftFromCard(AssistantDraft draft) {
+        LinearLayout form = new LinearLayout(this);
+        form.setOrientation(LinearLayout.VERTICAL);
+        form.setPadding(dp(20), dp(4), dp(20), 0);
+
+        EditText subjectInput = new EditText(this);
+        subjectInput.setHint("主题");
+        subjectInput.setSingleLine(true);
+        subjectInput.setText(draft.subject);
+        form.addView(subjectInput, new LinearLayout.LayoutParams(-1, -2));
+
+        EditText bodyInput = new EditText(this);
+        bodyInput.setHint("正文");
+        bodyInput.setMinLines(4);
+        bodyInput.setGravity(Gravity.TOP);
+        bodyInput.setText(draft.bodyText);
+        form.addView(bodyInput, new LinearLayout.LayoutParams(-1, -2));
+
+        AlertDialog dialog = new AlertDialog.Builder(this)
+                .setTitle("修改 Nomi 邮件")
+                .setView(form)
+                .setNegativeButton("返回", null)
+                .setPositiveButton("保存", null)
+                .create();
+        if (dialog.getWindow() != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            dialog.getWindow().setType(WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY);
+        }
+        dialog.setOnShowListener(ignored -> dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(view -> {
+            String bodyText = bodyInput.getText() == null ? "" : bodyInput.getText().toString().trim();
+            if (bodyText.isEmpty()) {
+                bodyInput.setError("正文不能为空");
+                return;
+            }
+            String subjectText = subjectInput.getText() == null ? "" : subjectInput.getText().toString();
+            if (!draftActionGuard.begin(draft.draftId)) return;
+            Button saveButton = dialog.getButton(AlertDialog.BUTTON_POSITIVE);
+            saveButton.setEnabled(false);
+            executor.execute(() -> {
+                try {
+                    api().editAssistantDraft(draft.draftId,
+                            subjectText,
+                            bodyText
+                    );
+                    runOnMain(() -> {
+                        dialog.dismiss();
+                        if (responseView != null) responseView.setText("草稿已更新，请重新确认。修改后重新确认");
+                    });
+                } catch (Exception error) {
+                    runOnMain(() -> {
+                        saveButton.setEnabled(true);
+                        if (responseView != null) responseView.setText("修改草稿失败：" + error.getMessage());
+                    });
+                } finally {
+                    draftActionGuard.finish(draft.draftId);
+                    runOnMain(this::loadAssistantDraftCards);
+                }
+            });
+        }));
+        dialog.show();
+    }
+
+    private void sendAssistantDraftFromCard(AssistantDraft draft, Button actionButton) {
+        if (!draftActionGuard.begin(draft.draftId)) return;
+        actionButton.setEnabled(false);
+        if (responseView != null) responseView.setText("正在确认并发送邮件...");
+        executor.execute(() -> {
+            try {
+                String confirmationToken = api().confirmAssistantDraft(draft.draftId);
+                AssistantDraft sentDraft = api().sendAssistantDraft(draft.draftId, confirmationToken);
+                runOnMain(() -> {
+                    if (responseView != null) responseView.setText(sentDraft.actionResultMessage());
+                });
+            } catch (Exception error) {
+                runOnMain(() -> {
+                    actionButton.setEnabled(true);
+                    if (responseView != null) responseView.setText("邮件发送失败：" + error.getMessage());
+                });
+            } finally {
+                draftActionGuard.finish(draft.draftId);
+                runOnMain(this::loadAssistantDraftCards);
+            }
+        });
+    }
+
+    private void cancelAssistantDraftFromCard(AssistantDraft draft, Button actionButton) {
+        if (!draftActionGuard.begin(draft.draftId)) return;
+        actionButton.setEnabled(false);
+        executor.execute(() -> {
+            try {
+                api().cancelAssistantDraft(draft.draftId);
+                runOnMain(() -> {
+                    if (responseView != null) responseView.setText("草稿已取消。");
+                });
+            } catch (Exception error) {
+                runOnMain(() -> {
+                    actionButton.setEnabled(true);
+                    if (responseView != null) responseView.setText("取消草稿失败：" + error.getMessage());
+                });
+            } finally {
+                draftActionGuard.finish(draft.draftId);
+                runOnMain(this::loadAssistantDraftCards);
+            }
+        });
+    }
+
+    private void persistChatContext() {
+        LocalChatHistoryStore.save(
+                this,
+                activeConversationId,
+                LocalChatHistoryStore.fromTurns(chatContext.snapshot(80))
+        );
+    }
+
+    private void clearChatHistorySyncMessage() {
+        if (chatHistorySyncView != null && chatHistoryView != null) {
+            chatHistoryView.removeView(chatHistorySyncView);
+        }
+        chatHistorySyncView = null;
     }
 
     private void addHistoryAttachmentCard(ChatHistoryAttachment attachment) {
@@ -1083,6 +1416,13 @@ public final class FloatingBallService extends Service {
         card.setTextColor(Color.rgb(30, 64, 175));
         card.setPadding(dp(10), dp(8), dp(10), dp(8));
         card.setBackground(rounded(Color.rgb(239, 246, 255), Color.rgb(191, 219, 254), 10));
+        if (!attachment.contentUrl.isEmpty()) {
+            card.setOnClickListener(view -> openInternalFileViewer(
+                    attachment.contentUrl,
+                    attachment.filename,
+                    attachment.mimeType
+            ));
+        }
         LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(-1, -2);
         params.setMargins(dp(16), 0, 0, dp(8));
         chatHistoryView.addView(card, params);
@@ -1092,14 +1432,6 @@ public final class FloatingBallService extends Service {
         if (bytes < 1024L) return bytes + " B";
         if (bytes < 1024L * 1024L) return Math.max(1L, bytes / 1024L) + " KB";
         return Math.max(1L, bytes / (1024L * 1024L)) + " MB";
-    }
-
-    private void persistLocalChatHistory() {
-        LocalChatHistoryStore.save(
-                this,
-                activeConversationId,
-                LocalChatHistoryStore.fromTurns(chatContext.snapshot(80))
-        );
     }
 
     private String speakerForHistoryRole(String role) {
@@ -1127,6 +1459,8 @@ public final class FloatingBallService extends Service {
         settingsStatusView = null;
         chatHistoryView = null;
         chatScrollView = null;
+        chatHistorySyncView = null;
+        displayedProactiveIds.clear();
         attachmentTrayView = null;
         composerInput = null;
         composerSendButton = null;
@@ -1249,8 +1583,8 @@ public final class FloatingBallService extends Service {
                 }
 
                 @Override
-                public void onChatDone(String answer, String conversationId) {
-                    runOnMain(() -> completeStreamingChat(answer, conversationId));
+                public void onChatDone(String answer, String conversationId, List<ChatArtifact> artifacts, String taskRunId) {
+                    runOnMain(() -> completeStreamingChat(answer, conversationId, artifacts, taskRunId));
                 }
             });
             realtimeClient.start();
@@ -1273,6 +1607,18 @@ public final class FloatingBallService extends Service {
         updateBallBadge();
         removeBubble();
 
+        ProactiveSurfacePolicy.Surface surface = ProactiveSurfacePolicy.choose(
+                panelView != null && chatHistoryView != null,
+                NomiForegroundUiState.isVisible()
+        );
+        if (surface == ProactiveSurfacePolicy.Surface.SUPPRESS_OVERLAY) {
+            return;
+        }
+        if (surface == ProactiveSurfacePolicy.Surface.INLINE_PANEL_CARD) {
+            addInlineProactiveCard(message);
+            return;
+        }
+
         bubbleView = new TextView(this);
         bubbleView.setText(bubbleText(message));
         bubbleView.setTextSize(13);
@@ -1287,6 +1633,27 @@ public final class FloatingBallService extends Service {
         bubbleParams.gravity = Gravity.TOP | Gravity.START;
         positionBubble();
         windowManager.addView(bubbleView, bubbleParams);
+    }
+
+    private void addInlineProactiveCard(ProactiveMessage message) {
+        if (message == null || chatHistoryView == null) return;
+        String messageId = message.id == null ? "" : message.id.trim();
+        if (!messageId.isEmpty() && !displayedProactiveIds.add(messageId)) return;
+
+        TextView card = new TextView(this);
+        card.setText("Nomi 提醒\n" + bubbleText(message));
+        card.setSingleLine(false);
+        card.setHorizontallyScrolling(false);
+        card.setBreakStrategy(Layout.BREAK_STRATEGY_HIGH_QUALITY);
+        card.setTextSize(13);
+        card.setTextColor(Color.rgb(15, 23, 42));
+        card.setPadding(dp(12), dp(10), dp(12), dp(10));
+        card.setBackground(rounded(Color.rgb(236, 253, 245), Color.rgb(20, 184, 166), 14));
+        card.setOnClickListener(view -> openWorkbenchChat(message));
+        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(-1, -2);
+        params.setMargins(0, 0, 0, dp(8));
+        chatHistoryView.addView(card, params);
+        scrollChatToLatest();
     }
 
     private String bubbleText(ProactiveMessage message) {
@@ -1564,7 +1931,11 @@ public final class FloatingBallService extends Service {
     private void openAppChat() {
         Intent intent = new Intent(this, WebWorkspaceActivity.class);
         intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
-        intent.putExtra(WebWorkspaceActivity.EXTRA_URL, WorkbenchUrls.chatUrl(ConfigPrefs.baseUrlOrDefault(this), activeConversationId));
+        String conversationId = ConfigPrefs.conversationId(this);
+        if (conversationId == null || conversationId.trim().isEmpty()) {
+            conversationId = activeConversationId;
+        }
+        intent.putExtra(WebWorkspaceActivity.EXTRA_URL, WorkbenchUrls.chatUrl(ConfigPrefs.baseUrlOrDefault(this), conversationId));
         startActivity(intent);
         closePanel();
     }
@@ -1598,6 +1969,158 @@ public final class FloatingBallService extends Service {
             }
         }
         return message;
+    }
+
+    private TextView addArtifactCard(ChatArtifact artifact) {
+        TextView card = new TextView(this);
+        String filename = artifact == null || artifact.filename.trim().isEmpty()
+                ? "Nomi 生成的文件"
+                : artifact.filename.trim();
+        String statusLine = artifact == null ? "文件 · 待校验" : artifact.statusLine();
+        card.setText("文件已准备好\n" + filename + "\n" + statusLine + "\n点击查看");
+        card.setSingleLine(false);
+        card.setHorizontallyScrolling(false);
+        card.setBreakStrategy(Layout.BREAK_STRATEGY_HIGH_QUALITY);
+        card.setHyphenationFrequency(Layout.HYPHENATION_FREQUENCY_NORMAL);
+        card.setTextSize(13);
+        card.setTextColor(Color.rgb(15, 23, 42));
+        card.setPadding(dp(12), dp(10), dp(12), dp(10));
+        card.setBackground(rounded(Color.rgb(236, 253, 245), Color.rgb(20, 184, 166), 14));
+        card.setOnClickListener(view -> openInternalFileViewer(
+                artifact == null ? "" : artifact.downloadUrl,
+                filename,
+                artifact == null ? "" : artifact.mimeType
+        ));
+        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(-1, -2);
+        params.setMargins(0, 0, 0, dp(8));
+        if (chatHistoryView != null) {
+            chatHistoryView.addView(card, params);
+            if (chatScrollView != null) {
+                chatScrollView.post(() -> chatScrollView.fullScroll(View.FOCUS_DOWN));
+            }
+        }
+        return card;
+    }
+
+    private boolean addArtifactCardOnce(ChatArtifact artifact) {
+        String key = artifactKey(artifact);
+        if (key.isEmpty() || displayedArtifactKeys.contains(key)) return false;
+        displayedArtifactKeys.add(key);
+        addArtifactCard(artifact);
+        return true;
+    }
+
+    private String artifactKey(ChatArtifact artifact) {
+        if (artifact == null) return "";
+        String artifactId = artifact.artifactId == null ? "" : artifact.artifactId.trim();
+        if (!artifactId.isEmpty()) return artifactId;
+        String downloadUrl = artifact.downloadUrl == null ? "" : artifact.downloadUrl.trim();
+        if (!downloadUrl.isEmpty()) return downloadUrl;
+        return artifact.filename == null ? "" : artifact.filename.trim();
+    }
+
+    private ChatArtifact artifactFromHistoryMessage(String content) {
+        String url = FloatingMessageLinks.firstWebUrl(content);
+        if (!ArtifactDownloadUrls.isArtifactDownloadUrl(url)) return null;
+        return artifactFromDownloadUrl(url, artifactFilenameFromHistoryMessage(content));
+    }
+
+    private ChatArtifact artifactFromDownloadUrl(String url) {
+        return artifactFromDownloadUrl(url, "");
+    }
+
+    private ChatArtifact artifactFromDownloadUrl(String url, String filename) {
+        String safeUrl = url == null ? "" : url.trim();
+        String safeFilename = filename == null ? "" : filename.trim();
+        String artifactId = artifactIdFromDownloadUrl(safeUrl);
+        if (safeFilename.isEmpty()) {
+            safeFilename = artifactId.isEmpty() ? "nomi-artifact.pptx" : "nomi-artifact-" + artifactId + ".pptx";
+        }
+        return new ChatArtifact(
+                artifactId,
+                "",
+                artifactTypeFromFilename(safeFilename),
+                safeFilename,
+                mimeTypeFromFilename(safeFilename),
+                safeUrl,
+                ""
+        );
+    }
+
+    private String artifactFilenameFromHistoryMessage(String content) {
+        String body = content == null ? "" : content;
+        String marker = "已生成 PPT 文件：";
+        int start = body.indexOf(marker);
+        if (start < 0) {
+            marker = "已生成 PPT 文件:";
+            start = body.indexOf(marker);
+        }
+        if (start < 0) return "";
+        start += marker.length();
+        int end = body.indexOf('\n', start);
+        String filename = end >= 0 ? body.substring(start, end) : body.substring(start);
+        return filename.trim();
+    }
+
+    private String artifactIdFromDownloadUrl(String url) {
+        String clean = url == null ? "" : url.trim();
+        int marker = clean.indexOf("/api/artifacts/");
+        if (marker < 0) return "";
+        int start = marker + "/api/artifacts/".length();
+        int end = clean.indexOf("/download", start);
+        if (end < 0 || end <= start) return "";
+        return clean.substring(start, end).replaceAll("[^A-Za-z0-9_-]", "");
+    }
+
+    private String artifactTypeFromFilename(String filename) {
+        String lower = filename == null ? "" : filename.trim().toLowerCase();
+        if (lower.endsWith(".pptx")) return "pptx";
+        if (lower.endsWith(".docx")) return "docx";
+        if (lower.endsWith(".xlsx")) return "xlsx";
+        return "";
+    }
+
+    private String mimeTypeFromFilename(String filename) {
+        String type = artifactTypeFromFilename(filename);
+        if ("pptx".equals(type)) {
+            return "application/vnd.openxmlformats-officedocument.presentationml.presentation";
+        }
+        if ("docx".equals(type)) {
+            return "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+        }
+        if ("xlsx".equals(type)) {
+            return "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
+        }
+        return "application/octet-stream";
+    }
+
+    private void openInternalFileViewer(String source, String filename, String mimeType) {
+        String viewerUrl = FileViewerUrls.viewerUrl(
+                ConfigPrefs.baseUrlOrDefault(this),
+                source,
+                filename,
+                mimeType
+        );
+        if (viewerUrl.isEmpty()) {
+            Toast.makeText(this, "文件查看地址无效", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        hideAssistantOverlaysForArtifactViewer();
+        try {
+            startActivity(NomiFileViewerActivity.intentFor(this, viewerUrl));
+        } catch (Exception error) {
+            if (ballView == null) showBall();
+            Toast.makeText(this, "未能打开 Nomi 文件查看器：" + error.getMessage(), Toast.LENGTH_LONG).show();
+        }
+    }
+
+    private void hideAssistantOverlaysForArtifactViewer() {
+        closePanel();
+        removeBubble();
+        removeExternalAuthCloseButton();
+        removeView(ballView);
+        ballView = null;
+        ballParams = null;
     }
 
     private String messageText(String speaker, String body) {
@@ -2023,6 +2546,11 @@ public final class FloatingBallService extends Service {
     }
 
     private boolean openChatMessageUrl(String url) {
+        if (ArtifactDownloadUrls.isArtifactDownloadUrl(url)) {
+            ChatArtifact artifact = artifactFromDownloadUrl(url);
+            openInternalFileViewer(artifact.downloadUrl, artifact.filename, artifact.mimeType);
+            return true;
+        }
         if (!FloatingMessageLinks.isLinkedInJobDetailUrl(url)) {
             closePanel();
             return false;

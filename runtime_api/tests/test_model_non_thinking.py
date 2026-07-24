@@ -62,7 +62,7 @@ async def test_openai_compatible_qwen_payload_uses_reasoning_effort_none(monkeyp
     assert answer == "ok"
     assert captured["reasoning_effort"] == "none"
     assert captured["enable_thinking"] is False
-    assert "chat_template_kwargs" not in captured
+    assert captured["chat_template_kwargs"] == {"enable_thinking": False}
 
 
 def test_qwen_non_thinking_options_only_applies_to_qwen():
@@ -71,10 +71,12 @@ def test_qwen_non_thinking_options_only_applies_to_qwen():
     assert qwen_non_thinking_options("qwen3.6") == {
         "reasoning_effort": "none",
         "enable_thinking": False,
+        "chat_template_kwargs": {"enable_thinking": False},
     }
     assert qwen_non_thinking_options("qwen/qwen3.6-27b") == {
         "reasoning_effort": "none",
         "enable_thinking": False,
+        "chat_template_kwargs": {"enable_thinking": False},
     }
     assert qwen_non_thinking_options("gpt-5.4-mini") == {}
 
@@ -109,6 +111,7 @@ def test_openclaw_context_model_uses_qwen_non_thinking_options(monkeypatch):
     assert result == {"include_keys": [], "exclude_keys": []}
     assert captured["reasoning_effort"] == "none"
     assert captured["enable_thinking"] is False
+    assert captured["chat_template_kwargs"] == {"enable_thinking": False}
 
 
 def test_pipeline_slot_model_uses_qwen_non_thinking_options(monkeypatch):
@@ -139,3 +142,4 @@ def test_pipeline_slot_model_uses_qwen_non_thinking_options(monkeypatch):
     assert result["reason"] == "ok"
     assert captured["reasoning_effort"] == "none"
     assert captured["enable_thinking"] is False
+    assert captured["chat_template_kwargs"] == {"enable_thinking": False}

@@ -125,6 +125,103 @@ public final class RealtimeClientTest {
     }
 
     @Test
+    public void parsesStreamingChatDoneArtifactCards() throws Exception {
+        RealtimeClient.ServerEvent done = RealtimeClient.parseServerEvent(
+                "{"
+                        + "\"type\":\"chat_done\","
+                        + "\"answer\":\"PPT 已生成，可以下载。\","
+                        + "\"conversation_id\":\"conv-artifact\","
+                        + "\"artifacts\":[{"
+                        + "\"artifact_id\":\"artifact_1\","
+                        + "\"task_run_id\":\"lta_1\","
+                        + "\"artifact_type\":\"pptx\","
+                        + "\"filename\":\"普通人也能理解_LLM.pptx\","
+                        + "\"download_url\":\"/api/artifacts/artifact_1/download\","
+                        + "\"verification_status\":\"verified\""
+                        + "}]"
+                        + "}"
+        );
+
+        assertNotNull(done);
+        assertEquals(1, done.artifacts.size());
+        ChatArtifact artifact = done.artifacts.get(0);
+        assertEquals("artifact_1", artifact.artifactId);
+        assertEquals("普通人也能理解_LLM.pptx", artifact.filename);
+        assertEquals("PPTX · 已校验", artifact.statusLine());
+    }
+
+    @Test
+    public void parsesStreamingChatDoneArtifactCardsFromTaskPayload() throws Exception {
+        RealtimeClient.ServerEvent done = RealtimeClient.parseServerEvent(
+                "{"
+                        + "\"type\":\"chat_done\","
+                        + "\"answer\":\"PPT 已生成，可以下载。\","
+                        + "\"conversation_id\":\"conv-artifact\","
+                        + "\"task\":{"
+                        + "\"status\":\"completed\","
+                        + "\"artifacts\":[{"
+                        + "\"artifact_id\":\"artifact_nested\","
+                        + "\"task_run_id\":\"lta_nested\","
+                        + "\"artifact_type\":\"pptx\","
+                        + "\"filename\":\"LLM工作原理.pptx\","
+                        + "\"download_url\":\"http://testserver/api/artifacts/artifact_nested/download\","
+                        + "\"verification_status\":\"verified\""
+                        + "}]"
+                        + "}"
+                        + "}"
+        );
+
+        assertNotNull(done);
+        assertEquals(1, done.artifacts.size());
+        assertEquals("artifact_nested", done.artifacts.get(0).artifactId);
+        assertEquals("LLM工作原理.pptx", done.artifacts.get(0).filename);
+    }
+
+    @Test
+    public void parsesStreamingChatDoneTaskRunIdWhenArtifactIsGeneratedLater() throws Exception {
+        RealtimeClient.ServerEvent done = RealtimeClient.parseServerEvent(
+                "{"
+                        + "\"type\":\"chat_done\","
+                        + "\"answer\":\"我已把 PPT 任务交给 OpenCode 处理。\","
+                        + "\"conversation_id\":\"conv-async-artifact\","
+                        + "\"task\":{"
+                        + "\"task_run_id\":\"lta_async_realtime\","
+                        + "\"status\":\"running\""
+                        + "}"
+                        + "}"
+        );
+
+        assertNotNull(done);
+        assertEquals("chat_done", done.type);
+        assertEquals("lta_async_realtime", done.taskId);
+        assertEquals("我已把 PPT 任务交给 OpenCode 处理。", done.chatAnswer);
+        assertEquals(0, done.artifacts.size());
+    }
+
+    @Test
+    public void parsesStreamingChatDoneWithoutTaskRunIdForClarificationTask() throws Exception {
+        RealtimeClient.ServerEvent done = RealtimeClient.parseServerEvent(
+                "{"
+                        + "\"type\":\"chat_done\","
+                        + "\"answer\":\"可以。我先确认两点：讲给谁？偏科普还是技术？\","
+                        + "\"conversation_id\":\"conv-clarify\","
+                        + "\"task\":{"
+                        + "\"task_run_id\":\"lta_clarify_realtime\","
+                        + "\"status\":\"waiting_user\","
+                        + "\"current_node\":\"waiting_for_human_input\","
+                        + "\"clarification\":{\"missing_fields\":[\"audience\",\"depth\"]}"
+                        + "}"
+                        + "}"
+        );
+
+        assertNotNull(done);
+        assertEquals("chat_done", done.type);
+        assertEquals("", done.taskId);
+        assertEquals("可以。我先确认两点：讲给谁？偏科普还是技术？", done.chatAnswer);
+        assertEquals(0, done.artifacts.size());
+    }
+
+    @Test
     public void buildsStreamingChatMessagePayloadForServerWebSocket() throws Exception {
         String payload = RealtimeClient.chatMessagePayload(
                 "继续核对成本",

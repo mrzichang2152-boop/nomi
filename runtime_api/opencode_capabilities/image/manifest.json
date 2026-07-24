@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "id": "image",
+  "version": "1.0.0",
+  "display_name": "Nomi Visual Studio",
+  "artifact_types": ["image", "png"],
+  "default_agent": "image-producer",
+  "resource_paths": {
+    "skills": ["skills/image-quality/SKILL.md"],
+    "agents": ["agents/image-producer.md"],
+    "tools": ["tools/create_image.ts"],
+    "plugins": []
+  },
+  "quality_profile": {
+    "minimum_dimension": 512,
+    "maximum_dimension": 4096,
+    "maximum_block_count": 6,
+    "maximum_characters_per_block": 360,
+    "maximum_items_per_block": 5,
+    "minimum_text_contrast_ratio": 4.5,
+    "minimum_non_background_ratio": 0.08,
+    "require_source_mapping": true,
+    "require_no_text_overflow": true
+  }
+}

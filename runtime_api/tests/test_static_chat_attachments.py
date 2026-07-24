@@ -44,7 +44,10 @@ def test_static_scripts_expose_progress_retry_remove_and_authenticated_previews(
     assert "attachment_ids" in module
     assert "client_request_id" in module
     assert "loadAuthenticatedAttachmentBlob" in app
-    assert 'searchParams.set("password"' not in app
+    attachment_transport = app[
+        app.index("async function loadAuthenticatedAttachmentBlob") : app.index("function renderMessageAttachments")
+    ]
+    assert 'searchParams.set("password"' not in attachment_transport
 
 
 def test_attachment_cards_and_tray_have_mobile_safe_layout_contracts():

@@ -30,6 +30,7 @@ def test_parallel_context_retrieval_runs_independent_fetchers_concurrently():
         needs_memory=True,
         needs_agenda=True,
         needs_tasks=True,
+        needs_web=True,
     )
 
     start = time.perf_counter()
@@ -41,6 +42,7 @@ def test_parallel_context_retrieval_runs_independent_fetchers_concurrently():
             "dialogue": slow("dialogue"),
             "agenda": slow("agenda"),
             "tasks": slow("tasks"),
+            "web": slow("web"),
         },
     )
     elapsed = time.perf_counter() - start
@@ -51,6 +53,7 @@ def test_parallel_context_retrieval_runs_independent_fetchers_concurrently():
     assert result["dialogue"] == [{"name": "dialogue"}]
     assert result["agenda"] == [{"name": "agenda"}]
     assert result["tasks"] == [{"name": "tasks"}]
+    assert result["web"] == [{"name": "web"}]
     assert result["latency_trace"]["source_ms"] >= 100
     assert result["latency_trace"]["memory_ms"] >= 100
     assert result["latency_trace"]["total_ms"] < 450

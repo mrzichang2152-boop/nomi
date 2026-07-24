@@ -47,7 +47,8 @@ final class LocalChatHistoryStore {
         if (turns == null || turns.isEmpty()) return List.of();
         ArrayList<ChatHistoryMessage> messages = new ArrayList<>();
         for (FloatingChatContext.Turn turn : turns) {
-            if (turn == null || !isSupportedRole(turn.role)) continue;
+            if (turn == null) continue;
+            if (!isSupportedRole(turn.role)) continue;
             String content = clean(turn.content);
             if (content.isEmpty()) continue;
             messages.add(new ChatHistoryMessage(turn.id, turn.createdAt, turn.role, content, turn.attachments));
@@ -94,14 +95,65 @@ final class LocalChatHistoryStore {
         boolean hasStableIds = hasAnyId(localMessages) && hasAnyId(remoteMessages);
         Overlap overlap = bestOverlap(localMessages, remoteMessages, hasStableIds);
         int requiredOverlap = Math.min(2, localMessages.size());
-        if (overlap.length < requiredOverlap) return tail(remoteMessages, safeLimit);
+        if (overlap.length < requiredOverlap) {
+            return tail(remoteMessages, safeLimit);
+        }
 
         ArrayList<ChatHistoryMessage> merged = new ArrayList<>();
         merged.addAll(localMessages.subList(0, overlap.localStart));
-        merged.addAll(remoteMessages.subList(overlap.remoteStart, remoteMessages.size()));
+        for (int index = overlap.remoteStart; index < remoteMessages.size(); index++) {
+            merged.add(remoteMessages.get(index));
+        }
         int localSuffixStart = overlap.localStart + overlap.length;
-        merged.addAll(localMessages.subList(localSuffixStart, localMessages.size()));
+        for (int index = localSuffixStart; index < localMessages.size(); index++) {
+            merged.add(localMessages.get(index));
+        }
         return tail(merged, safeLimit);
+    }
+
+    private static Overlap bestOverlap(
+            List<ChatHistoryMessage> local,
+            List<ChatHistoryMessage> remote,
+            boolean preferStableIds
+    ) {
+        Overlap best = new Overlap(0, 0, 0);
+        for (int localStart = 0; localStart < local.size(); localStart++) {
+            int maxLength = local.size() - localStart;
+            for (int length = maxLength; length >= 1; length--) {
+                for (int remoteStart = 0; remoteStart + length <= remote.size(); remoteStart++) {
+                    if (matches(local, localStart, remote, remoteStart, length, preferStableIds) && length > best.length) {
+                        best = new Overlap(localStart, remoteStart, length);
+                    }
+                }
+            }
+        }
+        return best;
+    }
+
+    private static boolean matches(
+            List<ChatHistoryMessage> local,
+            int localStart,
+            List<ChatHistoryMessage> remote,
+            int remoteStart,
+            int length,
+            boolean preferStableIds
+    ) {
+        for (int offset = 0; offset < length; offset++) {
+            if (!sameMessage(local.get(localStart + offset), remote.get(remoteStart + offset), preferStableIds)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private static boolean sameMessage(ChatHistoryMessage left, ChatHistoryMessage right, boolean preferStableIds) {
+        if (preferStableIds) {
+            String leftId = clean(left.id);
+            String rightId = clean(right.id);
+            return !leftId.isEmpty() && leftId.equals(rightId);
+        }
+        return clean(left.role).equals(clean(right.role))
+                && clean(left.content).equals(clean(right.content));
     }
 
     static String serializeMessages(List<ChatHistoryMessage> messages) {
@@ -184,10 +236,11 @@ final class LocalChatHistoryStore {
             String role = clean(message.role);
             String content = clean(message.content);
             String id = clean(message.id);
+            String createdAt = clean(message.createdAt);
             if (!isSupportedRole(role) || content.isEmpty()) continue;
             normalized.add(new ChatHistoryMessage(
                     id,
-                    clean(message.createdAt),
+                    createdAt,
                     role,
                     content,
                     normalizeAttachments(id, message.attachments)
@@ -229,52 +282,6 @@ final class LocalChatHistoryStore {
         return List.copyOf(normalized);
     }
 
-    private static Overlap bestOverlap(
-            List<ChatHistoryMessage> local,
-            List<ChatHistoryMessage> remote,
-            boolean preferStableIds
-    ) {
-        Overlap best = new Overlap(0, 0, 0);
-        for (int localStart = 0; localStart < local.size(); localStart++) {
-            for (int length = local.size() - localStart; length >= 1; length--) {
-                for (int remoteStart = 0; remoteStart + length <= remote.size(); remoteStart++) {
-                    if (matches(local, localStart, remote, remoteStart, length, preferStableIds)
-                            && length > best.length) {
-                        best = new Overlap(localStart, remoteStart, length);
-                    }
-                }
-            }
-        }
-        return best;
-    }
-
-    private static boolean matches(
-            List<ChatHistoryMessage> local,
-            int localStart,
-            List<ChatHistoryMessage> remote,
-            int remoteStart,
-            int length,
-            boolean preferStableIds
-    ) {
-        for (int offset = 0; offset < length; offset++) {
-            ChatHistoryMessage left = local.get(localStart + offset);
-            ChatHistoryMessage right = remote.get(remoteStart + offset);
-            if (preferStableIds) {
-                if (left.id.isEmpty() || !left.id.equals(right.id)) return false;
-            } else if (!left.role.equals(right.role) || !left.content.equals(right.content)) {
-                return false;
-            }
-        }
-        return true;
-    }
-
-    private static boolean hasAnyId(List<ChatHistoryMessage> messages) {
-        for (ChatHistoryMessage message : messages) {
-            if (!message.id.isEmpty()) return true;
-        }
-        return false;
-    }
-
     private static List<ChatHistoryMessage> tail(List<ChatHistoryMessage> messages, int limit) {
         if (messages == null || messages.isEmpty()) return List.of();
         int safeLimit = Math.max(1, limit);
@@ -282,14 +289,23 @@ final class LocalChatHistoryStore {
         return List.copyOf(messages.subList(from, messages.size()));
     }
 
+    private static boolean isSupportedRole(String role) {
+        return "user".equals(role) || "assistant".equals(role);
+    }
+
+    private static boolean hasAnyId(List<ChatHistoryMessage> messages) {
+        for (ChatHistoryMessage message : messages) {
+            if (message != null && !clean(message.id).isEmpty()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     private static String safeUrl(String value) {
         String url = clean(value);
         if (url.startsWith("/") || url.startsWith("https://") || url.startsWith("http://")) return url;
         return "";
-    }
-
-    private static boolean isSupportedRole(String role) {
-        return "user".equals(role) || "assistant".equals(role);
     }
 
     private static String messageFingerprint(ChatHistoryMessage message) {

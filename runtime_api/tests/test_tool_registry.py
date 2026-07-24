@@ -137,3 +137,21 @@ def test_tool_registry_schema_sql_creates_capability_and_trace_tables():
     assert "CREATE TABLE IF NOT EXISTS capability_catalog" in combined
     assert "CREATE TABLE IF NOT EXISTS tool_registry_entries" in combined
     assert "CREATE TABLE IF NOT EXISTS tool_invocation_traces" in combined
+
+
+def test_opencode_assistant_tool_manifest_delegates_to_bounded_gateway():
+    from app.tool_registry import opencode_assistant_tool_manifest
+
+    manifest = opencode_assistant_tool_manifest()
+
+    assert [tool["name"] for tool in manifest] == [
+        "assistant.identity.get_status",
+        "assistant.contacts.resolve",
+        "assistant.email.create_draft",
+        "assistant.outbound.get_status",
+        "assistant.outbound.cancel_draft",
+    ]
+    serialized = str(manifest).lower()
+    assert "send_confirmed_draft" not in serialized
+    assert "confirmation_token" not in serialized
+    assert "composio" not in serialized
