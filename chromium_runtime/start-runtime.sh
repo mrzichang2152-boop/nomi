@@ -8,6 +8,7 @@ SCREEN_HEIGHT="${SCREEN_HEIGHT:-1080}"
 SCREEN_DEPTH="${SCREEN_DEPTH:-24}"
 CHROMIUM_WINDOW_WIDTH="${CHROMIUM_WINDOW_WIDTH:-$SCREEN_WIDTH}"
 CHROMIUM_WINDOW_HEIGHT="${CHROMIUM_WINDOW_HEIGHT:-$SCREEN_HEIGHT}"
+CHROMIUM_DEVICE_SCALE_FACTOR="${CHROMIUM_DEVICE_SCALE_FACTOR:-1.25}"
 VNC_PASSWORD="${VNC_PASSWORD:-par-dev-vnc}"
 CHROMIUM_EXECUTABLE="${CHROMIUM_EXECUTABLE:-/usr/bin/chromium}"
 CHROMIUM_CDP_PORT="${CHROMIUM_CDP_PORT:-9222}"
@@ -88,6 +89,7 @@ fluxbox >/tmp/fluxbox.log 2>&1 &
   --disable-session-crashed-bubble \
   --start-maximized \
   --window-size="${CHROMIUM_WINDOW_WIDTH},${CHROMIUM_WINDOW_HEIGHT}" \
+  --force-device-scale-factor="$CHROMIUM_DEVICE_SCALE_FACTOR" \
   --window-position=0,0 \
   https://www.google.com \
   >/tmp/chromium.log 2>&1 &

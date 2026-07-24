@@ -93,7 +93,7 @@ final class ConfigPrefs {
     }
 
     private static String noVncQuery(String appPassword) {
-        return "?path=websockify&autoconnect=1&resize=remote&quality=6&compression=2&show_dot=1&password="
+        return "?path=websockify&autoconnect=1&scale=1&quality=6&compression=2&show_dot=1&password="
                 + encode(vncPassword(appPassword));
     }
 

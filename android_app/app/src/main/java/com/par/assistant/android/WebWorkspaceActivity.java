@@ -613,7 +613,7 @@ public final class WebWorkspaceActivity extends Activity {
         bar.setBackgroundColor(Color.rgb(245, 248, 252));
 
         TextView hint = new TextView(this);
-        hint.setText("先点远端输入框，再在这里输入。");
+        hint.setText("双指上下滑动远端页面；先点远端输入框，再在这里输入。");
         hint.setTextColor(Color.rgb(75, 85, 99));
         hint.setTextSize(13);
         bar.addView(hint, new LinearLayout.LayoutParams(

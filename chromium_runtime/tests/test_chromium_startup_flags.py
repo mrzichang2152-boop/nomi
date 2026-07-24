@@ -42,3 +42,11 @@ def test_chromium_startup_preserves_site_session_storage_for_login_state():
     cleanup_block = text.split("fluxbox >/tmp/fluxbox.log", 1)[0]
 
     assert "/app/user_profile/Default/Session\\ Storage" not in cleanup_block
+
+
+def test_chromium_startup_uses_configurable_phone_readable_scale():
+    script = Path(__file__).resolve().parents[1] / "start-runtime.sh"
+    text = script.read_text(encoding="utf-8")
+
+    assert 'CHROMIUM_DEVICE_SCALE_FACTOR="${CHROMIUM_DEVICE_SCALE_FACTOR:-1.25}"' in text
+    assert '--force-device-scale-factor="$CHROMIUM_DEVICE_SCALE_FACTOR"' in text

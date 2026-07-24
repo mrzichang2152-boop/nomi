@@ -62,6 +62,7 @@ public final class WebWorkspaceKeyboardTest {
 
         assertTrue(activity.contains("isRemoteBrowserUrl"));
         assertTrue(activity.contains("showRemoteInputBar"));
+        assertTrue(activity.contains("双指上下滑动远端页面"));
         assertTrue(activity.contains("输入到远端"));
         assertTrue(activity.contains("sendRemoteText"));
         assertTrue(activity.contains("requestRemoteBrowserType"));

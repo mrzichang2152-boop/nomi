@@ -10,7 +10,7 @@ public final class ConfigPrefsTest {
         String url = ConfigPrefs.remoteBrowserUrlFor("http://206.119.171.141", "par-dev");
 
         assertEquals(
-                "http://206.119.171.141:6080/vnc_lite.html?path=websockify&autoconnect=1&resize=remote&quality=6&compression=2&show_dot=1&password=par-dev-vnc",
+                "http://206.119.171.141:6080/vnc_lite.html?path=websockify&autoconnect=1&scale=1&quality=6&compression=2&show_dot=1&password=par-dev-vnc",
                 url
         );
     }
@@ -20,7 +20,7 @@ public final class ConfigPrefsTest {
         String url = ConfigPrefs.remoteBrowserUrlFor("http://example.test", "p a/r");
 
         assertEquals(
-                "http://example.test:6080/vnc_lite.html?path=websockify&autoconnect=1&resize=remote&quality=6&compression=2&show_dot=1&password=p+a%2Fr-vnc",
+                "http://example.test:6080/vnc_lite.html?path=websockify&autoconnect=1&scale=1&quality=6&compression=2&show_dot=1&password=p+a%2Fr-vnc",
                 url
         );
     }
