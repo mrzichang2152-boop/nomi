@@ -4,7 +4,7 @@
 
 **Goal:** Make the Android remote browser readable, fully fitted, and scrollable on phones with different resolutions.
 
-**Architecture:** Android enables the noVNC lite client's supported viewport scaling parameter instead of the ignored remote-resize parameter. The remote Chromium runtime uses a configurable 1.25 device scale factor for readability, while noVNC keeps native single-pointer interaction and two-finger remote scrolling.
+**Architecture:** Android enables the noVNC lite client's supported viewport scaling parameter instead of the ignored remote-resize parameter. The remote Chromium runtime uses a configurable 125% default page zoom preference for readability without scaling the X11 window, while noVNC keeps native single-pointer interaction and two-finger remote scrolling.
 
 **Tech Stack:** Android Java, JUnit 4, Bash, Chromium, Docker Compose, pytest, noVNC, ADB/CDP
 
@@ -51,12 +51,15 @@ The RED tests remain uncommitted until Task 3 is green, so the branch never reco
 - [ ] **Step 1: Add the scale-factor startup test**
 
 ```python
-def test_chromium_startup_uses_configurable_phone_readable_scale():
+def test_chromium_startup_uses_page_zoom_without_scaling_the_x11_window():
     script = Path(__file__).resolve().parents[1] / "start-runtime.sh"
     text = script.read_text(encoding="utf-8")
 
-    assert 'CHROMIUM_DEVICE_SCALE_FACTOR="${CHROMIUM_DEVICE_SCALE_FACTOR:-1.25}"' in text
-    assert '--force-device-scale-factor="$CHROMIUM_DEVICE_SCALE_FACTOR"' in text
+    assert 'CHROMIUM_PAGE_ZOOM_PERCENT="${CHROMIUM_PAGE_ZOOM_PERCENT:-125}"' in text
+    assert 'zoom_factor = float(os.environ["CHROMIUM_PAGE_ZOOM_PERCENT"]) / 100.0' in text
+    assert 'math.log(zoom_factor) / math.log(1.2)' in text
+    assert 'partition["default_zoom_level"] = {"x": zoom_level}' in text
+    assert "--force-device-scale-factor" not in text
 ```
 
 - [ ] **Step 2: Run the Chromium test and verify RED**
@@ -67,7 +70,7 @@ Run:
 python3 -m pytest chromium_runtime/tests/test_chromium_startup_flags.py -q
 ```
 
-Expected: the new test fails because the startup script has no scale-factor configuration.
+Expected: the new test fails because the startup script has no page-zoom configuration.
 
 ### Task 3: Implement the minimal mobile-fit behavior
 
@@ -99,20 +102,28 @@ hint.setText("双指上下滑动远端页面；先点远端输入框，再在这
 Add this default beside the existing Chromium window variables:
 
 ```bash
-CHROMIUM_DEVICE_SCALE_FACTOR="${CHROMIUM_DEVICE_SCALE_FACTOR:-1.25}"
+CHROMIUM_PAGE_ZOOM_PERCENT="${CHROMIUM_PAGE_ZOOM_PERCENT:-125}"
+export CHROMIUM_PAGE_ZOOM_PERCENT
 ```
 
-Add this launch argument beside `--window-size`:
+In the existing startup preference update, convert the percentage to Chromium's
+official zoom level and store it for the default profile partition:
 
-```bash
---force-device-scale-factor="$CHROMIUM_DEVICE_SCALE_FACTOR" \
+```python
+zoom_factor = float(os.environ["CHROMIUM_PAGE_ZOOM_PERCENT"]) / 100.0
+zoom_level = math.log(zoom_factor) / math.log(1.2)
+partition = preferences.setdefault("partition", {})
+partition["default_zoom_level"] = {"x": zoom_level}
 ```
 
 Add this explicit environment value to `chromium-runtime` in `docker-compose.yml`:
 
 ```yaml
-CHROMIUM_DEVICE_SCALE_FACTOR: "1.25"
+CHROMIUM_PAGE_ZOOM_PERCENT: "125"
 ```
+
+Do not add `--force-device-scale-factor`; it scales the Chromium rendering surface
+beyond the fixed X11 window and causes physical-pixel clipping.
 
 - [ ] **Step 4: Run focused tests and verify GREEN**
 
@@ -187,7 +198,7 @@ Expected: `android_app/app/build/outputs/apk/debug/app-debug.apk` exists and the
 
 - [ ] **Step 1: Synchronize and recreate the Chromium runtime**
 
-Run the repository deployment workflow, rebuild `chromium-runtime`, and keep its persisted profile volume. Confirm the live Chromium command contains `--force-device-scale-factor=1.25`.
+Run the repository deployment workflow, rebuild `chromium-runtime`, and keep its persisted profile volume. Confirm the live Chromium command does not contain `--force-device-scale-factor`, and the profile contains a default zoom level equivalent to 125%.
 
 - [ ] **Step 2: Install the APK**
 
@@ -209,4 +220,4 @@ Bring a temporary long page to the front in the remote Chromium instance. Send a
 
 - [ ] **Step 5: Capture final evidence**
 
-Save a true-device screenshot showing the complete remote page and record the measured WebView size, canvas bounds, Chromium device scale factor, and remote scroll delta.
+Save a true-device screenshot showing the complete remote page and record the measured WebView size, canvas bounds, Chromium page zoom, horizontal overflow, and remote scroll delta.

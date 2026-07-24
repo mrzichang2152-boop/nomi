@@ -27,10 +27,14 @@ Android 当前生成的 noVNC 地址包含 `resize=remote`，但服务器使用�
 
 ### 远端页面可读性
 
-Chromium 运行时增加可配置的 `CHROMIUM_DEVICE_SCALE_FACTOR`，默认值为 `1.25`，
-并传给 `--force-device-scale-factor`。远端桌面分辨率仍保持 1080×1920；显示比例
-只提高浏览器界面和网页内容的可读性。部署配置显式传入 `1.25`，未来可按设备
-体验调整而不改代码。
+Chromium 运行时增加可配置的 `CHROMIUM_PAGE_ZOOM_PERCENT`，默认值为 `125`。
+启动时将百分比转换为 Chromium zoom level，并写入官方支持的
+`partition.default_zoom_level` profile 偏好。远端桌面和 X11 窗口仍保持
+1080×1920；网页布局宽度约为 864 CSS 像素，物理渲染宽度仍为 1080 像素。
+
+不使用 `--force-device-scale-factor`。真机验证表明该参数在 X11 窗口仍为
+1080 CSS 像素时会生成约 1350 像素宽的渲染面，造成 framebuffer 裁切；
+网页默认缩放可以提高可读性而不改变 X11 窗口的像素边界。
 
 ### 滚动和输入
 
@@ -50,7 +54,7 @@ Chromium 运行时增加可配置的 `CHROMIUM_DEVICE_SCALE_FACTOR`，默认值�
 1. Android 从服务器地址和应用密码生成带 `scale=1` 的 noVNC URL。
 2. WebView 加载 `vnc_lite.html`，noVNC 将 1080×1920 远端画布缩放到当前
    WebView 可视区域。
-3. Chromium 以 1.25 的显示比例渲染远端页面。
+3. Chromium 以 125% 的默认网页缩放渲染远端页面。
 4. 用户单指操作由 noVNC 转换为远端指针事件；双指上下滑动转换为远端滚轮事件。
 5. 手机方向或可视高度变化时，现有 `resize` 处理让 noVNC 重新计算缩放。
 
@@ -63,7 +67,8 @@ Chromium 运行时增加可配置的 `CHROMIUM_DEVICE_SCALE_FACTOR`，默认值�
 
 - Android 单元测试断言远程 URL 使用 `scale=1`，且密码仍正确编码。
 - Android 源码回归测试断言远程输入栏展示双指滚动提示。
-- Chromium 启动脚本测试断言默认显示比例和启动参数存在。
+- Chromium 启动脚本测试断言默认网页缩放偏好存在，并禁止使用会裁切 X11
+  窗口的 `--force-device-scale-factor`。
 - Android 全量单元测试和 Chromium 运行时测试通过。
 - 构建并安装 Android Debug APK。
 - 服务端重建 Chromium 运行时后确认实际启动参数、noVNC URL 和画布尺寸。

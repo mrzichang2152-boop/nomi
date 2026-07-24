@@ -44,9 +44,12 @@ def test_chromium_startup_preserves_site_session_storage_for_login_state():
     assert "/app/user_profile/Default/Session\\ Storage" not in cleanup_block
 
 
-def test_chromium_startup_uses_configurable_phone_readable_scale():
+def test_chromium_startup_uses_page_zoom_without_scaling_the_x11_window():
     script = Path(__file__).resolve().parents[1] / "start-runtime.sh"
     text = script.read_text(encoding="utf-8")
 
-    assert 'CHROMIUM_DEVICE_SCALE_FACTOR="${CHROMIUM_DEVICE_SCALE_FACTOR:-1.25}"' in text
-    assert '--force-device-scale-factor="$CHROMIUM_DEVICE_SCALE_FACTOR"' in text
+    assert 'CHROMIUM_PAGE_ZOOM_PERCENT="${CHROMIUM_PAGE_ZOOM_PERCENT:-125}"' in text
+    assert 'zoom_factor = float(os.environ["CHROMIUM_PAGE_ZOOM_PERCENT"]) / 100.0' in text
+    assert 'math.log(zoom_factor) / math.log(1.2)' in text
+    assert 'partition["default_zoom_level"] = {"x": zoom_level}' in text
+    assert "--force-device-scale-factor" not in text

@@ -8,7 +8,8 @@ SCREEN_HEIGHT="${SCREEN_HEIGHT:-1080}"
 SCREEN_DEPTH="${SCREEN_DEPTH:-24}"
 CHROMIUM_WINDOW_WIDTH="${CHROMIUM_WINDOW_WIDTH:-$SCREEN_WIDTH}"
 CHROMIUM_WINDOW_HEIGHT="${CHROMIUM_WINDOW_HEIGHT:-$SCREEN_HEIGHT}"
-CHROMIUM_DEVICE_SCALE_FACTOR="${CHROMIUM_DEVICE_SCALE_FACTOR:-1.25}"
+CHROMIUM_PAGE_ZOOM_PERCENT="${CHROMIUM_PAGE_ZOOM_PERCENT:-125}"
+export CHROMIUM_PAGE_ZOOM_PERCENT
 VNC_PASSWORD="${VNC_PASSWORD:-par-dev-vnc}"
 CHROMIUM_EXECUTABLE="${CHROMIUM_EXECUTABLE:-/usr/bin/chromium}"
 CHROMIUM_CDP_PORT="${CHROMIUM_CDP_PORT:-9222}"
@@ -49,17 +50,22 @@ rm -rf \
   /app/user_profile/Default/Last\ Session \
   /app/user_profile/Default/Last\ Tabs
 
+mkdir -p /app/user_profile/Default
 PREFERENCES_FILE="/app/user_profile/Default/Preferences"
-if [ -f "$PREFERENCES_FILE" ]; then
-  python3 - <<'PY'
+python3 - <<'PY'
 import json
+import math
+import os
 from pathlib import Path
 
 path = Path("/app/user_profile/Default/Preferences")
-try:
-    preferences = json.loads(path.read_text(encoding="utf-8"))
-except Exception:
-    raise SystemExit(0)
+if path.exists():
+    try:
+        preferences = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        raise SystemExit(0)
+else:
+    preferences = {}
 
 profile = preferences.setdefault("profile", {})
 profile["exited_cleanly"] = True
@@ -67,9 +73,12 @@ profile["exit_type"] = "Normal"
 sessions = preferences.setdefault("sessions", {})
 sessions["event_log"] = []
 sessions["session_data_status"] = 0
+zoom_factor = float(os.environ["CHROMIUM_PAGE_ZOOM_PERCENT"]) / 100.0
+zoom_level = math.log(zoom_factor) / math.log(1.2)
+partition = preferences.setdefault("partition", {})
+partition["default_zoom_level"] = {"x": zoom_level}
 path.write_text(json.dumps(preferences, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
 PY
-fi
 
 fluxbox >/tmp/fluxbox.log 2>&1 &
 
@@ -89,7 +98,6 @@ fluxbox >/tmp/fluxbox.log 2>&1 &
   --disable-session-crashed-bubble \
   --start-maximized \
   --window-size="${CHROMIUM_WINDOW_WIDTH},${CHROMIUM_WINDOW_HEIGHT}" \
-  --force-device-scale-factor="$CHROMIUM_DEVICE_SCALE_FACTOR" \
   --window-position=0,0 \
   https://www.google.com \
   >/tmp/chromium.log 2>&1 &
