@@ -8,14 +8,16 @@ JS = (ROOT / "app" / "static" / "app.js").read_text(encoding="utf-8")
 CSS = (ROOT / "app" / "static" / "styles.css").read_text(encoding="utf-8")
 
 
-def test_assistant_identity_is_a_first_level_view_separate_from_user_accounts():
-    nav_start = HTML.index('<nav class="nav-actions"')
+def test_assistant_identity_is_a_settings_section_separate_from_user_accounts():
+    nav_start = HTML.index('<nav class="settings-navigation"')
     nav_end = HTML.index("</nav>", nav_start)
     nav = HTML[nav_start:nav_end]
 
-    assert 'data-view="assistantIdentitiesView"' in nav
+    assert 'data-settings-section="assistantIdentitiesView"' in nav
     assert ">助理身份</button>" in nav
-    assert nav.index('data-view="assistantIdentitiesView"') < nav.index('data-view="toolsView"')
+    assert nav.index('data-settings-section="toolsView"') < nav.index(
+        'data-settings-section="assistantIdentitiesView"'
+    )
     assert 'id="assistantIdentitiesView"' in HTML
     assert 'id="assistantIdentityList"' in HTML
 

@@ -10,7 +10,7 @@ CSS = (ROOT / "app" / "static" / "styles.css").read_text(encoding="utf-8")
 
 def test_web_search_settings_compact_list_and_detail_contract():
     required_html = [
-        'data-view="webSearchSettingsView"',
+        'data-settings-section="webSearchSettingsView"',
         'id="webSearchSettingsView"',
         'id="webSearchProviderList"',
         'id="webSearchConfiguredSummary"',
