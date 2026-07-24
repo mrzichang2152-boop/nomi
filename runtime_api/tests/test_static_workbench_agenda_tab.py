@@ -24,6 +24,7 @@ const {{
   applyWorkbenchRouteToDocument,
   createLatestRequestGate,
   createWorkbenchNavigationController,
+  runCollectorSettingsUpdate,
   runLatestRequest,
   runUiTask,
 }} = require({str(app_js)!r});
@@ -913,6 +914,141 @@ assert.equal(
   true
 );
 assert.equal(completed, true);
+"""
+    )
+
+
+def test_runtime_latest_request_rejects_stale_parent_without_cancelling_fresh_load():
+    run_navigation_runtime(
+        """
+const gate = createLatestRequestGate();
+const committed = [];
+let resolveFresh;
+const fresh = runLatestRequest({
+  gate,
+  key: "collectors",
+  parentContext: { isCurrent: () => true },
+  load: () => new Promise((resolve) => {
+    resolveFresh = resolve;
+  }),
+  commit: (value) => committed.push(value),
+});
+
+const stale = await runLatestRequest({
+  gate,
+  key: "collectors",
+  parentContext: { isCurrent: () => false },
+  load: () => assert.fail("stale loader must not start"),
+  commit: () => assert.fail("stale loader must not commit"),
+});
+assert.equal(stale, false);
+
+resolveFresh("fresh collectors");
+assert.equal(await fresh, true);
+assert.deepEqual(committed, ["fresh collectors"]);
+"""
+    )
+
+
+def test_runtime_old_collector_patch_cannot_refresh_after_route_return():
+    run_navigation_runtime(
+        """
+const gate = createLatestRequestGate();
+const committed = [];
+const refreshCalls = [];
+const actionButton = { disabled: false, textContent: "暂停" };
+let oldRouteIsCurrent = true;
+let resolvePatch;
+
+const oldMutation = runCollectorSettingsUpdate({
+  routeContext: { isCurrent: () => oldRouteIsCurrent },
+  actionButton,
+  mutate: () => new Promise((resolve) => {
+    resolvePatch = resolve;
+  }),
+  refresh: (context) => {
+    refreshCalls.push(context);
+    return runLatestRequest({
+      gate,
+      key: "collectors",
+      parentContext: context,
+      load: () => Promise.resolve("stale refresh"),
+      commit: (value) => committed.push(value),
+    });
+  },
+});
+assert.equal(actionButton.disabled, true);
+
+oldRouteIsCurrent = false;
+let resolveFresh;
+const freshLoad = runLatestRequest({
+  gate,
+  key: "collectors",
+  parentContext: { isCurrent: () => true },
+  load: () => new Promise((resolve) => {
+    resolveFresh = resolve;
+  }),
+  commit: (value) => committed.push(value),
+});
+
+resolvePatch();
+await oldMutation;
+assert.deepEqual(refreshCalls, []);
+
+resolveFresh("fresh collectors");
+assert.equal(await freshLoad, true);
+assert.deepEqual(committed, ["fresh collectors"]);
+"""
+    )
+
+
+def test_runtime_ui_task_handles_literal_throw_and_rejecting_recovery():
+    run_navigation_runtime(
+        """
+const seen = [];
+assert.equal(
+  await runUiTask(
+    () => {
+      throw new Error("literal sync throw");
+    },
+    (error) => seen.push(error.message)
+  ),
+  false
+);
+assert.deepEqual(seen, ["literal sync throw"]);
+
+assert.equal(
+  await runUiTask(
+    () => Promise.reject(new Error("task rejected")),
+    () => Promise.reject(new Error("recovery rejected"))
+  ),
+  false
+);
+"""
+    )
+
+
+def test_runtime_collector_action_restores_button_and_reports_patch_failure():
+    run_navigation_runtime(
+        """
+const actionButton = { disabled: false, textContent: "暂停" };
+const recoveryErrors = [];
+let refreshCount = 0;
+const handled = await runCollectorSettingsUpdate({
+  routeContext: { isCurrent: () => true },
+  actionButton,
+  mutate: () => Promise.reject(new Error("collector patch failed")),
+  refresh: () => {
+    refreshCount += 1;
+  },
+  recover: (error) => recoveryErrors.push(error.message),
+});
+
+assert.equal(handled, false);
+assert.equal(actionButton.disabled, false);
+assert.equal(actionButton.textContent, "暂停");
+assert.equal(refreshCount, 0);
+assert.deepEqual(recoveryErrors, ["collector patch failed"]);
 """
     )
 

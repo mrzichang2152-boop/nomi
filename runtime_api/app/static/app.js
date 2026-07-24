@@ -83,6 +83,10 @@ function createLatestRequestGate() {
   };
 }
 
+function isRequestParentCurrent(parentContext = null) {
+  return typeof parentContext?.isCurrent !== "function" || parentContext.isCurrent();
+}
+
 async function runLatestRequest({
   gate,
   key,
@@ -91,6 +95,7 @@ async function runLatestRequest({
   commit,
   onError = () => {},
 }) {
+  if (!isRequestParentCurrent(parentContext)) return false;
   const context = gate.begin(key, parentContext);
   if (!context.isCurrent()) return false;
   try {
@@ -122,6 +127,30 @@ async function runUiTask(task, onError = () => {}) {
     }
     return false;
   }
+}
+
+function runCollectorSettingsUpdate({
+  routeContext,
+  actionButton,
+  mutate,
+  refresh,
+  recover = () => {},
+}) {
+  const previousText = actionButton.textContent;
+  actionButton.disabled = true;
+  return runUiTask(
+    async () => {
+      await mutate();
+      if (!isRequestParentCurrent(routeContext)) return false;
+      await refresh(routeContext);
+      return true;
+    },
+    async (error) => {
+      actionButton.disabled = false;
+      actionButton.textContent = previousText;
+      await recover(error);
+    }
+  );
 }
 
 function createWorkbenchNavigationController({
@@ -373,6 +402,7 @@ if (typeof module !== "undefined" && module.exports) {
     applyWorkbenchRouteToDocument,
     createLatestRequestGate,
     createWorkbenchNavigationController,
+    runCollectorSettingsUpdate,
     runLatestRequest,
     runUiTask,
   };
@@ -1677,6 +1707,7 @@ function governanceQueryString() {
 
 async function loadGovernance(parentContext = null) {
   if (!governanceContent) return false;
+  if (!isRequestParentCurrent(parentContext)) return false;
   governanceContent.textContent = "加载中...";
   return runLatestRequest({
     gate: workbenchRequestGate,
@@ -1999,6 +2030,7 @@ function formatAgendaTitle(item = {}) {
 
 async function loadAgenda(parentContext = null) {
   if (!agendaContent) return false;
+  if (!isRequestParentCurrent(parentContext)) return false;
   agendaContent.textContent = "加载中...";
   return runLatestRequest({
     gate: workbenchRequestGate,
@@ -3018,6 +3050,7 @@ function renderSuggestionCard(item, focusSuggestionId = "") {
 
 async function loadSuggestions(focusSuggestionId = "", fallbackEvent = null, parentContext = null) {
   if (!suggestionsContent) return false;
+  if (!isRequestParentCurrent(parentContext)) return false;
   suggestionsContent.textContent = "加载中...";
   return runLatestRequest({
     gate: workbenchRequestGate,
@@ -3133,28 +3166,9 @@ function collectorStatusText(item) {
   return "采集中";
 }
 
-function runCollectorSettingsUpdate(item, payload, actionButton, node) {
-  const previousText = actionButton.textContent;
-  const routeContext = workbenchNavigation.currentRouteContext();
-  actionButton.disabled = true;
-  return runUiTask(
-    async () => {
-      await api(`/api/collectors/settings/${item.source}`, {
-        method: "PATCH",
-        body: JSON.stringify(payload),
-      });
-      await loadCollectors(routeContext);
-    },
-    () => {
-      actionButton.disabled = false;
-      actionButton.textContent = previousText;
-      showWorkbenchActionError(node, "采集设置更新失败，请稍后重试。");
-    }
-  );
-}
-
 async function loadCollectors(parentContext = null) {
   if (!collectorsContent) return false;
+  if (!isRequestParentCurrent(parentContext)) return false;
   collectorsContent.textContent = "加载中...";
   return runLatestRequest({
     gate: workbenchRequestGate,
@@ -3171,30 +3185,42 @@ async function loadCollectors(parentContext = null) {
         const toggle = button(item.enabled && !item.paused ? "暂停" : "开启");
         toggle.addEventListener("click", () => {
           const nextEnabled = !(item.enabled && !item.paused);
-          runCollectorSettingsUpdate(
-            item,
-            {
-              enabled: nextEnabled,
-              paused_until: null,
-              reason: nextEnabled ? "" : "user paused from workbench",
-            },
-            toggle,
-            node
-          );
+          runCollectorSettingsUpdate({
+            routeContext: workbenchNavigation.currentRouteContext(),
+            actionButton: toggle,
+            mutate: () =>
+              api(`/api/collectors/settings/${item.source}`, {
+                method: "PATCH",
+                body: JSON.stringify({
+                  enabled: nextEnabled,
+                  paused_until: null,
+                  reason: nextEnabled ? "" : "user paused from workbench",
+                }),
+              }),
+            refresh: (context) => loadCollectors(context),
+            recover: () =>
+              showWorkbenchActionError(node, "采集设置更新失败，请稍后重试。"),
+          });
         });
         const pauseHour = button("暂停1小时");
         pauseHour.addEventListener("click", () => {
           const until = new Date(Date.now() + 60 * 60 * 1000).toISOString();
-          runCollectorSettingsUpdate(
-            item,
-            {
-              enabled: true,
-              paused_until: until,
-              reason: "temporary pause from workbench",
-            },
-            pauseHour,
-            node
-          );
+          runCollectorSettingsUpdate({
+            routeContext: workbenchNavigation.currentRouteContext(),
+            actionButton: pauseHour,
+            mutate: () =>
+              api(`/api/collectors/settings/${item.source}`, {
+                method: "PATCH",
+                body: JSON.stringify({
+                  enabled: true,
+                  paused_until: until,
+                  reason: "temporary pause from workbench",
+                }),
+              }),
+            refresh: (context) => loadCollectors(context),
+            recover: () =>
+              showWorkbenchActionError(node, "采集设置更新失败，请稍后重试。"),
+          });
         });
         actions.append(toggle, pauseHour);
         node.appendChild(actions);
@@ -3373,6 +3399,7 @@ async function loadWebSearchSettings(options = {}) {
   const reopenProvider = options?.reopenProvider || "";
   const parentContext = typeof options?.isCurrent === "function" ? options : null;
   if (!webSearchProviderList) return;
+  if (!isRequestParentCurrent(parentContext)) return false;
   webSearchProviderList.textContent = "加载搜索服务...";
   return runLatestRequest({
     gate: workbenchRequestGate,
@@ -3786,6 +3813,7 @@ function renderChatAssistantDrafts(items = []) {
 
 async function loadChatAssistantDrafts(parentContext = null) {
   if (!chatAssistantDrafts) return false;
+  if (!isRequestParentCurrent(parentContext)) return false;
   return runLatestRequest({
     gate: workbenchRequestGate,
     key: "chat-assistant-drafts",
@@ -3869,6 +3897,7 @@ function renderAssistantIdentityAudit(items = []) {
 
 async function loadAssistantIdentities(parentContext = null) {
   if (!assistantIdentityGmail) return false;
+  if (!isRequestParentCurrent(parentContext)) return false;
   assistantIdentityStatus.textContent = "正在读取服务端状态...";
   return runLatestRequest({
     gate: workbenchRequestGate,
@@ -3952,6 +3981,7 @@ async function loadTools(parentContext = null) {
     return message || fallback;
   };
   if (!toolsContent) return false;
+  if (!isRequestParentCurrent(parentContext)) return false;
   toolsContent.textContent = "";
   toolsContent.appendChild(renderBrowserLoginPanel({ collectors: [], loading: true }));
 
