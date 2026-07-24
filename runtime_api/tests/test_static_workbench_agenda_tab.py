@@ -191,27 +191,89 @@ def test_account_connection_view_title_matches_settings_entry():
     assert "<h2>工具目录</h2>" not in tools_view_header
 
 
-def test_settings_items_keep_dedicated_hash_routes_instead_of_falling_back_to_chat():
+def test_settings_route_state_preserves_primary_and_legacy_deep_links():
     js = read_static("app.js")
 
+    assert 'const defaultSettingsSectionId = "suggestionsView";' in js
+    assert "const settingsSectionIds = new Set([" in js
+    for view_id in (
+        "suggestionsView",
+        "searchView",
+        "governanceView",
+        "collectorsView",
+        "toolsView",
+        "assistantIdentitiesView",
+        "webSearchSettingsView",
+        "privacyView",
+    ):
+        assert f'"{view_id}"' in js
     assert "const viewHashMap" in js
+    assert 'settingsView: "settings"' in js
     assert 'toolsView: "tools"' in js
     assert 'agendaView: "agenda"' in js
     assert 'careerView: "career"' in js
+    assert "const settingsHashViewMap" in js
+    assert "function routeStateFromHash" in js
+    assert 'primaryViewId: "settingsView", settingsSectionId: "suggestionsView"' in js
+    assert "settingsHashViewMap[String(hash || \"\")]" in js
     assert "function viewIdFromHash" in js
-    assert 'switchView(viewIdFromHash(location.hash) || "chatView")' in js
+    assert "routeStateFromHash(hash).primaryViewId" in js
+    assert "const initialRoute = routeStateFromHash(location.hash);" in js
+    assert 'switchView(initialRoute.primaryViewId || "chatView", initialRoute.settingsSectionId);' in js
+
+
+def test_settings_navigation_updates_hash_and_history_restores_secondary_route():
+    js = read_static("app.js")
 
     settings_handler_start = js.index('document.querySelectorAll(".assistant-settings-item")')
-    settings_handler_end = js.index('document.querySelectorAll("[data-action=\\"back-to-settings\\"]")', settings_handler_start)
+    settings_handler_end = js.index('document.querySelectorAll(".settings-nav-button")', settings_handler_start)
     settings_handler = js[settings_handler_start:settings_handler_end]
     assert "hashForView(buttonNode.dataset.view)" in settings_handler
     assert 'buttonNode.dataset.view === "chatView" ? "chat" : ""' not in settings_handler
 
+    secondary_handler_start = js.index('document.querySelectorAll(".settings-nav-button")')
+    secondary_handler_end = js.index('loginForm.addEventListener', secondary_handler_start)
+    secondary_handler = js[secondary_handler_start:secondary_handler_end]
+    assert "buttonNode.dataset.settingsSection" in secondary_handler
+    assert "setHashForView(settingsSectionId)" in secondary_handler
+
     hashchange_start = js.index('window.addEventListener("hashchange"')
     hashchange_end = js.index('window.addEventListener("nomi-pending-proactive"', hashchange_start)
     hashchange_handler = js[hashchange_start:hashchange_end]
-    assert "viewIdFromHash(location.hash)" in hashchange_handler
+    assert "routeStateFromHash(location.hash)" in hashchange_handler
+    assert "route.primaryViewId" in hashchange_handler
+    assert "route.settingsSectionId" in hashchange_handler
     assert 'if (location.hash === "#chat") switchView("chatView");' not in hashchange_handler
+
+
+def test_switch_view_activates_settings_section_and_uses_existing_lazy_loaders():
+    js = read_static("app.js")
+
+    switch_start = js.index("function switchView(")
+    switch_end = js.index("function renderJson", switch_start)
+    switcher = js[switch_start:switch_end]
+
+    assert "settingsSectionIds.has(primaryViewId)" in switcher
+    assert 'primaryViewId = "settingsView"' in switcher
+    assert 'document.querySelectorAll(".settings-section")' in switcher
+    assert 'document.querySelectorAll(".settings-nav-button")' in switcher
+    assert 'button.setAttribute("aria-current", "page")' in switcher
+    assert 'button.removeAttribute("aria-current")' in switcher
+    assert "selectedSettingsSectionId !== \"webSearchSettingsView\"" in switcher
+    assert "loadSuggestions(currentSuggestionFocusId())" in switcher
+    assert "loadGovernance()" in switcher
+    assert "loadCollectors()" in switcher
+    assert "loadTools()" in switcher
+    assert "loadAssistantIdentities()" in switcher
+    assert "loadWebSearchSettings()" in switcher
+    assert 'selectedSettingsSectionId === "searchView"' not in switcher
+
+
+def test_settings_routing_removes_legacy_back_handler():
+    js = read_static("app.js")
+
+    assert 'document.querySelectorAll("[data-action=\\"back-to-settings\\"]")' not in js
+    assert "returnToAssistantSettings" not in js
 
 
 def test_account_connection_view_keeps_browser_login_channels_visible():
@@ -340,7 +402,8 @@ def test_realtime_assistant_events_do_not_steal_settings_child_views():
     helper_start = js.index("function shouldPreserveCurrentViewForAssistantEvent")
     helper_end = js.index("function renderAssistantEventWithoutStealingView", helper_start)
     helper = js[helper_start:helper_end]
-    assert "viewIdFromHash(location.hash)" in helper
+    assert "routeStateFromHash(location.hash)" in helper
+    assert "route.primaryViewId" in helper
     assert '"chatView"' in helper
 
     realtime_start = js.index("function handleRealtimeMessage(event)")
@@ -435,7 +498,7 @@ def test_workbench_loads_and_manages_agenda_items_from_runtime_api():
 
     assert 'document.querySelector("#agendaContent")' in js
     assert 'document.querySelector("#refreshAgenda")' in js
-    assert 'if (viewId === "agendaView") loadAgenda();' in js
+    assert 'if (primaryViewId === "agendaView") loadAgenda();' in js
     assert "loadAgenda()" in js
     assert 'api("/api/agenda?limit=50")' in js
     assert "renderAgendaDayTabs" in js
@@ -465,7 +528,7 @@ def test_workbench_loads_and_manages_career_board_from_runtime_api():
     assert 'document.querySelector("#careerResumeFile")' in js
     assert 'document.querySelector("#refreshCareer")' in js
     assert 'document.querySelector("#careerOffers")' in js
-    assert 'if (viewId === "careerView") loadCareerBoard();' in js
+    assert 'if (primaryViewId === "careerView") loadCareerBoard();' in js
     assert "loadCareerBoard()" in js
     assert 'api("/api/career/board?limit=50")' in js
     assert 'api("/api/career/offers")' in js

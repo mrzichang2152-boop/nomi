@@ -163,6 +163,7 @@ const viewHashMap = {
   chatView: "chat",
   agendaView: "agenda",
   careerView: "career",
+  settingsView: "settings",
   searchView: "search",
   governanceView: "governance",
   suggestionsView: "suggestions",
@@ -172,15 +173,41 @@ const viewHashMap = {
   privacyView: "privacy",
   webSearchSettingsView: "web-search",
 };
-const hashViewMap = Object.fromEntries(Object.entries(viewHashMap).map(([viewId, hash]) => [`#${hash}`, viewId]));
+const defaultSettingsSectionId = "suggestionsView";
+const settingsSectionIds = new Set([
+  "suggestionsView",
+  "searchView",
+  "governanceView",
+  "collectorsView",
+  "toolsView",
+  "assistantIdentitiesView",
+  "webSearchSettingsView",
+  "privacyView",
+]);
+const primaryHashViewMap = Object.fromEntries(
+  ["chatView", "agendaView", "careerView", "settingsView"].map((viewId) => [`#${viewHashMap[viewId]}`, viewId])
+);
+const settingsHashViewMap = Object.fromEntries(
+  Array.from(settingsSectionIds, (viewId) => [`#${viewHashMap[viewId]}`, viewId])
+);
 
 function hashForView(viewId) {
   return viewHashMap[viewId] || "";
 }
 
+function routeStateFromHash(hash = location.hash) {
+  if (String(hash || "").startsWith("#suggestion:")) {
+    return { primaryViewId: "settingsView", settingsSectionId: "suggestionsView" };
+  }
+  const primaryViewId = primaryHashViewMap[String(hash || "")];
+  if (primaryViewId) return { primaryViewId, settingsSectionId: "" };
+  const settingsSectionId = settingsHashViewMap[String(hash || "")];
+  if (settingsSectionId) return { primaryViewId: "settingsView", settingsSectionId };
+  return { primaryViewId: "", settingsSectionId: "" };
+}
+
 function viewIdFromHash(hash = location.hash) {
-  if (String(hash || "").startsWith("#suggestion:")) return "suggestionsView";
-  return hashViewMap[String(hash || "")] || "";
+  return routeStateFromHash(hash).primaryViewId;
 }
 
 function setHashForView(viewId) {
@@ -190,8 +217,8 @@ function setHashForView(viewId) {
 }
 
 function shouldPreserveCurrentViewForAssistantEvent() {
-  const routedViewId = viewIdFromHash(location.hash);
-  return routedViewId && routedViewId !== "chatView";
+  const route = routeStateFromHash(location.hash);
+  return route.primaryViewId && route.primaryViewId !== "chatView";
 }
 
 function renderAssistantEventWithoutStealingView(render) {
@@ -229,7 +256,8 @@ function showApp() {
   if (conversationIdFromUrl()) setChatConversationId(conversationIdFromUrl());
   bindViewportMetrics();
   connectRealtime();
-  switchView(viewIdFromHash(location.hash) || "chatView");
+  const initialRoute = routeStateFromHash(location.hash);
+  switchView(initialRoute.primaryViewId || "chatView", initialRoute.settingsSectionId);
   loadChatHistory().finally(() => {
     consumePendingProactive();
     consumePendingAgentEvent();
@@ -250,12 +278,6 @@ function closeAssistantWorkspace() {
     return;
   }
   window.history.back();
-}
-
-function returnToAssistantSettings() {
-  switchView("chatView");
-  toggleAssistantSettings(true);
-  location.hash = "chat";
 }
 
 function computeViewportMetrics({
@@ -347,19 +369,42 @@ async function api(path, options = {}) {
   return response.json();
 }
 
-function switchView(viewId) {
-  if (viewId !== "webSearchSettingsView") clearWebSearchKeyInput();
-  document.querySelectorAll(".view").forEach((view) => view.classList.toggle("active", view.id === viewId));
-  document.querySelectorAll(".nav-button").forEach((button) => button.classList.toggle("active", button.dataset.view === viewId));
-  if (viewId === "agendaView") loadAgenda();
-  if (viewId === "careerView") loadCareerBoard();
-  if (viewId === "suggestionsView") loadSuggestions(currentSuggestionFocusId());
-  if (viewId === "collectorsView") loadCollectors();
-  if (viewId === "assistantIdentitiesView") loadAssistantIdentities();
-  if (viewId === "chatView") loadChatAssistantDrafts();
-  if (viewId === "toolsView") loadTools();
-  if (viewId === "governanceView") loadGovernance();
-  if (viewId === "webSearchSettingsView") loadWebSearchSettings();
+function switchView(primaryViewId, settingsSectionId = "") {
+  let selectedSettingsSectionId = settingsSectionId;
+  if (settingsSectionIds.has(primaryViewId)) {
+    selectedSettingsSectionId = primaryViewId;
+    primaryViewId = "settingsView";
+  }
+  if (primaryViewId === "settingsView") {
+    if (!settingsSectionIds.has(selectedSettingsSectionId)) {
+      selectedSettingsSectionId = defaultSettingsSectionId;
+    }
+  } else {
+    selectedSettingsSectionId = "";
+  }
+
+  if (selectedSettingsSectionId !== "webSearchSettingsView") clearWebSearchKeyInput();
+  document.querySelectorAll(".view").forEach((view) => view.classList.toggle("active", view.id === primaryViewId));
+  document.querySelectorAll(".nav-button").forEach((button) => button.classList.toggle("active", button.dataset.view === primaryViewId));
+  document.querySelectorAll(".settings-section").forEach((section) => {
+    section.classList.toggle("active", primaryViewId === "settingsView" && section.id === selectedSettingsSectionId);
+  });
+  document.querySelectorAll(".settings-nav-button").forEach((button) => {
+    const active = primaryViewId === "settingsView" && button.dataset.settingsSection === selectedSettingsSectionId;
+    button.classList.toggle("active", active);
+    if (active) button.setAttribute("aria-current", "page");
+    else button.removeAttribute("aria-current");
+  });
+
+  if (primaryViewId === "agendaView") loadAgenda();
+  if (primaryViewId === "careerView") loadCareerBoard();
+  if (primaryViewId === "chatView") loadChatAssistantDrafts();
+  if (selectedSettingsSectionId === "suggestionsView") loadSuggestions(currentSuggestionFocusId());
+  if (selectedSettingsSectionId === "collectorsView") loadCollectors();
+  if (selectedSettingsSectionId === "assistantIdentitiesView") loadAssistantIdentities();
+  if (selectedSettingsSectionId === "toolsView") loadTools();
+  if (selectedSettingsSectionId === "governanceView") loadGovernance();
+  if (selectedSettingsSectionId === "webSearchSettingsView") loadWebSearchSettings();
 }
 
 function renderJson(value) {
@@ -3727,8 +3772,13 @@ document.querySelectorAll(".assistant-settings-item").forEach((buttonNode) => {
     location.hash = hashForView(buttonNode.dataset.view);
   });
 });
-document.querySelectorAll("[data-action=\"back-to-settings\"]").forEach((buttonNode) => {
-  buttonNode.addEventListener("click", returnToAssistantSettings);
+document.querySelectorAll(".settings-nav-button").forEach((buttonNode) => {
+  buttonNode.addEventListener("click", () => {
+    const settingsSectionId = buttonNode.dataset.settingsSection;
+    if (!settingsSectionIds.has(settingsSectionId)) return;
+    switchView("settingsView", settingsSectionId);
+    setHashForView(settingsSectionId);
+  });
 });
 
 loginForm.addEventListener("submit", async (event) => {
@@ -3889,8 +3939,8 @@ messages.addEventListener("pointerdown", () => {
 });
 
 window.addEventListener("hashchange", () => {
-  const viewId = viewIdFromHash(location.hash);
-  if (viewId) switchView(viewId);
+  const route = routeStateFromHash(location.hash);
+  switchView(route.primaryViewId || "chatView", route.settingsSectionId);
 });
 window.addEventListener("nomi-pending-proactive", consumePendingProactive);
 
