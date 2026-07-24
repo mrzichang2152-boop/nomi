@@ -13,6 +13,7 @@ function createWorkbenchNavigationController({
   const settingsIds = new Set(settingsSectionIds || []);
   const suggestionFallbacks = new Map();
   let activeRoute = null;
+  let hashChangeBinding = null;
 
   function hashForView(viewId) {
     return viewHashMap[viewId] || "";
@@ -117,6 +118,25 @@ function createWorkbenchNavigationController({
     return navigateToHash(`#suggestion:${encodeURIComponent(normalizedId)}`);
   }
 
+  function unbindHashChanges() {
+    if (!hashChangeBinding) return;
+    const { eventTarget, listener } = hashChangeBinding;
+    hashChangeBinding = null;
+    eventTarget.removeEventListener?.("hashchange", listener);
+  }
+
+  function bindHashChanges(eventTarget) {
+    if (!eventTarget || typeof eventTarget.addEventListener !== "function") {
+      throw new TypeError("hash change event target must support addEventListener");
+    }
+    if (hashChangeBinding?.eventTarget === eventTarget) return unbindHashChanges;
+    unbindHashChanges();
+    const listener = () => activateCurrentRoute();
+    eventTarget.addEventListener("hashchange", listener);
+    hashChangeBinding = { eventTarget, listener };
+    return unbindHashChanges;
+  }
+
   function shouldPreserveCurrentViewForAssistantEvent() {
     return normalizeRoute(routeStateFromHash(location.hash)).primaryViewId !== "chatView";
   }
@@ -146,6 +166,7 @@ function createWorkbenchNavigationController({
   return {
     activateCurrentRoute,
     activateRoute,
+    bindHashChanges,
     consumePendingAgentEvent,
     currentSuggestionFocusId,
     hashForView,
@@ -4064,9 +4085,7 @@ messages.addEventListener("pointerdown", () => {
   setTimeout(updateViewportMetrics, 120);
 });
 
-window.addEventListener("hashchange", () => {
-  workbenchNavigation.activateCurrentRoute();
-});
+workbenchNavigation.bindHashChanges(window);
 window.addEventListener("nomi-pending-proactive", consumePendingProactive);
 
 searchForm.addEventListener("submit", (event) => {

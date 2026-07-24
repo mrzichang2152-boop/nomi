@@ -46,12 +46,49 @@ const settingsSectionIds = [
 ];
 
 function createHarness(initialHash) {{
+  const listeners = new Map();
+  const eventTarget = {{
+    addEventListener(type, listener) {{
+      if (!listeners.has(type)) listeners.set(type, new Set());
+      listeners.get(type).add(listener);
+    }},
+    removeEventListener(type, listener) {{
+      listeners.get(type)?.delete(listener);
+    }},
+    dispatchEvent(event) {{
+      const eventObject = typeof event === "string" ? {{ type: event }} : event;
+      for (const listener of [...(listeners.get(eventObject.type) || [])]) {{
+        listener.call(this, eventObject);
+      }}
+      return true;
+    }},
+    listenerCount(type) {{
+      return listeners.get(type)?.size || 0;
+    }},
+  }};
   const location = {{ hash: initialHash }};
+  const historyStack = [initialHash];
+  let historyIndex = 0;
   const history = {{
     entries: [],
     pushState(_state, _title, nextHash) {{
       this.entries.push(nextHash);
+      historyStack.splice(historyIndex + 1);
+      historyStack.push(nextHash);
+      historyIndex = historyStack.length - 1;
       location.hash = nextHash;
+    }},
+    back() {{
+      if (historyIndex === 0) return;
+      historyIndex -= 1;
+      location.hash = historyStack[historyIndex];
+      eventTarget.dispatchEvent({{ type: "hashchange" }});
+    }},
+    forward() {{
+      if (historyIndex >= historyStack.length - 1) return;
+      historyIndex += 1;
+      location.hash = historyStack[historyIndex];
+      eventTarget.dispatchEvent({{ type: "hashchange" }});
     }},
   }};
   const routes = [];
@@ -84,7 +121,7 @@ function createHarness(initialHash) {{
       state.clearCount += 1;
     }},
   }});
-  return {{ controller, history, loads, location, routes, state }};
+  return {{ controller, eventTarget, history, loads, location, routes, state }};
 }}
 """
     result = subprocess.run(
@@ -389,10 +426,12 @@ def test_settings_navigation_updates_hash_and_history_restores_secondary_route()
     assert "workbenchNavigation.navigateToView(settingsSectionId)" in secondary_handler
     assert "switchView(" not in secondary_handler
 
-    hashchange_start = js.index('window.addEventListener("hashchange"')
-    hashchange_end = js.index('window.addEventListener("nomi-pending-proactive"', hashchange_start)
-    hashchange_handler = js[hashchange_start:hashchange_end]
-    assert "workbenchNavigation.activateCurrentRoute()" in hashchange_handler
+    assert "function bindHashChanges" in js
+    assert "workbenchNavigation.bindHashChanges(window);" in js
+    browser_body_start = js.index('if (typeof window !== "undefined"')
+    browser_body = js[browser_body_start:]
+    assert 'window.addEventListener("hashchange"' not in browser_body
+    assert 'window.addEventListener("popstate"' not in browser_body
 
 
 def test_navigation_controller_uses_existing_lazy_loaders():
@@ -645,25 +684,80 @@ assert.deepEqual(h.routes, [{ primaryViewId: "settingsView", settingsSectionId: 
     )
 
 
-def test_runtime_hash_history_restores_primary_and_secondary_state():
+def test_runtime_all_legacy_settings_hashes_and_deep_links_are_executable():
     run_navigation_runtime(
         """
-const h = createHarness("#chat");
-h.controller.navigateToView("webSearchSettingsView");
-h.location.hash = "#agenda";
+const cases = [
+  { hash: "#settings", section: "suggestionsView", load: "suggestionsView", focus: "" },
+  { hash: "#suggestions", section: "suggestionsView", load: "suggestionsView", focus: "" },
+  { hash: "#search", section: "searchView", load: "" },
+  { hash: "#governance", section: "governanceView", load: "governanceView" },
+  { hash: "#collectors", section: "collectorsView", load: "collectorsView" },
+  { hash: "#tools", section: "toolsView", load: "toolsView" },
+  { hash: "#assistant-identities", section: "assistantIdentitiesView", load: "assistantIdentitiesView" },
+  { hash: "#web-search", section: "webSearchSettingsView", load: "webSearchSettingsView" },
+  { hash: "#privacy", section: "privacyView", load: "" },
+  { hash: "#suggestion:sg%2042", section: "suggestionsView", load: "suggestionsView", focus: "sg 42" },
+];
+
+for (const testCase of cases) {
+  const h = createHarness(testCase.hash);
+  h.controller.activateCurrentRoute();
+  assert.deepEqual(
+    h.routes,
+    [{ primaryViewId: "settingsView", settingsSectionId: testCase.section }],
+    `route for ${testCase.hash}`
+  );
+  if (!testCase.load) {
+    assert.deepEqual(h.loads, [], `no remote loader for ${testCase.hash}`);
+    continue;
+  }
+  assert.equal(h.loads.length, 1, `one loader for ${testCase.hash}`);
+  assert.equal(h.loads[0].id, testCase.load, `loader for ${testCase.hash}`);
+  if (testCase.load === "suggestionsView") {
+    assert.equal(h.loads[0].args[0], testCase.focus, `suggestion focus for ${testCase.hash}`);
+    assert.equal(h.loads[0].args[1], null, `suggestion fallback for ${testCase.hash}`);
+  }
+}
+"""
+    )
+
+
+def test_runtime_hash_back_forward_events_restore_routes_with_one_load_each():
+    run_navigation_runtime(
+        """
+const h = createHarness("#settings");
+const unbind = h.controller.bindHashChanges(h.eventTarget);
+assert.equal(h.eventTarget.listenerCount("hashchange"), 1);
+assert.equal(h.eventTarget.listenerCount("popstate"), 0);
+
 h.controller.activateCurrentRoute();
-h.location.hash = "#web-search";
-h.controller.activateCurrentRoute();
+h.controller.navigateToView("toolsView");
+h.controller.navigateToView("agendaView");
+h.loads.length = 0;
+h.routes.length = 0;
+
+h.history.back();
+h.history.back();
+h.history.forward();
+h.history.forward();
+
 assert.deepEqual(h.routes, [
-  { primaryViewId: "settingsView", settingsSectionId: "webSearchSettingsView" },
+  { primaryViewId: "settingsView", settingsSectionId: "toolsView" },
+  { primaryViewId: "settingsView", settingsSectionId: "suggestionsView" },
+  { primaryViewId: "settingsView", settingsSectionId: "toolsView" },
   { primaryViewId: "agendaView", settingsSectionId: "" },
-  { primaryViewId: "settingsView", settingsSectionId: "webSearchSettingsView" },
 ]);
 assert.deepEqual(h.loads.map((item) => item.id), [
-  "webSearchSettingsView",
+  "toolsView",
+  "suggestionsView",
+  "toolsView",
   "agendaView",
-  "webSearchSettingsView",
 ]);
+assert.equal(h.location.hash, "#agenda");
+
+unbind();
+assert.equal(h.eventTarget.listenerCount("hashchange"), 0);
 """
     )
 
