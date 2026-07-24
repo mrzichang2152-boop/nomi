@@ -1,3 +1,129 @@
+const WORKBENCH_VIEW_HASH_MAP = Object.freeze({
+  chatView: "chat",
+  agendaView: "agenda",
+  careerView: "career",
+  settingsView: "settings",
+  searchView: "search",
+  governanceView: "governance",
+  suggestionsView: "suggestions",
+  collectorsView: "collectors",
+  assistantIdentitiesView: "assistant-identities",
+  toolsView: "tools",
+  privacyView: "privacy",
+  webSearchSettingsView: "web-search",
+});
+
+const WORKBENCH_SETTINGS_SECTION_IDS = Object.freeze([
+  "suggestionsView",
+  "searchView",
+  "governanceView",
+  "collectorsView",
+  "toolsView",
+  "assistantIdentitiesView",
+  "webSearchSettingsView",
+  "privacyView",
+]);
+
+function applyWorkbenchRouteToDocument(
+  root,
+  { primaryViewId, settingsSectionId },
+  { revealActiveSetting = false } = {}
+) {
+  if (!root || typeof root.querySelectorAll !== "function") return;
+  root
+    .querySelectorAll(".view")
+    .forEach((view) => view.classList?.toggle("active", view.id === primaryViewId));
+  root
+    .querySelectorAll(".nav-button")
+    .forEach((button) => button.classList?.toggle("active", button.dataset?.view === primaryViewId));
+  root.querySelectorAll(".settings-section").forEach((section) => {
+    section.classList?.toggle(
+      "active",
+      primaryViewId === "settingsView" && section.id === settingsSectionId
+    );
+  });
+
+  let activeSettingsButton = null;
+  root.querySelectorAll(".settings-nav-button").forEach((button) => {
+    const active =
+      primaryViewId === "settingsView" && button.dataset?.settingsSection === settingsSectionId;
+    button.classList?.toggle("active", active);
+    if (active) {
+      button.setAttribute?.("aria-current", "page");
+      activeSettingsButton = button;
+    } else {
+      button.removeAttribute?.("aria-current");
+    }
+  });
+
+  if (revealActiveSetting && activeSettingsButton?.scrollIntoView) {
+    activeSettingsButton.scrollIntoView({
+      block: "nearest",
+      inline: "nearest",
+      behavior: "smooth",
+    });
+  }
+}
+
+function createLatestRequestGate() {
+  const versions = new Map();
+  return {
+    begin(key, parentContext = null) {
+      const normalizedKey = String(key || "default");
+      const version = (versions.get(normalizedKey) || 0) + 1;
+      versions.set(normalizedKey, version);
+      return {
+        isCurrent() {
+          const parentIsCurrent =
+            typeof parentContext?.isCurrent !== "function" || parentContext.isCurrent();
+          return parentIsCurrent && versions.get(normalizedKey) === version;
+        },
+      };
+    },
+  };
+}
+
+async function runLatestRequest({
+  gate,
+  key,
+  parentContext = null,
+  load,
+  commit,
+  onError = () => {},
+}) {
+  const context = gate.begin(key, parentContext);
+  if (!context.isCurrent()) return false;
+  try {
+    const value = await load(context);
+    if (!context.isCurrent()) return false;
+    await commit(value, context);
+    return context.isCurrent();
+  } catch (error) {
+    if (context.isCurrent()) {
+      try {
+        onError(error, context);
+      } catch {
+        // Error presentation must not turn a handled loader failure into an unhandled rejection.
+      }
+    }
+    return false;
+  }
+}
+
+async function runUiTask(task, onError = () => {}) {
+  try {
+    await task();
+    return true;
+  } catch (error) {
+    try {
+      await onError(error);
+    } catch {
+      // Error recovery must not create another unhandled rejection.
+    }
+    return false;
+  }
+}
+
 function createWorkbenchNavigationController({
   location,
   history,
@@ -8,12 +134,16 @@ function createWorkbenchNavigationController({
   primaryLoaders = {},
   settingsLoaders = {},
   clearWebSearchKeyInput = () => {},
+  onLoaderError = () => {},
 }) {
   const primaryViewIds = new Set(["chatView", "agendaView", "careerView", "settingsView"]);
   const settingsIds = new Set(settingsSectionIds || []);
   const suggestionFallbacks = new Map();
   let activeRoute = null;
+  let activeRouteContext = null;
   let hashChangeBinding = null;
+  let activationSequence = 0;
+  const pendingLoads = new Set();
 
   function hashForView(viewId) {
     return viewHashMap[viewId] || "";
@@ -65,6 +195,14 @@ function createWorkbenchNavigationController({
 
   function activateRoute(route, hash = location.hash) {
     const nextRoute = normalizeRoute(route);
+    const activationId = ++activationSequence;
+    const loadContext = {
+      activationId,
+      hash: String(hash || ""),
+      route: nextRoute,
+      isCurrent: () => activationSequence === activationId,
+    };
+    activeRouteContext = loadContext;
     if (
       activeRoute?.settingsSectionId === "webSearchSettingsView" &&
       nextRoute.settingsSectionId !== "webSearchSettingsView"
@@ -75,26 +213,74 @@ function createWorkbenchNavigationController({
     applyRoute(nextRoute);
     activeRoute = nextRoute;
 
+    let loadResult;
+    let onLoadSuccess = null;
     if (nextRoute.primaryViewId === "settingsView") {
       const loader = settingsLoaders[nextRoute.settingsSectionId];
       if (loader) {
         if (nextRoute.settingsSectionId === "suggestionsView") {
           const focusSuggestionId = currentSuggestionFocusId(hash);
           const fallbackEvent = focusSuggestionId ? suggestionFallbacks.get(focusSuggestionId) || null : null;
-          if (focusSuggestionId) suggestionFallbacks.delete(focusSuggestionId);
-          loader(focusSuggestionId, fallbackEvent);
+          if (focusSuggestionId) {
+            onLoadSuccess = () => suggestionFallbacks.delete(focusSuggestionId);
+          }
+          loadResult = invokeLoader(
+            loader,
+            [focusSuggestionId, fallbackEvent, loadContext],
+            loadContext
+          );
         } else {
-          loader();
+          loadResult = invokeLoader(loader, [loadContext], loadContext);
         }
       }
     } else {
-      primaryLoaders[nextRoute.primaryViewId]?.();
+      const loader = primaryLoaders[nextRoute.primaryViewId];
+      if (loader) loadResult = invokeLoader(loader, [loadContext], loadContext);
+    }
+    if (loadResult) {
+      const trackedLoad = Promise.resolve(loadResult)
+        .then((result) => {
+          if (result !== false && loadContext.isCurrent()) onLoadSuccess?.();
+          return result;
+        })
+        .finally(() => pendingLoads.delete(trackedLoad));
+      pendingLoads.add(trackedLoad);
     }
     return nextRoute;
   }
 
+  function invokeLoader(loader, args, context) {
+    try {
+      return Promise.resolve(loader(...args)).catch((error) => {
+        try {
+          onLoaderError(error, context);
+        } catch {
+          // Keep navigation stable even if a diagnostic callback fails.
+        }
+        return false;
+      });
+    } catch (error) {
+      try {
+        onLoaderError(error, context);
+      } catch {
+        // Keep navigation stable even if a diagnostic callback fails.
+      }
+      return Promise.resolve(false);
+    }
+  }
+
+  async function whenIdle() {
+    while (pendingLoads.size) {
+      await Promise.all(Array.from(pendingLoads));
+    }
+  }
+
   function activateCurrentRoute() {
     return activateRoute(routeStateFromHash(location.hash), location.hash);
+  }
+
+  function currentRouteContext() {
+    return activeRouteContext;
   }
 
   function navigateToHash(nextHash) {
@@ -169,17 +355,27 @@ function createWorkbenchNavigationController({
     bindHashChanges,
     consumePendingAgentEvent,
     currentSuggestionFocusId,
+    currentRouteContext,
     hashForView,
     navigateToSuggestion,
     navigateToView,
     renderAssistantEventWithoutStealingView,
     routeStateFromHash,
     shouldPreserveCurrentViewForAssistantEvent,
+    whenIdle,
   };
 }
 
 if (typeof module !== "undefined" && module.exports) {
-  module.exports = { createWorkbenchNavigationController };
+  module.exports = {
+    WORKBENCH_SETTINGS_SECTION_IDS,
+    WORKBENCH_VIEW_HASH_MAP,
+    applyWorkbenchRouteToDocument,
+    createLatestRequestGate,
+    createWorkbenchNavigationController,
+    runLatestRequest,
+    runUiTask,
+  };
 }
 
 if (typeof window !== "undefined" && typeof document !== "undefined") {
@@ -344,31 +540,10 @@ const browserLoginChannels = [
     description: "打开云端浏览器购物入口，后续工具执行仍需要确认。",
   },
 ];
-const viewHashMap = {
-  chatView: "chat",
-  agendaView: "agenda",
-  careerView: "career",
-  settingsView: "settings",
-  searchView: "search",
-  governanceView: "governance",
-  suggestionsView: "suggestions",
-  collectorsView: "collectors",
-  assistantIdentitiesView: "assistant-identities",
-  toolsView: "tools",
-  privacyView: "privacy",
-  webSearchSettingsView: "web-search",
-};
+const viewHashMap = WORKBENCH_VIEW_HASH_MAP;
 const defaultSettingsSectionId = "suggestionsView";
-const settingsSectionIds = new Set([
-  "suggestionsView",
-  "searchView",
-  "governanceView",
-  "collectorsView",
-  "toolsView",
-  "assistantIdentitiesView",
-  "webSearchSettingsView",
-  "privacyView",
-]);
+const settingsSectionIds = new Set(WORKBENCH_SETTINGS_SECTION_IDS);
+const workbenchRequestGate = createLatestRequestGate();
 const workbenchNavigation = createWorkbenchNavigationController({
   location,
   history: window.history,
@@ -377,20 +552,23 @@ const workbenchNavigation = createWorkbenchNavigationController({
   defaultSettingsSectionId,
   applyRoute: (route) => applyWorkbenchRoute(route),
   primaryLoaders: {
-    chatView: () => loadChatAssistantDrafts(),
-    agendaView: () => loadAgenda(),
-    careerView: () => loadCareerBoard(),
+    chatView: (context) => loadChatAssistantDrafts(context),
+    agendaView: (context) => loadAgenda(context),
+    careerView: (context) => loadCareerBoard(context),
   },
   settingsLoaders: {
-    suggestionsView: (focusSuggestionId, fallbackEvent) =>
-      loadSuggestions(focusSuggestionId, fallbackEvent),
-    governanceView: () => loadGovernance(),
-    collectorsView: () => loadCollectors(),
-    toolsView: () => loadTools(),
-    assistantIdentitiesView: () => loadAssistantIdentities(),
-    webSearchSettingsView: () => loadWebSearchSettings(),
+    suggestionsView: (focusSuggestionId, fallbackEvent, context) =>
+      loadSuggestions(focusSuggestionId, fallbackEvent, context),
+    governanceView: (context) => loadGovernance(context),
+    collectorsView: (context) => loadCollectors(context),
+    toolsView: (context) => loadTools(context),
+    assistantIdentitiesView: (context) => loadAssistantIdentities(context),
+    webSearchSettingsView: (context) => loadWebSearchSettings(context),
   },
   clearWebSearchKeyInput: () => clearWebSearchKeyInput(),
+  onLoaderError: (error, context) => {
+    console.error("Unable to load workbench route", context?.route, error);
+  },
 });
 
 function hashForView(viewId) {
@@ -550,17 +728,11 @@ async function api(path, options = {}) {
 }
 
 function applyWorkbenchRoute({ primaryViewId, settingsSectionId }) {
-  document.querySelectorAll(".view").forEach((view) => view.classList.toggle("active", view.id === primaryViewId));
-  document.querySelectorAll(".nav-button").forEach((button) => button.classList.toggle("active", button.dataset.view === primaryViewId));
-  document.querySelectorAll(".settings-section").forEach((section) => {
-    section.classList.toggle("active", primaryViewId === "settingsView" && section.id === settingsSectionId);
-  });
-  document.querySelectorAll(".settings-nav-button").forEach((button) => {
-    const active = primaryViewId === "settingsView" && button.dataset.settingsSection === settingsSectionId;
-    button.classList.toggle("active", active);
-    if (active) button.setAttribute("aria-current", "page");
-    else button.removeAttribute("aria-current");
-  });
+  applyWorkbenchRouteToDocument(
+    document,
+    { primaryViewId, settingsSectionId },
+    { revealActiveSetting: window.matchMedia?.("(max-width: 860px)")?.matches === true }
+  );
 }
 
 function switchView(primaryViewId, settingsSectionId = "") {
@@ -1503,26 +1675,36 @@ function governanceQueryString() {
   return params.toString();
 }
 
-async function loadGovernance() {
+async function loadGovernance(parentContext = null) {
+  if (!governanceContent) return false;
   governanceContent.textContent = "加载中...";
-  try {
-    const query = governanceQueryString();
-    const traceQuery = new URLSearchParams();
-    if (governanceQuery.value.trim()) traceQuery.set("q", governanceQuery.value.trim());
-    traceQuery.set("limit", "20");
-    const [data, routeTraceData] = await Promise.all([
-      api(`/api/memory/governance${query ? `?${query}` : ""}`),
-      api(`/api/tools/route/traces?${traceQuery.toString()}`),
-    ]);
-    governanceContent.textContent = "";
-    renderGovernanceSection("事件审计", data.events || [], renderEventGovernanceItem);
-    renderGovernanceSection("长期记忆", data.semantic_memory || [], renderSemanticGovernanceItem);
-    renderGovernanceSection("状态记忆", data.states || [], renderStateGovernanceItem);
-    renderGovernanceSection("任务路由", routeTraceData.traces || [], renderRouteTraceGovernanceItem);
-    if (!governanceContent.children.length) governanceContent.appendChild(emptyCard("暂无治理项"));
-  } catch {
-    governanceContent.textContent = "无法读取治理数据。";
-  }
+  return runLatestRequest({
+    gate: workbenchRequestGate,
+    key: "governance",
+    parentContext,
+    load: async () => {
+      const query = governanceQueryString();
+      const traceQuery = new URLSearchParams();
+      if (governanceQuery?.value.trim()) traceQuery.set("q", governanceQuery.value.trim());
+      traceQuery.set("limit", "20");
+      const [data, routeTraceData] = await Promise.all([
+        api(`/api/memory/governance${query ? `?${query}` : ""}`),
+        api(`/api/tools/route/traces?${traceQuery.toString()}`),
+      ]);
+      return { data, routeTraceData };
+    },
+    commit: ({ data, routeTraceData }) => {
+      governanceContent.textContent = "";
+      renderGovernanceSection("事件审计", data.events || [], renderEventGovernanceItem);
+      renderGovernanceSection("长期记忆", data.semantic_memory || [], renderSemanticGovernanceItem);
+      renderGovernanceSection("状态记忆", data.states || [], renderStateGovernanceItem);
+      renderGovernanceSection("任务路由", routeTraceData.traces || [], renderRouteTraceGovernanceItem);
+      if (!governanceContent.children.length) governanceContent.appendChild(emptyCard("暂无治理项"));
+    },
+    onError: () => {
+      governanceContent.textContent = "无法读取治理数据。";
+    },
+  });
 }
 
 function renderGovernanceSection(title, items, renderer) {
@@ -1815,18 +1997,26 @@ function formatAgendaTitle(item = {}) {
     .trim();
 }
 
-async function loadAgenda() {
+async function loadAgenda(parentContext = null) {
+  if (!agendaContent) return false;
   agendaContent.textContent = "加载中...";
-  try {
-    const data = await api("/api/agenda?limit=50");
-    agendaItems = data.items || [];
-    if (!selectedAgendaDate) {
-      selectedAgendaDate = agendaItems.map(agendaDateKeyForItem).find(Boolean) || agendaDateKeyFromDate(new Date());
-    }
-    renderAgenda();
-  } catch {
-    agendaContent.textContent = "无法读取日程。";
-  }
+  return runLatestRequest({
+    gate: workbenchRequestGate,
+    key: "agenda",
+    parentContext,
+    load: () => api("/api/agenda?limit=50"),
+    commit: (data) => {
+      agendaItems = data.items || [];
+      if (!selectedAgendaDate) {
+        selectedAgendaDate =
+          agendaItems.map(agendaDateKeyForItem).find(Boolean) || agendaDateKeyFromDate(new Date());
+      }
+      renderAgenda();
+    },
+    onError: () => {
+      agendaContent.textContent = "无法读取日程。";
+    },
+  });
 }
 
 function renderAgenda() {
@@ -2097,15 +2287,60 @@ function careerAtsPreviewText(preview = {}) {
   return lines.join("\n\n");
 }
 
-async function loadCareerBoard() {
-  careerContent.textContent = "加载中...";
-  try {
-    const data = await api("/api/career/board?limit=50");
-    renderCareerBoard(data);
-  } catch {
-    if (careerResumeLibrary) careerResumeLibrary.textContent = "";
-    careerContent.textContent = "无法读取求职看板。";
+function currentCareerRouteContext(parentContext = null) {
+  const context =
+    typeof parentContext?.isCurrent === "function"
+      ? parentContext
+      : workbenchNavigation.currentRouteContext();
+  if (!context) {
+    return {
+      route: { primaryViewId: "careerView", settingsSectionId: "" },
+      isCurrent: () => workbenchNavigation.currentRouteContext() === null,
+    };
   }
+  if (
+    typeof context?.isCurrent !== "function" ||
+    !context.isCurrent() ||
+    context.route?.primaryViewId !== "careerView"
+  ) {
+    return null;
+  }
+  return context;
+}
+
+function runCareerContentRequest({
+  parentContext = null,
+  start = () => {},
+  load,
+  commit,
+  onError = () => {},
+}) {
+  const routeContext = currentCareerRouteContext(parentContext);
+  if (!routeContext || !careerContent) return Promise.resolve(false);
+  start();
+  return runLatestRequest({
+    gate: workbenchRequestGate,
+    key: "career-content",
+    parentContext: routeContext,
+    load,
+    commit,
+    onError,
+  });
+}
+
+async function loadCareerBoard(parentContext = null) {
+  return runCareerContentRequest({
+    parentContext,
+    start: () => {
+      careerContent.textContent = "加载中...";
+    },
+    load: () => api("/api/career/board?limit=50"),
+    commit: (data) => renderCareerBoard(data),
+    onError: () => {
+      if (careerResumeLibrary) careerResumeLibrary.textContent = "";
+      careerContent.textContent = "无法读取求职看板。";
+    },
+  });
 }
 
 function clearCareerResumeLibrary() {
@@ -2114,57 +2349,69 @@ function clearCareerResumeLibrary() {
 
 async function previewCareerAtsPage() {
   const url = careerAtsPreviewUrl.value.trim();
-  if (!url) return;
-  clearCareerResumeLibrary();
-  careerContent.textContent = "正在读取公开 ATS 岗位页面...";
-  try {
-    const preview = await api("/api/career/ats/preview", {
+  if (!url) return false;
+  return runCareerContentRequest({
+    start: () => {
+      clearCareerResumeLibrary();
+      careerContent.textContent = "正在读取公开 ATS 岗位页面...";
+    },
+    load: () => api("/api/career/ats/preview", {
       method: "POST",
       body: JSON.stringify({ url }),
-    });
-    renderCareerAtsPreview(preview);
-  } catch {
-    careerContent.textContent = "无法预览这个岗位链接。请确认它是 Greenhouse、Lever、Ashby、Workable 或 SmartRecruiters 的公开岗位页。";
-  }
+    }),
+    commit: (preview) => renderCareerAtsPreview(preview),
+    onError: () => {
+      careerContent.textContent = "无法预览这个岗位链接。请确认它是 Greenhouse、Lever、Ashby、Workable 或 SmartRecruiters 的公开岗位页。";
+    },
+  });
 }
 
 async function previewCareerAtsList() {
   const url = careerAtsPreviewUrl.value.trim();
-  if (!url) return;
-  clearCareerResumeLibrary();
-  careerContent.textContent = "正在读取公开 ATS 职位列表...";
-  try {
-    const preview = await api("/api/career/ats/list-preview", {
+  if (!url) return false;
+  return runCareerContentRequest({
+    start: () => {
+      clearCareerResumeLibrary();
+      careerContent.textContent = "正在读取公开 ATS 职位列表...";
+    },
+    load: () => api("/api/career/ats/list-preview", {
       method: "POST",
       body: JSON.stringify({ url, limit: 25 }),
-    });
-    renderCareerAtsPreview(preview);
-  } catch {
-    careerContent.textContent = "无法预览这个公司职位列表。当前列表预览支持 Greenhouse、Lever、Ashby、Workable 和 SmartRecruiters 的公开职位列表。";
-  }
+    }),
+    commit: (preview) => renderCareerAtsPreview(preview),
+    onError: () => {
+      careerContent.textContent = "无法预览这个公司职位列表。当前列表预览支持 Greenhouse、Lever、Ashby、Workable 和 SmartRecruiters 的公开职位列表。";
+    },
+  });
 }
 
 async function loadCareerDetail(jobId) {
-  if (!jobId) return;
-  clearCareerResumeLibrary();
-  careerContent.textContent = "正在读取岗位详情...";
-  try {
-    const detail = await api(`/api/career/opportunities/${jobId}`);
-    renderCareerDetail(detail);
-  } catch {
-    careerContent.textContent = "无法读取岗位详情。";
-  }
+  if (!jobId) return false;
+  return runCareerContentRequest({
+    start: () => {
+      clearCareerResumeLibrary();
+      careerContent.textContent = "正在读取岗位详情...";
+    },
+    load: () => api(`/api/career/opportunities/${jobId}`),
+    commit: (detail) => renderCareerDetail(detail),
+    onError: () => {
+      careerContent.textContent = "无法读取岗位详情。";
+    },
+  });
 }
 
 async function loadCareerOffers() {
-  clearCareerResumeLibrary();
-  careerContent.textContent = "正在读取面试和 Offer 跟踪...";
-  try {
-    const data = await api("/api/career/offers");
-    renderCareerOffers(data);
-  } catch {
-    careerContent.textContent = "无法读取面试和 Offer 跟踪。";
-  }
+  return runCareerContentRequest({
+    start: () => {
+      clearCareerResumeLibrary();
+      careerContent.textContent = "正在读取面试和 Offer 跟踪...";
+    },
+    load: () => api("/api/career/offers"),
+    commit: (data) => renderCareerOffers(data),
+    onError: () => {
+      careerContent.textContent = "无法读取面试和 Offer 跟踪。";
+    },
+  });
 }
 
 function readFileAsBase64(file) {
@@ -2181,50 +2428,60 @@ function readFileAsBase64(file) {
 
 async function importCareerResumeFile() {
   const file = careerResumeFile.files?.[0];
-  clearCareerResumeLibrary();
   if (!file) {
+    clearCareerResumeLibrary();
     careerContent.textContent = "请先选择 docx、pdf、txt 或 md 简历文件。";
-    return;
+    return false;
   }
-  careerContent.textContent = "正在解析并导入简历文件...";
-  try {
-    const contentBase64 = await readFileAsBase64(file);
-    const result = await api("/api/career/resumes/import", {
-      method: "POST",
-      body: JSON.stringify({
-        filename: file.name,
-        content_base64: contentBase64,
-        target_roles: splitCareerInputList(careerTargetRoles.value),
-        target_locations: splitCareerInputList(careerTargetLocations.value),
-      }),
-    });
-    renderCareerProfileIngestResult(result);
-  } catch {
-    careerContent.textContent = "无法导入简历文件。请确认文件格式和内容可读取。";
-  }
+  return runCareerContentRequest({
+    start: () => {
+      clearCareerResumeLibrary();
+      careerContent.textContent = "正在解析并导入简历文件...";
+    },
+    load: async () => {
+      const contentBase64 = await readFileAsBase64(file);
+      return api("/api/career/resumes/import", {
+        method: "POST",
+        body: JSON.stringify({
+          filename: file.name,
+          content_base64: contentBase64,
+          target_roles: splitCareerInputList(careerTargetRoles.value),
+          target_locations: splitCareerInputList(careerTargetLocations.value),
+        }),
+      });
+    },
+    commit: (result) => renderCareerProfileIngestResult(result),
+    onError: () => {
+      careerContent.textContent = "无法导入简历文件。请确认文件格式和内容可读取。";
+    },
+  });
 }
 
 async function ingestCareerProfile() {
   const resumeText = careerResumeText.value.trim();
-  clearCareerResumeLibrary();
   if (resumeText.length < 20) {
+    clearCareerResumeLibrary();
     careerContent.textContent = "请先粘贴至少 20 个字符的简历文本。";
-    return;
+    return false;
   }
-  careerContent.textContent = "正在生成本地职业画像...";
-  try {
-    const result = await api("/api/career/profile/ingest", {
+  return runCareerContentRequest({
+    start: () => {
+      clearCareerResumeLibrary();
+      careerContent.textContent = "正在生成本地职业画像...";
+    },
+    load: () => api("/api/career/profile/ingest", {
       method: "POST",
       body: JSON.stringify({
         resume_text: resumeText,
         target_roles: splitCareerInputList(careerTargetRoles.value),
         target_locations: splitCareerInputList(careerTargetLocations.value),
       }),
-    });
-    renderCareerProfileIngestResult(result);
-  } catch {
-    careerContent.textContent = "无法生成职业画像，请检查简历内容或服务状态。";
-  }
+    }),
+    commit: (result) => renderCareerProfileIngestResult(result),
+    onError: () => {
+      careerContent.textContent = "无法生成职业画像，请检查简历内容或服务状态。";
+    },
+  });
 }
 
 function renderCareerAtsPreview(preview = {}) {
@@ -2305,34 +2562,50 @@ function renderCareerBaseResumeCard(resume = {}) {
   actions.appendChild(viewSummary);
   if (!isDefault) {
     const makeDefault = button("设为默认");
-    makeDefault.addEventListener("click", () => setDefaultCareerResume(resume.id));
+    makeDefault.addEventListener("click", () =>
+      runCareerActionTask(() => setDefaultCareerResume(resume.id), node)
+    );
     actions.appendChild(makeDefault);
   }
   const remove = button("删除");
   remove.className = "danger";
-  remove.addEventListener("click", () => deleteCareerResume(resume.id));
+  remove.addEventListener("click", () =>
+    runCareerActionTask(() => deleteCareerResume(resume.id), node)
+  );
   actions.appendChild(remove);
   node.append(meta, title, summary, actions);
   return node;
 }
 
-async function setDefaultCareerResume(resumeId) {
-  if (!resumeId) return;
+function runCareerActionTask(task, node) {
+  return runUiTask(task, () => {
+    showWorkbenchActionError(node, "求职看板操作失败，请稍后重试。");
+  });
+}
+
+async function setDefaultCareerResume(resumeId, parentContext = null) {
+  if (!resumeId) return false;
+  const routeContext = currentCareerRouteContext(parentContext);
+  if (!routeContext) return false;
   await api(`/api/career/resumes/${resumeId}`, {
     method: "PATCH",
     body: JSON.stringify({ make_default: true }),
   });
-  await loadCareerBoard();
+  if (!routeContext.isCurrent()) return false;
+  return loadCareerBoard(routeContext);
 }
 
-async function deleteCareerResume(resumeId) {
-  if (!resumeId) return;
+async function deleteCareerResume(resumeId, parentContext = null) {
+  if (!resumeId) return false;
   const confirmed = typeof window.confirm === "function" ? window.confirm("删除这份基础简历？") : true;
-  if (!confirmed) return;
+  if (!confirmed) return false;
+  const routeContext = currentCareerRouteContext(parentContext);
+  if (!routeContext) return false;
   await api(`/api/career/resumes/${resumeId}`, {
     method: "DELETE",
   });
-  await loadCareerBoard();
+  if (!routeContext.isCurrent()) return false;
+  return loadCareerBoard(routeContext);
 }
 
 function careerResumeDraftSections(detail = {}) {
@@ -2434,8 +2707,8 @@ async function exportCareerResumeDraft(detail = {}, format = "docx", sectionsOve
   const headline = `${opportunity.title || "Target Resume"}${opportunity.company ? ` - ${opportunity.company}` : ""}`;
   const editedSections = Array.isArray(sectionsOverride) ? sectionsOverride : readCareerEditedResumeSections();
   const sections = editedSections.length ? editedSections : careerResumeDraftSections(detail);
-  try {
-    const artifact = await api("/api/career/resumes/export", {
+  return runCareerContentRequest({
+    load: () => api("/api/career/resumes/export", {
       method: "POST",
       body: JSON.stringify({
         filename: `${headline || "nomi-resume"}.${format}`,
@@ -2444,11 +2717,12 @@ async function exportCareerResumeDraft(detail = {}, format = "docx", sectionsOve
         format,
         source_event_ids: detail.generated_from?.source_event_ids || detail.fit_summary?.evidence_ids || [],
       }),
-    });
-    downloadCareerArtifact(artifact);
-  } catch {
-    careerContent.appendChild(emptyCard("导出失败。请确认该岗位已有简历草稿或 Cover Letter 草稿。"));
-  }
+    }),
+    commit: (artifact) => downloadCareerArtifact(artifact),
+    onError: () => {
+      careerContent.appendChild(emptyCard("导出失败。请确认该岗位已有简历草稿或 Cover Letter 草稿。"));
+    },
+  });
 }
 
 function renderCareerOffers(data = {}) {
@@ -2571,19 +2845,25 @@ function renderCareerOpportunityCard(opportunity, application, resumeVersion) {
   if (application?.id) {
     if (!["submitted", "ignored", "rejected", "withdrawn"].includes(application.status)) {
       const submitted = button("标记已投递");
-      submitted.addEventListener("click", () => updateCareerApplicationStatus(
-        application.id,
-        "submitted",
-        "submitted",
-        "prepare_interview_if_replied"
-      ));
+      submitted.addEventListener("click", () =>
+        runCareerActionTask(
+          () =>
+            updateCareerApplicationStatus(
+              application.id,
+              "submitted",
+              "submitted",
+              "prepare_interview_if_replied"
+            ),
+          node
+        )
+      );
       const ignored = button("忽略");
-      ignored.addEventListener("click", () => updateCareerApplicationStatus(
-        application.id,
-        "ignored",
-        "ignored",
-        "none"
-      ));
+      ignored.addEventListener("click", () =>
+        runCareerActionTask(
+          () => updateCareerApplicationStatus(application.id, "ignored", "ignored", "none"),
+          node
+        )
+      );
       actions.append(submitted, ignored);
     }
   }
@@ -2603,7 +2883,15 @@ function renderCareerApplicationCard(application) {
   return node;
 }
 
-async function updateCareerApplicationStatus(applicationId, status, stage, nextStep) {
+async function updateCareerApplicationStatus(
+  applicationId,
+  status,
+  stage,
+  nextStep,
+  parentContext = null
+) {
+  const routeContext = currentCareerRouteContext(parentContext);
+  if (!routeContext) return false;
   await api(`/api/career/applications/${applicationId}`, {
     method: "PATCH",
     body: JSON.stringify({
@@ -2613,7 +2901,8 @@ async function updateCareerApplicationStatus(applicationId, status, stage, nextS
       user_note: `updated from workbench: ${status}`,
     }),
   });
-  await loadCareerBoard();
+  if (!routeContext.isCurrent()) return false;
+  return loadCareerBoard(routeContext);
 }
 
 if (typeof window !== "undefined") {
@@ -2715,41 +3004,80 @@ function renderSuggestionCard(item, focusSuggestionId = "") {
     actions.appendChild(actionButton);
   }
   const done = button("完成");
-  done.addEventListener("click", () => updateSuggestion(item.id, "done", node));
+  done.addEventListener("click", () =>
+    runSuggestionStatusUpdate(item.id, "done", node, done)
+  );
   const dismiss = button("忽略");
-  dismiss.addEventListener("click", () => updateSuggestion(item.id, "dismissed", node));
+  dismiss.addEventListener("click", () =>
+    runSuggestionStatusUpdate(item.id, "dismissed", node, dismiss)
+  );
   actions.append(done, dismiss);
   node.appendChild(actions);
   return node;
 }
 
-async function loadSuggestions(focusSuggestionId = "", fallbackEvent = null) {
+async function loadSuggestions(focusSuggestionId = "", fallbackEvent = null, parentContext = null) {
+  if (!suggestionsContent) return false;
   suggestionsContent.textContent = "加载中...";
-  try {
-    const data = await api("/api/suggestions");
-    suggestionsContent.textContent = "";
-    const items = [...(data || [])];
-    const fallbackSuggestion = suggestionFromProactiveEvent(fallbackEvent);
-    if (focusSuggestionId && fallbackSuggestion && !items.some((item) => item.id === focusSuggestionId)) {
-      items.unshift(fallbackSuggestion);
-    }
-    for (const item of items) {
-      suggestionsContent.appendChild(renderSuggestionCard(item, focusSuggestionId));
-    }
-    if (!suggestionsContent.children.length) suggestionsContent.appendChild(emptyCard("暂无建议"));
-    if (focusSuggestionId) {
-      const focused = suggestionsContent.querySelector(`[data-suggestion-id="${cssEscapeValue(focusSuggestionId)}"]`);
-      if (focused) focused.scrollIntoView({ block: "center", inline: "nearest" });
-    }
-  } catch {
-    suggestionsContent.textContent = "无法读取建议。";
-  }
+  return runLatestRequest({
+    gate: workbenchRequestGate,
+    key: "suggestions",
+    parentContext,
+    load: () => api("/api/suggestions"),
+    commit: (data) => {
+      suggestionsContent.textContent = "";
+      const items = [...(data || [])];
+      const fallbackSuggestion = suggestionFromProactiveEvent(fallbackEvent);
+      if (
+        focusSuggestionId &&
+        fallbackSuggestion &&
+        !items.some((item) => item.id === focusSuggestionId)
+      ) {
+        items.unshift(fallbackSuggestion);
+      }
+      for (const item of items) {
+        suggestionsContent.appendChild(renderSuggestionCard(item, focusSuggestionId));
+      }
+      if (!suggestionsContent.children.length) suggestionsContent.appendChild(emptyCard("暂无建议"));
+      if (focusSuggestionId) {
+        const focused = suggestionsContent.querySelector(
+          `[data-suggestion-id="${cssEscapeValue(focusSuggestionId)}"]`
+        );
+        if (focused) focused.scrollIntoView({ block: "center", inline: "nearest" });
+      }
+    },
+    onError: () => {
+      suggestionsContent.textContent = "无法读取建议。";
+    },
+  });
 }
 
 async function updateSuggestion(id, status, node) {
   await api(`/api/suggestions/${encodeURIComponent(id)}`, { method: "PATCH", body: JSON.stringify({ status }) });
   node.remove();
   if (!suggestionsContent.children.length) suggestionsContent.appendChild(emptyCard("暂无建议"));
+}
+
+function showWorkbenchActionError(container, message) {
+  if (!container) return;
+  let error = container.querySelector?.(".workbench-action-error");
+  if (!error) {
+    error = document.createElement("p");
+    error.className = "error workbench-action-error";
+    container.appendChild(error);
+  }
+  error.textContent = message;
+}
+
+function runSuggestionStatusUpdate(id, status, node, actionButton) {
+  actionButton.disabled = true;
+  return runUiTask(
+    () => updateSuggestion(id, status, node),
+    () => {
+      actionButton.disabled = false;
+      showWorkbenchActionError(node, "建议状态更新失败，请稍后重试。");
+    }
+  );
 }
 
 async function runSuggestionAction(id, actionId, actionButton) {
@@ -2805,41 +3133,78 @@ function collectorStatusText(item) {
   return "采集中";
 }
 
-async function loadCollectors() {
-  collectorsContent.textContent = "加载中...";
-  try {
-    const data = await api("/api/collectors/status");
-    collectorsContent.textContent = "";
-    for (const item of data.collectors || []) {
-      const node = card();
-      node.innerHTML = `<time>${collectorStatusText(item)} · ${item.health_status || "unknown"}</time><strong>${item.source}</strong><p>${JSON.stringify(item.details || {}, null, 2)}</p>`;
-      const actions = document.createElement("div");
-      actions.className = "actions";
-      const toggle = button(item.enabled && !item.paused ? "暂停" : "开启");
-      toggle.addEventListener("click", async () => {
-        const nextEnabled = !(item.enabled && !item.paused);
-        await api(`/api/collectors/settings/${item.source}`, {
-          method: "PATCH",
-          body: JSON.stringify({ enabled: nextEnabled, paused_until: null, reason: nextEnabled ? "" : "user paused from workbench" }),
-        });
-        await loadCollectors();
+function runCollectorSettingsUpdate(item, payload, actionButton, node) {
+  const previousText = actionButton.textContent;
+  const routeContext = workbenchNavigation.currentRouteContext();
+  actionButton.disabled = true;
+  return runUiTask(
+    async () => {
+      await api(`/api/collectors/settings/${item.source}`, {
+        method: "PATCH",
+        body: JSON.stringify(payload),
       });
-      const pauseHour = button("暂停1小时");
-      pauseHour.addEventListener("click", async () => {
-        const until = new Date(Date.now() + 60 * 60 * 1000).toISOString();
-        await api(`/api/collectors/settings/${item.source}`, {
-          method: "PATCH",
-          body: JSON.stringify({ enabled: true, paused_until: until, reason: "temporary pause from workbench" }),
-        });
-        await loadCollectors();
-      });
-      actions.append(toggle, pauseHour);
-      node.appendChild(actions);
-      collectorsContent.appendChild(node);
+      await loadCollectors(routeContext);
+    },
+    () => {
+      actionButton.disabled = false;
+      actionButton.textContent = previousText;
+      showWorkbenchActionError(node, "采集设置更新失败，请稍后重试。");
     }
-  } catch {
-    collectorsContent.textContent = "无法读取采集设置。";
-  }
+  );
+}
+
+async function loadCollectors(parentContext = null) {
+  if (!collectorsContent) return false;
+  collectorsContent.textContent = "加载中...";
+  return runLatestRequest({
+    gate: workbenchRequestGate,
+    key: "collectors",
+    parentContext,
+    load: () => api("/api/collectors/status"),
+    commit: (data) => {
+      collectorsContent.textContent = "";
+      for (const item of data.collectors || []) {
+        const node = card();
+        node.innerHTML = `<time>${collectorStatusText(item)} · ${item.health_status || "unknown"}</time><strong>${item.source}</strong><p>${JSON.stringify(item.details || {}, null, 2)}</p>`;
+        const actions = document.createElement("div");
+        actions.className = "actions";
+        const toggle = button(item.enabled && !item.paused ? "暂停" : "开启");
+        toggle.addEventListener("click", () => {
+          const nextEnabled = !(item.enabled && !item.paused);
+          runCollectorSettingsUpdate(
+            item,
+            {
+              enabled: nextEnabled,
+              paused_until: null,
+              reason: nextEnabled ? "" : "user paused from workbench",
+            },
+            toggle,
+            node
+          );
+        });
+        const pauseHour = button("暂停1小时");
+        pauseHour.addEventListener("click", () => {
+          const until = new Date(Date.now() + 60 * 60 * 1000).toISOString();
+          runCollectorSettingsUpdate(
+            item,
+            {
+              enabled: true,
+              paused_until: until,
+              reason: "temporary pause from workbench",
+            },
+            pauseHour,
+            node
+          );
+        });
+        actions.append(toggle, pauseHour);
+        node.appendChild(actions);
+        collectorsContent.appendChild(node);
+      }
+    },
+    onError: () => {
+      collectorsContent.textContent = "无法读取采集设置。";
+    },
+  });
 }
 
 const webSearchProviderMeta = {
@@ -3004,17 +3369,26 @@ function setWebSearchDetailBusy(busy, message = "") {
   if (message) webSearchProviderStatus.textContent = message;
 }
 
-async function loadWebSearchSettings({ reopenProvider = "" } = {}) {
+async function loadWebSearchSettings(options = {}) {
+  const reopenProvider = options?.reopenProvider || "";
+  const parentContext = typeof options?.isCurrent === "function" ? options : null;
   if (!webSearchProviderList) return;
   webSearchProviderList.textContent = "加载搜索服务...";
-  try {
-    webSearchSettingsState = await api("/api/web-search/settings");
-    renderWebSearchProviderList();
-    renderWebSearchRouting();
-    if (reopenProvider) openWebSearchProvider(reopenProvider);
-  } catch (error) {
-    webSearchProviderList.textContent = safeWebSearchError(error, "无法读取 Web Search 设置。");
-  }
+  return runLatestRequest({
+    gate: workbenchRequestGate,
+    key: "web-search-settings",
+    parentContext,
+    load: () => api("/api/web-search/settings"),
+    commit: (nextState) => {
+      webSearchSettingsState = nextState;
+      renderWebSearchProviderList();
+      renderWebSearchRouting();
+      if (reopenProvider) openWebSearchProvider(reopenProvider);
+    },
+    onError: (error) => {
+      webSearchProviderList.textContent = safeWebSearchError(error, "无法读取 Web Search 设置。");
+    },
+  });
 }
 
 async function saveAndTestWebSearchProvider(provider) {
@@ -3184,6 +3558,14 @@ function appendAssistantIdentityListItem(container, { meta, title, body, status 
   return item;
 }
 
+function runAssistantIdentityTask(task) {
+  return runUiTask(task, (error) => {
+    if (assistantIdentityStatus) {
+      assistantIdentityStatus.textContent = `操作失败：${String(error?.message || error || "请稍后重试。")}`;
+    }
+  });
+}
+
 function renderAssistantIdentityGmail(identity, health = {}) {
   assistantIdentityGmail.textContent = "";
   const heading = document.createElement("div");
@@ -3231,29 +3613,37 @@ function renderAssistantIdentityGmail(identity, health = {}) {
   const actions = document.createElement("div");
   actions.className = "assistant-identity-actions";
   const connect = button(identity.status === "connected" || identity.status === "degraded" ? "重新连接" : "连接 Gmail");
-  connect.addEventListener("click", connectAssistantGmail);
+  connect.addEventListener("click", () => runAssistantIdentityTask(connectAssistantGmail));
   actions.appendChild(connect);
   if (!["unconfigured", "authorization_pending"].includes(identity.status)) {
     const verify = button("立即验证");
     verify.className = "secondary";
-    verify.addEventListener("click", () => verifyAssistantIdentity(identity.identity_id));
+    verify.addEventListener("click", () =>
+      runAssistantIdentityTask(() => verifyAssistantIdentity(identity.identity_id))
+    );
     actions.appendChild(verify);
   }
   if (identity.status === "disabled") {
     const enable = button("启用");
     enable.className = "secondary";
-    enable.addEventListener("click", () => enableAssistantIdentity(identity.identity_id));
+    enable.addEventListener("click", () =>
+      runAssistantIdentityTask(() => enableAssistantIdentity(identity.identity_id))
+    );
     actions.appendChild(enable);
   } else if (identity.status !== "unconfigured") {
     const disable = button("停用");
     disable.className = "secondary";
-    disable.addEventListener("click", () => disableAssistantIdentity(identity.identity_id));
+    disable.addEventListener("click", () =>
+      runAssistantIdentityTask(() => disableAssistantIdentity(identity.identity_id))
+    );
     actions.appendChild(disable);
   }
   if (identity.status !== "unconfigured") {
     const disconnect = button("断开连接");
     disconnect.className = "secondary danger";
-    disconnect.addEventListener("click", () => disconnectAssistantIdentity(identity.identity_id));
+    disconnect.addEventListener("click", () =>
+      runAssistantIdentityTask(() => disconnectAssistantIdentity(identity.identity_id))
+    );
     actions.appendChild(disconnect);
   }
 
@@ -3369,16 +3759,22 @@ function renderChatAssistantDrafts(items = []) {
     actions.className = "assistant-identity-actions compact";
     if (draft.status === "draft") {
       const confirm = button("确认并发送");
-      confirm.addEventListener("click", () => confirmAssistantDraft(draft.draft_id));
+      confirm.addEventListener("click", () =>
+        runAssistantIdentityTask(() => confirmAssistantDraft(draft.draft_id))
+      );
       actions.appendChild(confirm);
     }
     if (["draft", "blocked"].includes(draft.status)) {
       const edit = button("修改");
       edit.className = "secondary";
-      edit.addEventListener("click", () => editAssistantDraft(draft.draft_id, draft));
+      edit.addEventListener("click", () =>
+        runAssistantIdentityTask(() => editAssistantDraft(draft.draft_id, draft))
+      );
       const cancel = button("取消");
       cancel.className = "secondary";
-      cancel.addEventListener("click", () => cancelAssistantDraft(draft.draft_id));
+      cancel.addEventListener("click", () =>
+        runAssistantIdentityTask(() => cancelAssistantDraft(draft.draft_id))
+      );
       actions.append(edit, cancel);
     }
     item.append(meta, title, recipient, body, evidence, failure);
@@ -3388,19 +3784,23 @@ function renderChatAssistantDrafts(items = []) {
   chatAssistantDrafts.hidden = !chatAssistantDrafts.children.length;
 }
 
-async function loadChatAssistantDrafts() {
-  if (!chatAssistantDrafts) return;
-  try {
-    const result = await api("/api/assistant-outbound/drafts?limit=20");
-    renderChatAssistantDrafts(result.items || []);
-  } catch {
-    chatAssistantDrafts.replaceChildren();
-    const error = document.createElement("p");
-    error.className = "muted";
-    error.textContent = "待确认草稿暂时无法读取。";
-    chatAssistantDrafts.appendChild(error);
-    chatAssistantDrafts.hidden = false;
-  }
+async function loadChatAssistantDrafts(parentContext = null) {
+  if (!chatAssistantDrafts) return false;
+  return runLatestRequest({
+    gate: workbenchRequestGate,
+    key: "chat-assistant-drafts",
+    parentContext,
+    load: () => api("/api/assistant-outbound/drafts?limit=20"),
+    commit: (result) => renderChatAssistantDrafts(result.items || []),
+    onError: () => {
+      chatAssistantDrafts.replaceChildren();
+      const error = document.createElement("p");
+      error.className = "muted";
+      error.textContent = "待确认草稿暂时无法读取。";
+      chatAssistantDrafts.appendChild(error);
+      chatAssistantDrafts.hidden = false;
+    },
+  });
 }
 
 function renderAssistantIdentityDrafts(items = []) {
@@ -3418,16 +3818,22 @@ function renderAssistantIdentityDrafts(items = []) {
     actions.className = "assistant-identity-actions compact";
     if (draft.status === "draft") {
       const confirm = button("确认并发送");
-      confirm.addEventListener("click", () => confirmAssistantDraft(draft.draft_id));
+      confirm.addEventListener("click", () =>
+        runAssistantIdentityTask(() => confirmAssistantDraft(draft.draft_id))
+      );
       actions.appendChild(confirm);
     }
     if (["draft", "blocked"].includes(draft.status)) {
       const edit = button("修改");
       edit.className = "secondary";
-      edit.addEventListener("click", () => editAssistantDraft(draft.draft_id, draft));
+      edit.addEventListener("click", () =>
+        runAssistantIdentityTask(() => editAssistantDraft(draft.draft_id, draft))
+      );
       const cancel = button("取消");
       cancel.className = "secondary";
-      cancel.addEventListener("click", () => cancelAssistantDraft(draft.draft_id));
+      cancel.addEventListener("click", () =>
+        runAssistantIdentityTask(() => cancelAssistantDraft(draft.draft_id))
+      );
       actions.append(edit, cancel);
     }
     item.appendChild(actions);
@@ -3461,37 +3867,46 @@ function renderAssistantIdentityAudit(items = []) {
   if (!assistantIdentityAudit.children.length) assistantIdentityAudit.appendChild(emptyCard("暂无审计记录。"));
 }
 
-async function loadAssistantIdentities() {
-  if (!assistantIdentityGmail) return;
+async function loadAssistantIdentities(parentContext = null) {
+  if (!assistantIdentityGmail) return false;
   assistantIdentityStatus.textContent = "正在读取服务端状态...";
-  try {
-    const identitiesData = await api("/api/assistant-identities");
-    const gmail = (identitiesData.identities || []).find((item) => item.identity_id === "nomi_gmail_primary") || {
-      identity_id: "nomi_gmail_primary",
-      status: "unconfigured",
-    };
-    const identityId = gmail.identity_id;
-    const [healthResult, inboxResult, draftsResult, historyResult, auditResult] = await Promise.allSettled([
-      api(`/api/assistant-identities/${identityId}/health`),
-      api("/api/assistant-inbox?limit=20"),
-      api("/api/assistant-outbound/drafts?limit=20"),
-      api("/api/assistant-outbound/messages?limit=20"),
-      api("/api/assistant-audit?limit=30"),
-    ]);
-    renderAssistantIdentityGmail(gmail, healthResult.status === "fulfilled" ? healthResult.value : {});
-    renderAssistantIdentityInbox(inboxResult.status === "fulfilled" ? inboxResult.value.items : []);
-    renderAssistantIdentityDrafts(draftsResult.status === "fulfilled" ? draftsResult.value.items : []);
-    renderAssistantIdentityHistory(historyResult.status === "fulfilled" ? historyResult.value.items : []);
-    renderAssistantIdentityAudit(auditResult.status === "fulfilled" ? auditResult.value.items : []);
-    const failures = [healthResult, inboxResult, draftsResult, historyResult, auditResult]
-      .filter((result) => result.status === "rejected").length;
-    assistantIdentityStatus.textContent = failures
-      ? `${failures} 个数据区域暂时不可用，其余状态已从服务端刷新。`
-      : "状态已从服务端刷新。";
-  } catch (error) {
-    assistantIdentityGmail.textContent = "助理身份状态加载失败。";
-    assistantIdentityStatus.textContent = String(error?.message || "请检查服务端连接。");
-  }
+  return runLatestRequest({
+    gate: workbenchRequestGate,
+    key: "assistant-identities",
+    parentContext,
+    load: async () => {
+      const identitiesData = await api("/api/assistant-identities");
+      const gmail = (identitiesData.identities || []).find((item) => item.identity_id === "nomi_gmail_primary") || {
+        identity_id: "nomi_gmail_primary",
+        status: "unconfigured",
+      };
+      const identityId = gmail.identity_id;
+      const results = await Promise.allSettled([
+        api(`/api/assistant-identities/${identityId}/health`),
+        api("/api/assistant-inbox?limit=20"),
+        api("/api/assistant-outbound/drafts?limit=20"),
+        api("/api/assistant-outbound/messages?limit=20"),
+        api("/api/assistant-audit?limit=30"),
+      ]);
+      return { gmail, results };
+    },
+    commit: ({ gmail, results }) => {
+      const [healthResult, inboxResult, draftsResult, historyResult, auditResult] = results;
+      renderAssistantIdentityGmail(gmail, healthResult.status === "fulfilled" ? healthResult.value : {});
+      renderAssistantIdentityInbox(inboxResult.status === "fulfilled" ? inboxResult.value.items : []);
+      renderAssistantIdentityDrafts(draftsResult.status === "fulfilled" ? draftsResult.value.items : []);
+      renderAssistantIdentityHistory(historyResult.status === "fulfilled" ? historyResult.value.items : []);
+      renderAssistantIdentityAudit(auditResult.status === "fulfilled" ? auditResult.value.items : []);
+      const failures = results.filter((result) => result.status === "rejected").length;
+      assistantIdentityStatus.textContent = failures
+        ? `${failures} 个数据区域暂时不可用，其余状态已从服务端刷新。`
+        : "状态已从服务端刷新。";
+    },
+    onError: (error) => {
+      assistantIdentityGmail.textContent = "助理身份状态加载失败。";
+      assistantIdentityStatus.textContent = String(error?.message || "请检查服务端连接。");
+    },
+  });
 }
 
 async function connectAssistantGmail() {
@@ -3530,65 +3945,81 @@ async function disconnectAssistantIdentity(identityId) {
   await loadAssistantIdentities();
 }
 
-async function loadTools() {
+async function loadTools(parentContext = null) {
   const failureMessage = (error, fallback) => {
     if (!error) return fallback;
     const message = String(error.message || error || "").trim();
     return message || fallback;
   };
+  if (!toolsContent) return false;
   toolsContent.textContent = "";
   toolsContent.appendChild(renderBrowserLoginPanel({ collectors: [], loading: true }));
 
-  const [catalogResult, collectorResult, composioStatusResult] = await Promise.allSettled([
-    api("/api/tools/catalog"),
-    api("/api/collectors/status"),
-    api("/api/integrations/composio/status"),
-  ]);
-  const data =
-    catalogResult.status === "fulfilled"
-      ? catalogResult.value
-      : { tools: [], error: failureMessage(catalogResult.reason, "无法读取工具目录") };
-  const collectorStatus =
-    collectorResult.status === "fulfilled"
-      ? collectorResult.value
-      : { collectors: [], error: failureMessage(collectorResult.reason, "无法读取网页登录状态") };
-  const composioStatus =
-    composioStatusResult.status === "fulfilled"
-      ? composioStatusResult.value
-      : {
-          configured: false,
-          error: failureMessage(composioStatusResult.reason, "无法读取 Composio 状态"),
-          readonly_toolkits: [],
-        };
-  const composioConnections = composioStatus.configured
-    ? await api("/api/integrations/composio/toolkits?session_kind=readonly").catch((error) => ({
-        toolkits: [],
-        error: failureMessage(error, "无法同步 Composio 连接状态"),
-      }))
-    : { toolkits: [] };
-
-  toolsContent.textContent = "";
-  toolsContent.appendChild(renderBrowserLoginPanel(collectorStatus));
-  toolsContent.appendChild(renderComposioPanel(composioStatus, composioConnections));
-  const policy = card("card compact");
-  policy.innerHTML = `<strong>执行权限规则</strong><p>读取可直接执行；写入、发消息、叫车、购买等动作都需要用户确认。付款/下单必须最终确认。</p>`;
-  toolsContent.appendChild(policy);
-  if (data.error) {
-    toolsContent.appendChild(emptyCard("工具目录暂时不可用，网页登录入口仍可继续使用。"));
-  }
-  const groups = [
-    ["core", "第一批：先接入"],
-    ["recommended", "第二批：目标人群高频"],
-    ["experimental", "实验：生活服务与非官方工具"],
-  ];
-  for (const [phase, title] of groups) {
-    const items = (data.tools || []).filter((tool) => tool.phase === phase);
-    if (!items.length) continue;
-    const heading = document.createElement("h3");
-    heading.textContent = title;
-    toolsContent.appendChild(heading);
-    for (const tool of items) toolsContent.appendChild(renderToolCard(tool));
-  }
+  return runLatestRequest({
+    gate: workbenchRequestGate,
+    key: "tools",
+    parentContext,
+    load: async () => {
+      const [catalogResult, collectorResult, composioStatusResult] = await Promise.allSettled([
+        api("/api/tools/catalog"),
+        api("/api/collectors/status"),
+        api("/api/integrations/composio/status"),
+      ]);
+      const data =
+        catalogResult.status === "fulfilled"
+          ? catalogResult.value
+          : { tools: [], error: failureMessage(catalogResult.reason, "无法读取工具目录") };
+      const collectorStatus =
+        collectorResult.status === "fulfilled"
+          ? collectorResult.value
+          : { collectors: [], error: failureMessage(collectorResult.reason, "无法读取网页登录状态") };
+      const composioStatus =
+        composioStatusResult.status === "fulfilled"
+          ? composioStatusResult.value
+          : {
+              configured: false,
+              error: failureMessage(composioStatusResult.reason, "无法读取 Composio 状态"),
+              readonly_toolkits: [],
+            };
+      const composioConnections = composioStatus.configured
+        ? await api("/api/integrations/composio/toolkits?session_kind=readonly").catch((error) => ({
+            toolkits: [],
+            error: failureMessage(error, "无法同步 Composio 连接状态"),
+          }))
+        : { toolkits: [] };
+      return { data, collectorStatus, composioStatus, composioConnections };
+    },
+    commit: ({ data, collectorStatus, composioStatus, composioConnections }) => {
+      toolsContent.textContent = "";
+      toolsContent.appendChild(renderBrowserLoginPanel(collectorStatus));
+      toolsContent.appendChild(renderComposioPanel(composioStatus, composioConnections));
+      const policy = card("card compact");
+      policy.innerHTML = `<strong>执行权限规则</strong><p>读取可直接执行；写入、发消息、叫车、购买等动作都需要用户确认。付款/下单必须最终确认。</p>`;
+      toolsContent.appendChild(policy);
+      if (data.error) {
+        toolsContent.appendChild(emptyCard("工具目录暂时不可用，网页登录入口仍可继续使用。"));
+      }
+      const groups = [
+        ["core", "第一批：先接入"],
+        ["recommended", "第二批：目标人群高频"],
+        ["experimental", "实验：生活服务与非官方工具"],
+      ];
+      for (const [phase, title] of groups) {
+        const items = (data.tools || []).filter((tool) => tool.phase === phase);
+        if (!items.length) continue;
+        const heading = document.createElement("h3");
+        heading.textContent = title;
+        toolsContent.appendChild(heading);
+        for (const tool of items) toolsContent.appendChild(renderToolCard(tool));
+      }
+    },
+    onError: () => {
+      toolsContent.textContent = "";
+      toolsContent.appendChild(
+        emptyCard("工具与账号连接状态暂时无法读取，请检查服务端连接后重试。")
+      );
+    },
+  });
 }
 
 function collectorBySource(status) {
@@ -4088,36 +4519,36 @@ messages.addEventListener("pointerdown", () => {
 workbenchNavigation.bindHashChanges(window);
 window.addEventListener("nomi-pending-proactive", consumePendingProactive);
 
-searchForm.addEventListener("submit", (event) => {
+searchForm?.addEventListener("submit", (event) => {
   event.preventDefault();
   const query = searchInput.value.trim();
   if (query) loadSearch(query);
 });
-governanceFilters.addEventListener("submit", (event) => {
+governanceFilters?.addEventListener("submit", (event) => {
   event.preventDefault();
   loadGovernance();
 });
-refreshGovernance.addEventListener("click", loadGovernance);
-refreshAgenda.addEventListener("click", loadAgenda);
-refreshCareer.addEventListener("click", loadCareerBoard);
-careerOffers.addEventListener("click", loadCareerOffers);
-careerAtsListPreview.addEventListener("click", previewCareerAtsList);
-careerAtsPreviewForm.addEventListener("submit", (event) => {
+refreshGovernance?.addEventListener("click", loadGovernance);
+refreshAgenda?.addEventListener("click", loadAgenda);
+refreshCareer?.addEventListener("click", loadCareerBoard);
+careerOffers?.addEventListener("click", loadCareerOffers);
+careerAtsListPreview?.addEventListener("click", previewCareerAtsList);
+careerAtsPreviewForm?.addEventListener("submit", (event) => {
   event.preventDefault();
   previewCareerAtsPage();
 });
-careerProfileIngestForm.addEventListener("submit", (event) => {
+careerProfileIngestForm?.addEventListener("submit", (event) => {
   event.preventDefault();
   ingestCareerProfile();
 });
-careerResumeFileImportForm.addEventListener("submit", (event) => {
+careerResumeFileImportForm?.addEventListener("submit", (event) => {
   event.preventDefault();
   importCareerResumeFile();
 });
-refreshSuggestions.addEventListener("click", () => loadSuggestions(currentSuggestionFocusId()));
-refreshCollectors.addEventListener("click", loadCollectors);
+refreshSuggestions?.addEventListener("click", () => loadSuggestions(currentSuggestionFocusId()));
+refreshCollectors?.addEventListener("click", loadCollectors);
 refreshAssistantIdentities?.addEventListener("click", loadAssistantIdentities);
-refreshTools.addEventListener("click", loadTools);
+refreshTools?.addEventListener("click", loadTools);
 toolRouteForm?.addEventListener("submit", (event) => {
   event.preventDefault();
   const request = toolRouteInput?.value.trim() || "";

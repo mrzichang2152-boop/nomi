@@ -18,34 +18,17 @@ def run_navigation_runtime(scenario: str) -> None:
     app_js = ROOT / "app" / "static" / "app.js"
     harness = f"""
 const assert = require("node:assert/strict");
-const {{ createWorkbenchNavigationController }} = require({str(app_js)!r});
+const {{
+  WORKBENCH_SETTINGS_SECTION_IDS: settingsSectionIds,
+  WORKBENCH_VIEW_HASH_MAP: viewHashMap,
+  applyWorkbenchRouteToDocument,
+  createLatestRequestGate,
+  createWorkbenchNavigationController,
+  runLatestRequest,
+  runUiTask,
+}} = require({str(app_js)!r});
 
-const viewHashMap = {{
-  chatView: "chat",
-  agendaView: "agenda",
-  careerView: "career",
-  settingsView: "settings",
-  suggestionsView: "suggestions",
-  searchView: "search",
-  governanceView: "governance",
-  collectorsView: "collectors",
-  toolsView: "tools",
-  assistantIdentitiesView: "assistant-identities",
-  webSearchSettingsView: "web-search",
-  privacyView: "privacy",
-}};
-const settingsSectionIds = [
-  "suggestionsView",
-  "searchView",
-  "governanceView",
-  "collectorsView",
-  "toolsView",
-  "assistantIdentitiesView",
-  "webSearchSettingsView",
-  "privacyView",
-];
-
-function createHarness(initialHash) {{
+function createHarness(initialHash, options = {{}}) {{
   const listeners = new Map();
   const eventTarget = {{
     addEventListener(type, listener) {{
@@ -94,20 +77,25 @@ function createHarness(initialHash) {{
   const routes = [];
   const loads = [];
   const state = {{ clearCount: 0 }};
-  const primaryLoaders = Object.fromEntries(
+  const defaultPrimaryLoaders = Object.fromEntries(
     ["chatView", "agendaView", "careerView"].map((id) => [
       id,
       () => loads.push({{ kind: "primary", id }}),
     ])
   );
-  const settingsLoaders = Object.fromEntries(
+  const defaultSettingsLoaders = Object.fromEntries(
     settingsSectionIds
       .filter((id) => id !== "searchView" && id !== "privacyView")
       .map((id) => [
         id,
-        (...args) => loads.push({{ kind: "settings", id, args }}),
+        (...args) => {{
+          if (typeof args.at(-1)?.isCurrent === "function") args.pop();
+          return loads.push({{ kind: "settings", id, args }});
+        }},
       ])
   );
+  const primaryLoaders = {{ ...defaultPrimaryLoaders, ...(options.primaryLoaders || {{}}) }};
+  const settingsLoaders = {{ ...defaultSettingsLoaders, ...(options.settingsLoaders || {{}}) }};
   const controller = createWorkbenchNavigationController({{
     location,
     history,
@@ -120,12 +108,22 @@ function createHarness(initialHash) {{
     clearWebSearchKeyInput: () => {{
       state.clearCount += 1;
     }},
+    onLoaderError: options.onLoaderError,
   }});
   return {{ controller, eventTarget, history, loads, location, routes, state }};
 }}
 """
     result = subprocess.run(
-        ["node", "-e", f"{harness}\n{scenario}"],
+        [
+            "node",
+            "-e",
+            (
+                f"{harness}\n"
+                "(async () => {\n"
+                f"{scenario}\n"
+                "})().catch((error) => { console.error(error); process.exitCode = 1; });"
+            ),
+        ],
         text=True,
         capture_output=True,
         check=False,
@@ -379,7 +377,8 @@ def test_settings_route_state_preserves_primary_and_legacy_deep_links():
     assert "function createWorkbenchNavigationController" in js
     assert "const workbenchNavigation = createWorkbenchNavigationController" in js
     assert 'const defaultSettingsSectionId = "suggestionsView";' in js
-    assert "const settingsSectionIds = new Set([" in js
+    assert "const WORKBENCH_SETTINGS_SECTION_IDS = Object.freeze([" in js
+    assert "const settingsSectionIds = new Set(WORKBENCH_SETTINGS_SECTION_IDS);" in js
     for view_id in (
         "suggestionsView",
         "searchView",
@@ -391,7 +390,8 @@ def test_settings_route_state_preserves_primary_and_legacy_deep_links():
         "privacyView",
     ):
         assert f'"{view_id}"' in js
-    assert "const viewHashMap" in js
+    assert "const WORKBENCH_VIEW_HASH_MAP = Object.freeze({" in js
+    assert "const viewHashMap = WORKBENCH_VIEW_HASH_MAP;" in js
     assert 'settingsView: "settings"' in js
     assert 'toolsView: "tools"' in js
     assert 'agendaView: "agenda"' in js
@@ -441,26 +441,26 @@ def test_navigation_controller_uses_existing_lazy_loaders():
     controller_end = js.index("function hashForView", controller_start)
     controller = js[controller_start:controller_end]
 
-    assert 'chatView: () => loadChatAssistantDrafts()' in controller
-    assert 'agendaView: () => loadAgenda()' in controller
-    assert 'careerView: () => loadCareerBoard()' in controller
-    assert 'suggestionsView: (focusSuggestionId, fallbackEvent)' in controller
-    assert "loadSuggestions(focusSuggestionId, fallbackEvent)" in controller
-    assert 'governanceView: () => loadGovernance()' in controller
-    assert 'collectorsView: () => loadCollectors()' in controller
-    assert 'toolsView: () => loadTools()' in controller
-    assert 'assistantIdentitiesView: () => loadAssistantIdentities()' in controller
-    assert 'webSearchSettingsView: () => loadWebSearchSettings()' in controller
+    assert 'chatView: (context) => loadChatAssistantDrafts(context)' in controller
+    assert 'agendaView: (context) => loadAgenda(context)' in controller
+    assert 'careerView: (context) => loadCareerBoard(context)' in controller
+    assert 'suggestionsView: (focusSuggestionId, fallbackEvent, context)' in controller
+    assert "loadSuggestions(focusSuggestionId, fallbackEvent, context)" in controller
+    assert 'governanceView: (context) => loadGovernance(context)' in controller
+    assert 'collectorsView: (context) => loadCollectors(context)' in controller
+    assert 'toolsView: (context) => loadTools(context)' in controller
+    assert 'assistantIdentitiesView: (context) => loadAssistantIdentities(context)' in controller
+    assert 'webSearchSettingsView: (context) => loadWebSearchSettings(context)' in controller
     assert "searchView:" not in controller
     assert "privacyView:" not in controller
 
     apply_start = js.index("function applyWorkbenchRoute")
     apply_end = js.index("function switchView", apply_start)
     apply_route = js[apply_start:apply_end]
-    assert 'document.querySelectorAll(".settings-section")' in apply_route
-    assert 'document.querySelectorAll(".settings-nav-button")' in apply_route
-    assert 'button.setAttribute("aria-current", "page")' in apply_route
-    assert 'button.removeAttribute("aria-current")' in apply_route
+    assert "applyWorkbenchRouteToDocument(" in apply_route
+    assert 'root.querySelectorAll(".settings-nav-button")' in apply_route
+    assert 'button.setAttribute?.("aria-current", "page")' in apply_route
+    assert 'button.removeAttribute?.("aria-current")' in apply_route
 
 
 def test_settings_routing_removes_legacy_back_handler():
@@ -507,7 +507,7 @@ def test_account_connection_notifies_android_before_opening_remote_browser():
 
 def test_account_connection_renders_browser_login_before_remote_status_calls():
     js = read_static("app.js")
-    load_tools_start = js.index("async function loadTools()")
+    load_tools_start = js.index("async function loadTools(parentContext = null)")
     load_tools_end = js.index("function collectorBySource", load_tools_start)
     load_tools = js[load_tools_start:load_tools_end]
 
@@ -680,6 +680,354 @@ assert.equal(h.loads[0].id, "suggestionsView");
 assert.equal(h.loads[0].args[0], "sg-42");
 assert.deepEqual(h.loads[0].args[1], fallback);
 assert.deepEqual(h.routes, [{ primaryViewId: "settingsView", settingsSectionId: "suggestionsView" }]);
+"""
+    )
+
+
+def test_runtime_exports_and_executes_production_route_configuration():
+    run_navigation_runtime(
+        """
+assert.equal(viewHashMap.settingsView, "settings");
+assert.equal(viewHashMap.assistantIdentitiesView, "assistant-identities");
+assert.equal(viewHashMap.webSearchSettingsView, "web-search");
+assert.deepEqual(settingsSectionIds, [
+  "suggestionsView",
+  "searchView",
+  "governanceView",
+  "collectorsView",
+  "toolsView",
+  "assistantIdentitiesView",
+  "webSearchSettingsView",
+  "privacyView",
+]);
+
+const h = createHarness("#assistant-identities");
+h.controller.activateCurrentRoute();
+assert.deepEqual(h.routes, [
+  { primaryViewId: "settingsView", settingsSectionId: "assistantIdentitiesView" },
+]);
+assert.equal(h.loads[0].id, "assistantIdentitiesView");
+"""
+    )
+
+
+def test_runtime_executes_production_dom_route_adapter_and_reveals_mobile_tab():
+    run_navigation_runtime(
+        """
+function fakeNode({ id = "", view = "", section = "" } = {}) {
+  const classes = new Set();
+  return {
+    id,
+    dataset: { view, settingsSection: section },
+    attributes: new Map(),
+    classList: {
+      toggle(name, force) {
+        if (force) classes.add(name);
+        else classes.delete(name);
+      },
+      contains(name) {
+        return classes.has(name);
+      },
+    },
+    setAttribute(name, value) {
+      this.attributes.set(name, value);
+    },
+    removeAttribute(name) {
+      this.attributes.delete(name);
+    },
+    scrollIntoViewCalls: [],
+    scrollIntoView(options) {
+      this.scrollIntoViewCalls.push(options);
+    },
+  };
+}
+
+const chat = fakeNode({ id: "chatView" });
+const settings = fakeNode({ id: "settingsView" });
+const primaryChat = fakeNode({ view: "chatView" });
+const primarySettings = fakeNode({ view: "settingsView" });
+const suggestions = fakeNode({ id: "suggestionsView" });
+const privacy = fakeNode({ id: "privacyView" });
+const suggestionsButton = fakeNode({ section: "suggestionsView" });
+const privacyButton = fakeNode({ section: "privacyView" });
+const groups = new Map([
+  [".view", [chat, settings]],
+  [".nav-button", [primaryChat, primarySettings]],
+  [".settings-section", [suggestions, privacy]],
+  [".settings-nav-button", [suggestionsButton, privacyButton]],
+]);
+const fakeDocument = {
+  querySelectorAll(selector) {
+    return groups.get(selector) || [];
+  },
+};
+
+applyWorkbenchRouteToDocument(
+  fakeDocument,
+  { primaryViewId: "settingsView", settingsSectionId: "privacyView" },
+  { revealActiveSetting: true }
+);
+
+assert.equal(chat.classList.contains("active"), false);
+assert.equal(settings.classList.contains("active"), true);
+assert.equal(primarySettings.classList.contains("active"), true);
+assert.equal(privacy.classList.contains("active"), true);
+assert.equal(suggestions.classList.contains("active"), false);
+assert.equal(privacyButton.classList.contains("active"), true);
+assert.equal(privacyButton.attributes.get("aria-current"), "page");
+assert.equal(suggestionsButton.attributes.has("aria-current"), false);
+assert.deepEqual(privacyButton.scrollIntoViewCalls, [
+  { block: "nearest", inline: "nearest", behavior: "smooth" },
+]);
+"""
+    )
+
+
+def test_runtime_loader_context_prevents_stale_route_results_from_winning():
+    run_navigation_runtime(
+        """
+const pending = [];
+const rendered = [];
+const h = createHarness("#suggestion:first", {
+  settingsLoaders: {
+    suggestionsView: (focusId, _fallback, context) =>
+      new Promise((resolve) => pending.push({ focusId, context, resolve })).then(() => {
+        if (!context.isCurrent()) return false;
+        rendered.push(focusId);
+        return true;
+      }),
+  },
+});
+
+h.controller.activateCurrentRoute();
+h.location.hash = "#suggestion:second";
+h.controller.activateCurrentRoute();
+assert.equal(pending.length, 2);
+assert.equal(pending[0].context.isCurrent(), false);
+assert.equal(pending[1].context.isCurrent(), true);
+
+pending[1].resolve();
+await Promise.resolve();
+pending[0].resolve();
+await h.controller.whenIdle();
+assert.deepEqual(rendered, ["second"]);
+"""
+    )
+
+
+def test_runtime_latest_request_helper_prevents_same_loader_and_stale_route_commits():
+    run_navigation_runtime(
+        """
+const gate = createLatestRequestGate();
+const pending = [];
+const committed = [];
+let routeIsCurrent = true;
+const parentContext = { isCurrent: () => routeIsCurrent };
+
+function run(label) {
+  return runLatestRequest({
+    gate,
+    key: "web-search",
+    parentContext,
+    load: () => new Promise((resolve) => pending.push({ label, resolve })),
+    commit: (value) => committed.push(value),
+  });
+}
+
+const first = run("first");
+const second = run("second");
+pending[1].resolve("second");
+await second;
+pending[0].resolve("first");
+await first;
+assert.deepEqual(committed, ["second"]);
+
+const third = run("third");
+routeIsCurrent = false;
+pending[2].resolve("third");
+assert.equal(await third, false);
+assert.deepEqual(committed, ["second"]);
+"""
+    )
+
+
+def test_runtime_active_route_context_blocks_stale_career_action_after_return():
+    run_navigation_runtime(
+        """
+const h = createHarness("#career");
+h.controller.activateCurrentRoute();
+const staleCareerContext = h.controller.currentRouteContext();
+const gate = createLatestRequestGate();
+const pending = [];
+const committed = [];
+
+const staleDetail = runLatestRequest({
+  gate,
+  key: "career-content",
+  parentContext: staleCareerContext,
+  load: () => new Promise((resolve) => pending.push({ label: "stale-detail", resolve })),
+  commit: (value) => committed.push(value),
+});
+
+h.controller.navigateToView("settingsView");
+h.controller.navigateToView("careerView");
+const returnedCareerContext = h.controller.currentRouteContext();
+assert.equal(staleCareerContext.isCurrent(), false);
+assert.equal(returnedCareerContext.isCurrent(), true);
+
+const freshBoard = runLatestRequest({
+  gate,
+  key: "career-content",
+  parentContext: returnedCareerContext,
+  load: () => new Promise((resolve) => pending.push({ label: "fresh-board", resolve })),
+  commit: (value) => committed.push(value),
+});
+
+pending.find((item) => item.label === "fresh-board").resolve("fresh-board");
+await freshBoard;
+pending.find((item) => item.label === "stale-detail").resolve("stale-detail");
+assert.equal(await staleDetail, false);
+assert.deepEqual(committed, ["fresh-board"]);
+"""
+    )
+
+
+def test_runtime_ui_task_consumes_rejections_and_runs_recovery_callback():
+    run_navigation_runtime(
+        """
+const observed = [];
+const handled = await runUiTask(
+  async () => {
+    throw new Error("settings action failed");
+  },
+  (error) => observed.push(error.message)
+);
+assert.equal(handled, false);
+assert.deepEqual(observed, ["settings action failed"]);
+
+let completed = false;
+assert.equal(
+  await runUiTask(async () => {
+    completed = true;
+  }),
+  true
+);
+assert.equal(completed, true);
+"""
+    )
+
+
+def test_all_career_content_requests_and_settings_actions_use_safe_async_boundaries():
+    js = read_static("app.js")
+
+    def function_body(name: str, next_name: str) -> str:
+        start = js.index(f"async function {name}")
+        end = js.index(next_name, start)
+        return js[start:end]
+
+    for name, next_name in (
+        ("loadCareerBoard", "function clearCareerResumeLibrary"),
+        ("previewCareerAtsPage", "async function previewCareerAtsList"),
+        ("previewCareerAtsList", "async function loadCareerDetail"),
+        ("loadCareerDetail", "async function loadCareerOffers"),
+        ("loadCareerOffers", "function readFileAsBase64"),
+        ("importCareerResumeFile", "async function ingestCareerProfile"),
+        ("ingestCareerProfile", "function renderCareerAtsPreview"),
+        ("exportCareerResumeDraft", "function renderCareerOffers"),
+    ):
+        assert "runCareerContentRequest({" in function_body(name, next_name), name
+
+    assert "currentRouteContext" in js
+    assert 'key: "career-content"' in js
+    assert "runUiTask(" in js
+    assert "runSuggestionStatusUpdate(" in js
+    assert "runCollectorSettingsUpdate(" in js
+    assert "runAssistantIdentityTask(" in js
+
+
+def test_all_navigation_loaders_use_shared_latest_request_gate():
+    js = read_static("app.js")
+
+    controller_start = js.index("const workbenchNavigation = createWorkbenchNavigationController")
+    controller_end = js.index("function hashForView", controller_start)
+    controller = js[controller_start:controller_end]
+    for expected in (
+        "chatView: (context) => loadChatAssistantDrafts(context)",
+        "agendaView: (context) => loadAgenda(context)",
+        "careerView: (context) => loadCareerBoard(context)",
+        "governanceView: (context) => loadGovernance(context)",
+        "collectorsView: (context) => loadCollectors(context)",
+        "toolsView: (context) => loadTools(context)",
+        "assistantIdentitiesView: (context) => loadAssistantIdentities(context)",
+        "webSearchSettingsView: (context) => loadWebSearchSettings(context)",
+    ):
+        assert expected in controller
+
+    for key in (
+        "chat-assistant-drafts",
+        "agenda",
+        "career-content",
+        "governance",
+        "collectors",
+        "tools",
+        "assistant-identities",
+        "suggestions",
+        "web-search-settings",
+    ):
+        assert f'key: "{key}"' in js
+    assert js.count("gate: workbenchRequestGate") >= 9
+
+
+def test_runtime_suggestion_fallback_is_consumed_only_after_successful_load():
+    run_navigation_runtime(
+        """
+const attempts = [];
+let shouldSucceed = false;
+const fallback = { id: "sg-retry", title: "recover me" };
+const h = createHarness("#chat", {
+  settingsLoaders: {
+    suggestionsView: async (focusId, fallbackEvent) => {
+      attempts.push({ focusId, fallbackEvent });
+      return shouldSucceed;
+    },
+  },
+});
+
+h.controller.navigateToSuggestion("sg-retry", fallback);
+await h.controller.whenIdle();
+h.controller.activateCurrentRoute();
+await h.controller.whenIdle();
+assert.deepEqual(attempts.map((item) => item.fallbackEvent), [fallback, fallback]);
+
+shouldSucceed = true;
+h.controller.activateCurrentRoute();
+await h.controller.whenIdle();
+h.controller.activateCurrentRoute();
+await h.controller.whenIdle();
+assert.deepEqual(attempts.map((item) => item.fallbackEvent), [fallback, fallback, fallback, null]);
+"""
+    )
+
+
+def test_runtime_loader_rejections_are_reported_without_unhandled_promises():
+    run_navigation_runtime(
+        """
+const errors = [];
+const h = createHarness("#tools", {
+  settingsLoaders: {
+    toolsView: async () => {
+      throw new Error("tools failed");
+    },
+  },
+  onLoaderError: (error, context) => errors.push({
+    message: error.message,
+    section: context.route.settingsSectionId,
+  }),
+});
+
+h.controller.activateCurrentRoute();
+await h.controller.whenIdle();
+assert.deepEqual(errors, [{ message: "tools failed", section: "toolsView" }]);
 """
     )
 
@@ -909,7 +1257,7 @@ def test_workbench_loads_and_manages_agenda_items_from_runtime_api():
 
     assert 'document.querySelector("#agendaContent")' in js
     assert 'document.querySelector("#refreshAgenda")' in js
-    assert 'agendaView: () => loadAgenda()' in js
+    assert 'agendaView: (context) => loadAgenda(context)' in js
     assert "loadAgenda()" in js
     assert 'api("/api/agenda?limit=50")' in js
     assert "renderAgendaDayTabs" in js
@@ -939,8 +1287,8 @@ def test_workbench_loads_and_manages_career_board_from_runtime_api():
     assert 'document.querySelector("#careerResumeFile")' in js
     assert 'document.querySelector("#refreshCareer")' in js
     assert 'document.querySelector("#careerOffers")' in js
-    assert 'careerView: () => loadCareerBoard()' in js
-    assert "loadCareerBoard()" in js
+    assert 'careerView: (context) => loadCareerBoard(context)' in js
+    assert "loadCareerBoard(" in js
     assert 'api("/api/career/board?limit=50")' in js
     assert 'api("/api/career/offers")' in js
     assert "career_resumes" in js
