@@ -7283,6 +7283,15 @@ def composio_live_registry() -> ExecutorAdapterRegistry:
     return ExecutorAdapterRegistry(event_store=long_tail_event_store(), policy_gate=PolicyGate())
 
 
+def raise_if_known_composio_provider_error(error: object) -> None:
+    classified = classify_composio_provider_error(error)
+    if classified is not None:
+        raise HTTPException(
+            status_code=classified["status_code"],
+            detail=classified["detail"],
+        ) from None
+
+
 def composio_link_request_fields(connection_request: Any) -> dict[str, Any]:
     return {
         "redirect_url": str(object_value(connection_request, "redirect_url") or object_value(connection_request, "redirectUrl") or ""),
@@ -7380,11 +7389,29 @@ def create_composio_connect_link(toolkit_slug: str, requested_kind: str = "", fo
     authorized: dict[str, Any] = {}
 
     def authorize_toolkit(action_request: dict[str, Any]) -> dict[str, Any]:
-        if callback_url:
-            connection_request = session.authorize(slug, callback_url=callback_url)
-        else:
-            connection_request = session.authorize(slug)
-        fields = composio_link_request_fields(connection_request)
+        try:
+            if callback_url:
+                connection_request = session.authorize(slug, callback_url=callback_url)
+            else:
+                connection_request = session.authorize(slug)
+            fields = composio_link_request_fields(connection_request)
+        except Exception as exc:
+            classified = classify_composio_provider_error(exc)
+            if classified is not None:
+                return {
+                    "status": "failed",
+                    "provider_error": {
+                        "status_code": classified["status_code"],
+                        "detail": classified["detail"],
+                    },
+                    "error_code": classified["detail"]["code"],
+                    "external_side_effect": False,
+                }
+            return {
+                "status": "failed",
+                "error_code": "composio_connect_failed",
+                "external_side_effect": False,
+            }
         authorized["fields"] = fields
         return {
             "status": "link_created",
@@ -7425,7 +7452,15 @@ def create_composio_connect_link(toolkit_slug: str, requested_kind: str = "", fo
             },
         )
     if live_result.get("status") == "failed":
-        raise_classified_composio_error(live_result)
+        provider_error = live_result.get("provider_error")
+        if isinstance(provider_error, dict):
+            provider_status_code = provider_error.get("status_code")
+            provider_detail = provider_error.get("detail")
+            if isinstance(provider_status_code, int) and isinstance(provider_detail, dict):
+                raise HTTPException(
+                    status_code=provider_status_code,
+                    detail=provider_detail,
+                )
         raise HTTPException(
             status_code=502,
             detail={
@@ -11405,15 +11440,6 @@ def composio_integration_status(x_par_password: Optional[str] = Header(default=N
     return payload
 
 
-def raise_classified_composio_error(error: object) -> None:
-    classified = classify_composio_provider_error(error)
-    if classified is not None:
-        raise HTTPException(
-            status_code=classified["status_code"],
-            detail=classified["detail"],
-        )
-
-
 @app.post("/api/integrations/composio/connect/{toolkit_slug}")
 def composio_connect_toolkit(
     toolkit_slug: str,
@@ -11427,7 +11453,7 @@ def composio_connect_toolkit(
     except HTTPException:
         raise
     except Exception as exc:
-        raise_classified_composio_error(exc)
+        raise_if_known_composio_provider_error(exc)
         raise
 
 

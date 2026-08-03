@@ -3140,6 +3140,111 @@ def test_composio_connect_maps_provider_permission_error_without_leaking_secrets
         assert secret_value not in rendered_response
 
 
+@pytest.mark.parametrize(
+    ("provider_status", "expected_status", "expected_detail"),
+    [
+        (
+            401,
+            503,
+            {
+                "code": "composio_api_key_invalid",
+                "message": "Composio API Key 无效或已失效。",
+                "provider": "composio",
+                "settings_url": "https://dashboard.composio.dev",
+                "retryable": False,
+            },
+        ),
+        (
+            429,
+            503,
+            {
+                "code": "composio_rate_limited",
+                "message": "Composio 服务请求频率受限，请稍后重试。",
+                "provider": "composio",
+                "retryable": True,
+            },
+        ),
+        (
+            503,
+            502,
+            {
+                "code": "composio_upstream_unavailable",
+                "message": "Composio 上游服务暂时不可用。",
+                "provider": "composio",
+                "retryable": True,
+            },
+        ),
+    ],
+)
+def test_composio_connect_maps_direct_provider_failures_without_leaking_secrets(
+    monkeypatch,
+    provider_status,
+    expected_status,
+    expected_detail,
+):
+    monkeypatch.setenv("APP_PASSWORD", "secret")
+    from fastapi.testclient import TestClient
+    from app import main
+
+    api_key = f"ak_test_direct_{provider_status}_secret"
+    authorization_header = f"Bearer direct-{provider_status}-secret"
+    request_id = f"req-direct-{provider_status}-secret"
+    raw_provider_message = (
+        f"provider status {provider_status}; api_key={api_key}; "
+        f"authorization={authorization_header}; request_id={request_id}"
+    )
+
+    class FakeResponse:
+        status_code = provider_status
+        headers = {
+            "x-api-key": api_key,
+            "authorization": authorization_header,
+        }
+
+        def json(self):
+            return {
+                "error": {
+                    "message": raw_provider_message,
+                    "request_id": request_id,
+                }
+            }
+
+    class FakeProviderError(Exception):
+        status_code = provider_status
+        body = {
+            "error": {
+                "message": raw_provider_message,
+                "request_id": request_id,
+            }
+        }
+        response = FakeResponse()
+        headers = {
+            "x-api-key": api_key,
+            "authorization": authorization_header,
+        }
+
+    def fail_connect(*args, **kwargs):
+        raise FakeProviderError(raw_provider_message)
+
+    monkeypatch.setattr(main, "create_composio_connect_link", fail_connect)
+
+    response = TestClient(main.app, raise_server_exceptions=False).post(
+        "/api/integrations/composio/connect/gmail",
+        headers={"x-par-password": "secret"},
+    )
+
+    assert response.status_code == expected_status
+    assert response.json()["detail"] == expected_detail
+    rendered_response = response.text
+    for secret_value in (
+        api_key,
+        authorization_header,
+        request_id,
+        raw_provider_message,
+    ):
+        assert secret_value not in rendered_response
+
+
 def test_composio_connect_maps_permission_error_swallowed_by_live_executor(monkeypatch):
     monkeypatch.setenv("APP_PASSWORD", "secret")
     from fastapi.testclient import TestClient
@@ -3147,16 +3252,42 @@ def test_composio_connect_maps_permission_error_swallowed_by_live_executor(monke
     from app.long_tail_agent import LongTailEventStore
 
     api_key = "ak_test_live_secret"
+    authorization_header = "Bearer live-authorization-secret"
     request_id = "req-live-secret-456"
     raw_provider_message = (
         "Error code: 403 - APIKey_InsufficientPermissions; "
         f"this route requires sessions write access; api_key={api_key}; "
-        f"request_id={request_id}"
+        f"authorization={authorization_header}; request_id={request_id}"
     )
     event_store = LongTailEventStore()
 
+    class FakeResponse:
+        status_code = 403
+        headers = {"authorization": authorization_header}
+
+        def json(self):
+            return {
+                "error": {
+                    "slug": "APIKey_InsufficientPermissions",
+                    "message": raw_provider_message,
+                    "request_id": request_id,
+                }
+            }
+
     class PermissionDeniedError(Exception):
-        pass
+        status_code = 403
+        body = {
+            "error": {
+                "slug": "APIKey_InsufficientPermissions",
+                "message": raw_provider_message,
+                "request_id": request_id,
+            }
+        }
+        response = FakeResponse()
+        headers = {
+            "x-api-key": api_key,
+            "authorization": authorization_header,
+        }
 
     class FakeSession:
         def authorize(self, toolkit_slug, callback_url=None):
@@ -3190,8 +3321,24 @@ def test_composio_connect_maps_permission_error_swallowed_by_live_executor(monke
     }
     rendered_response = response.text
     assert "provider_request_id" not in rendered_response
-    for secret_value in (api_key, request_id, raw_provider_message):
+    for secret_value in (
+        api_key,
+        authorization_header,
+        request_id,
+        raw_provider_message,
+    ):
         assert secret_value not in rendered_response
+    rendered_events = json.dumps(
+        event_store.task_events("composio:readonly:gmail:connect"),
+        ensure_ascii=False,
+    )
+    for secret_value in (
+        api_key,
+        authorization_header,
+        request_id,
+        raw_provider_message,
+    ):
+        assert secret_value not in rendered_events
 
 
 def test_composio_connect_sanitizes_unrecognized_live_authorize_failure(monkeypatch):
@@ -3200,7 +3347,14 @@ def test_composio_connect_sanitizes_unrecognized_live_authorize_failure(monkeypa
     from app import main
     from app.long_tail_agent import LongTailEventStore
 
-    raw_exception_text = "authorize database invariant failed near live-secret"
+    api_key = "ak_test_generic_live_secret"
+    authorization_header = "Bearer generic-authorization-secret"
+    request_id = "req-generic-live-secret-789"
+    raw_exception_text = (
+        "authorize database invariant failed near live-secret; "
+        f"api_key={api_key}; authorization={authorization_header}; "
+        f"request_id={request_id}"
+    )
     event_store = LongTailEventStore()
 
     class FakeSession:
@@ -3230,6 +3384,18 @@ def test_composio_connect_sanitizes_unrecognized_live_authorize_failure(monkeypa
         "retryable": True,
     }
     assert raw_exception_text not in response.text
+    rendered_events = json.dumps(
+        event_store.task_events("composio:readonly:gmail:connect"),
+        ensure_ascii=False,
+    )
+    for secret_value in (
+        api_key,
+        authorization_header,
+        request_id,
+        raw_exception_text,
+        "database invariant",
+    ):
+        assert secret_value not in rendered_events
 
 
 def test_composio_connect_preserves_unknown_internal_failure_as_500(monkeypatch):
