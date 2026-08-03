@@ -7642,11 +7642,29 @@ def sync_composio_toolkits(session_kind: str = "readonly") -> dict[str, Any]:
     synced: dict[str, Any] = {}
 
     def list_toolkits(action_request: dict[str, Any]) -> dict[str, Any]:
-        result = session.toolkits()
-        items = getattr(result, "items", None)
-        if items is None and isinstance(result, dict):
-            items = result.get("items", [])
-        toolkits = [normalize_composio_toolkit(item) for item in (items or [])]
+        try:
+            result = session.toolkits()
+            items = getattr(result, "items", None)
+            if items is None and isinstance(result, dict):
+                items = result.get("items", [])
+            toolkits = [normalize_composio_toolkit(item) for item in (items or [])]
+        except Exception as exc:
+            classified = classify_composio_provider_error(exc)
+            if classified is not None:
+                return {
+                    "status": "failed",
+                    "provider_error": {
+                        "status_code": classified["status_code"],
+                        "detail": classified["detail"],
+                    },
+                    "error_code": classified["detail"]["code"],
+                    "external_side_effect": False,
+                }
+            return {
+                "status": "failed",
+                "error_code": "composio_toolkits_sync_failed",
+                "external_side_effect": False,
+            }
         synced["toolkits"] = toolkits
         return {
             "status": "toolkits_synced",
@@ -7683,13 +7701,24 @@ def sync_composio_toolkits(session_kind: str = "readonly") -> dict[str, Any]:
             },
         )
     if live_result.get("status") == "failed":
+        provider_error = live_result.get("provider_error")
+        if isinstance(provider_error, dict):
+            provider_status_code = provider_error.get("status_code")
+            provider_detail = provider_error.get("detail")
+            if isinstance(provider_status_code, int) and isinstance(provider_detail, dict):
+                raise HTTPException(
+                    status_code=provider_status_code,
+                    detail=provider_detail,
+                ) from None
         raise HTTPException(
             status_code=502,
             detail={
                 "code": "composio_toolkits_sync_failed",
-                "message": live_result.get("summary") or "Composio toolkit sync failed.",
+                "message": "Composio 暂时无法同步账号连接状态，请稍后重试。",
+                "provider": "composio",
+                "retryable": True,
             },
-        )
+        ) from None
     toolkits = list(synced.get("toolkits") or [])
     with db() as conn:
         for toolkit in toolkits:

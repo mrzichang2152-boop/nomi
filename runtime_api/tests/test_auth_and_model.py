@@ -3789,6 +3789,231 @@ def test_composio_toolkits_maps_provider_permission_error_without_leaking_secret
         assert secret_value not in rendered_response
 
 
+@pytest.mark.parametrize(
+    ("provider_status", "provider_slug", "expected_status", "expected_detail"),
+    [
+        (
+            403,
+            "APIKey_InsufficientPermissions",
+            403,
+            {
+                "code": "composio_api_key_insufficient_permissions",
+                "message": "Composio API Key 权限不足，无法创建账号授权会话。",
+                "provider": "composio",
+                "required_permissions": [
+                    {"area": "sessions", "access": "read_and_write"}
+                ],
+                "settings_url": "https://dashboard.composio.dev",
+                "retryable": False,
+            },
+        ),
+        (
+            401,
+            "AuthenticationError",
+            503,
+            {
+                "code": "composio_api_key_invalid",
+                "message": "Composio API Key 无效或已失效。",
+                "provider": "composio",
+                "settings_url": "https://dashboard.composio.dev",
+                "retryable": False,
+            },
+        ),
+        (
+            429,
+            "RateLimitError",
+            503,
+            {
+                "code": "composio_rate_limited",
+                "message": "Composio 服务请求频率受限，请稍后重试。",
+                "provider": "composio",
+                "retryable": True,
+            },
+        ),
+        (
+            503,
+            "UpstreamUnavailable",
+            502,
+            {
+                "code": "composio_upstream_unavailable",
+                "message": "Composio 上游服务暂时不可用。",
+                "provider": "composio",
+                "retryable": True,
+            },
+        ),
+    ],
+)
+def test_composio_toolkits_maps_live_provider_failures_without_persisting_secrets(
+    monkeypatch,
+    provider_status,
+    provider_slug,
+    expected_status,
+    expected_detail,
+):
+    monkeypatch.setenv("APP_PASSWORD", "secret")
+    from fastapi.testclient import TestClient
+    from app import main
+    from app.long_tail_agent import LongTailEventStore
+
+    api_key = f"ak_test_toolkits_live_{provider_status}_secret"
+    authorization_header = f"Bearer toolkits-live-{provider_status}-secret"
+    request_id = f"req-toolkits-live-{provider_status}-secret"
+    raw_provider_message = (
+        f"provider status {provider_status}; api_key={api_key}; "
+        f"authorization={authorization_header}; request_id={request_id}"
+    )
+    event_store = LongTailEventStore()
+
+    class FakeResponse:
+        status_code = provider_status
+        headers = {
+            "x-api-key": api_key,
+            "authorization": authorization_header,
+        }
+
+        def json(self):
+            return {
+                "error": {
+                    "slug": provider_slug,
+                    "message": raw_provider_message,
+                    "request_id": request_id,
+                }
+            }
+
+    class FakeProviderError(Exception):
+        status_code = provider_status
+        body = {
+            "error": {
+                "slug": provider_slug,
+                "message": raw_provider_message,
+                "request_id": request_id,
+            }
+        }
+        response = FakeResponse()
+        headers = {
+            "x-api-key": api_key,
+            "authorization": authorization_header,
+        }
+
+    class FakeMcp:
+        url = "https://mcp.composio.test/session"
+        headers = {"authorization": "Bearer redacted-session-header"}
+
+    class FakeSession:
+        session_id = "sess_readonly"
+        mcp = FakeMcp()
+
+        def toolkits(self):
+            raise FakeProviderError(raw_provider_message)
+
+    monkeypatch.setattr(
+        main,
+        "get_or_create_composio_session",
+        lambda user_id, session_kind: (
+            FakeSession(),
+            {
+                "session_kind": session_kind,
+                "toolkits": {"enable": ["gmail"]},
+                "tags": {"enable": ["readOnlyHint"]},
+                "manage_connections": False,
+            },
+        ),
+    )
+    monkeypatch.setattr(main, "long_tail_event_store", lambda: event_store)
+
+    response = TestClient(main.app, raise_server_exceptions=False).get(
+        "/api/integrations/composio/toolkits?session_kind=readonly",
+        headers={"x-par-password": "secret"},
+    )
+
+    assert response.status_code == expected_status
+    assert response.json()["detail"] == expected_detail
+    rendered_response = response.text
+    rendered_events = json.dumps(
+        event_store.task_events("composio:readonly:toolkits:sync"),
+        ensure_ascii=False,
+    )
+    live_event = next(
+        event
+        for event in event_store.task_events("composio:readonly:toolkits:sync")
+        if event["event_type"] == "executor.live_completed"
+    )
+    assert "summary" not in live_event["payload"]["live_result"]
+    for rendered_value in (rendered_response, rendered_events):
+        for secret_value in (
+            api_key,
+            authorization_header,
+            request_id,
+            raw_provider_message,
+        ):
+            assert secret_value not in rendered_value
+
+
+def test_composio_toolkits_sanitizes_unknown_live_failure(monkeypatch):
+    monkeypatch.setenv("APP_PASSWORD", "secret")
+    from fastapi.testclient import TestClient
+    from app import main
+    from app.long_tail_agent import LongTailEventStore
+
+    raw_exception_text = (
+        "toolkit database invariant failed; api_key=ak_unknown_live_secret; "
+        "authorization=Bearer-unknown-live-secret; "
+        "request_id=req-unknown-live-secret"
+    )
+    event_store = LongTailEventStore()
+
+    class FakeSession:
+        session_id = "sess_readonly"
+        mcp = {}
+
+        def toolkits(self):
+            raise RuntimeError(raw_exception_text)
+
+    monkeypatch.setattr(
+        main,
+        "get_or_create_composio_session",
+        lambda user_id, session_kind: (
+            FakeSession(),
+            {
+                "session_kind": session_kind,
+                "toolkits": {"enable": ["gmail"]},
+                "tags": {"enable": ["readOnlyHint"]},
+                "manage_connections": False,
+            },
+        ),
+    )
+    monkeypatch.setattr(main, "long_tail_event_store", lambda: event_store)
+
+    response = TestClient(main.app, raise_server_exceptions=False).get(
+        "/api/integrations/composio/toolkits?session_kind=readonly",
+        headers={"x-par-password": "secret"},
+    )
+
+    assert response.status_code == 502
+    assert response.json()["detail"] == {
+        "code": "composio_toolkits_sync_failed",
+        "message": "Composio 暂时无法同步账号连接状态，请稍后重试。",
+        "provider": "composio",
+        "retryable": True,
+    }
+    rendered_response = response.text
+    rendered_events = json.dumps(
+        event_store.task_events("composio:readonly:toolkits:sync"),
+        ensure_ascii=False,
+    )
+    live_event = next(
+        event
+        for event in event_store.task_events("composio:readonly:toolkits:sync")
+        if event["event_type"] == "executor.live_completed"
+    )
+    assert "summary" not in live_event["payload"]["live_result"]
+    for rendered_value in (rendered_response, rendered_events):
+        assert raw_exception_text not in rendered_value
+        assert "ak_unknown_live_secret" not in rendered_value
+        assert "Bearer-unknown-live-secret" not in rendered_value
+        assert "req-unknown-live-secret" not in rendered_value
+
+
 def test_composio_toolkits_preserves_unknown_internal_failure_as_500(monkeypatch):
     monkeypatch.setenv("APP_PASSWORD", "secret")
     from fastapi.testclient import TestClient
