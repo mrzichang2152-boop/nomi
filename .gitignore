@@ -26,6 +26,7 @@ dist/
 coverage/
 
 .codegraph/
+.worktrees/
 
 *.log
 tmp/
