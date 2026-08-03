@@ -3,7 +3,7 @@ from typing import Any, Dict, Mapping, Optional, Tuple
 
 
 _COMPOSIO_DASHBOARD_URL = "https://dashboard.composio.dev"
-_SAFE_REQUEST_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+_SAFE_REQUEST_ID = re.compile(r"^req[-_][A-Za-z0-9][A-Za-z0-9._:-]{0,123}$")
 
 
 def classify_composio_provider_error(error: object) -> Optional[Dict[str, Any]]:

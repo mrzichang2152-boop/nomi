@@ -147,6 +147,41 @@ def test_classifies_invalid_api_key_from_response_json_without_leaking_raw_field
     assert secret not in json.dumps(result, ensure_ascii=False)
 
 
+def test_omits_untrusted_request_id_and_never_copies_headers() -> None:
+    malicious_request_id = "ak_test_secret_must_not_escape"
+    api_key_header = "ak_header_secret"
+    authorization_header = "Bearer authorization_header_secret"
+    exception_header = "ak_exception_header_secret"
+    response = FakeResponse(
+        status_code=401,
+        body={
+            "error": {
+                "message": "invalid API key",
+                "request_id": malicious_request_id,
+            }
+        },
+    )
+    response.headers = {
+        "x-api-key": api_key_header,
+        "authorization": authorization_header,
+    }
+    error = ResponseProviderError(response=response, message="authentication failed")
+    error.headers = {"x-api-key": exception_header}
+
+    result = classify_composio_provider_error(error)
+
+    assert result is not None
+    assert "provider_request_id" not in result["detail"]
+    rendered_result = repr(result)
+    for secret in (
+        malicious_request_id,
+        api_key_header,
+        authorization_header,
+        exception_header,
+    ):
+        assert secret not in rendered_result
+
+
 def test_classifies_rate_limit_as_retryable_service_unavailable() -> None:
     secret = "ak_test_rate_limit_secret_must_not_escape"
     error = BodyProviderError(
