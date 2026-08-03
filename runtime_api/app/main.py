@@ -11472,7 +11472,13 @@ def composio_toolkit_connections(
     x_par_password: Optional[str] = Header(default=None),
 ) -> dict[str, Any]:
     require_password(x_par_password)
-    return sync_composio_toolkits(session_kind=session_kind)
+    try:
+        return sync_composio_toolkits(session_kind=session_kind)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise_if_known_composio_provider_error(exc)
+        raise
 
 
 @app.post("/api/integrations/composio/tools/execute")

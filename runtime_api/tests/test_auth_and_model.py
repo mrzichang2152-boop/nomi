@@ -3712,3 +3712,98 @@ def test_composio_toolkits_sync_returns_connected_status_and_redacts_session_hea
     assert live_result["toolkit_count"] == 1
     assert live_result["connected_count"] == 1
     assert live_result["external_side_effect"] is False
+
+
+def test_composio_toolkits_maps_provider_permission_error_without_leaking_secrets(monkeypatch):
+    monkeypatch.setenv("APP_PASSWORD", "secret")
+    from fastapi.testclient import TestClient
+    from app import main
+
+    api_key = "ak_test_toolkits_route_secret"
+    authorization_header = "Bearer toolkits-route-header-secret"
+    request_id = "req-toolkits-route-secret-123"
+    raw_provider_message = (
+        "This route requires sessions write access for " + api_key
+    )
+
+    class FakeResponse:
+        status_code = 403
+        headers = {
+            "x-api-key": api_key,
+            "authorization": authorization_header,
+        }
+
+        def json(self):
+            return {
+                "error": {
+                    "slug": "APIKey_InsufficientPermissions",
+                    "message": raw_provider_message,
+                    "request_id": request_id,
+                }
+            }
+
+    class FakePermissionDeniedError(Exception):
+        status_code = 403
+        body = {
+            "error": {
+                "slug": "APIKey_InsufficientPermissions",
+                "message": raw_provider_message,
+                "request_id": request_id,
+            }
+        }
+        response = FakeResponse()
+        headers = {
+            "x-api-key": api_key,
+            "authorization": authorization_header,
+        }
+
+    def fail_sync(*args, **kwargs):
+        raise FakePermissionDeniedError(raw_provider_message)
+
+    monkeypatch.setattr(main, "sync_composio_toolkits", fail_sync)
+
+    response = TestClient(main.app, raise_server_exceptions=False).get(
+        "/api/integrations/composio/toolkits?session_kind=readonly",
+        headers={"x-par-password": "secret"},
+    )
+
+    assert response.status_code == 403
+    assert response.json()["detail"] == {
+        "code": "composio_api_key_insufficient_permissions",
+        "message": "Composio API Key 权限不足，无法创建账号授权会话。",
+        "provider": "composio",
+        "required_permissions": [
+            {"area": "sessions", "access": "read_and_write"}
+        ],
+        "settings_url": "https://dashboard.composio.dev",
+        "retryable": False,
+    }
+    rendered_response = response.text
+    assert "provider_request_id" not in rendered_response
+    for secret_value in (
+        api_key,
+        authorization_header,
+        request_id,
+        raw_provider_message,
+    ):
+        assert secret_value not in rendered_response
+
+
+def test_composio_toolkits_preserves_unknown_internal_failure_as_500(monkeypatch):
+    monkeypatch.setenv("APP_PASSWORD", "secret")
+    from fastapi.testclient import TestClient
+    from app import main
+
+    def fail_sync(*args, **kwargs):
+        raise RuntimeError("database invariant failed")
+
+    monkeypatch.setattr(main, "sync_composio_toolkits", fail_sync)
+
+    response = TestClient(main.app, raise_server_exceptions=False).get(
+        "/api/integrations/composio/toolkits?session_kind=readonly",
+        headers={"x-par-password": "secret"},
+    )
+
+    assert response.status_code == 500
+    assert "composio_api_key_insufficient_permissions" not in response.text
+    assert "required_permissions" not in response.text
