@@ -4254,11 +4254,11 @@ function renderComposioPanel(status, connections) {
     guidanceRegion.focus();
   }
 
-  function showManualConnectLink(safeUrl) {
+  function showAuthorizationLink(safeUrl) {
     const title = document.createElement("strong");
-    title.textContent = "授权窗口未打开";
+    title.textContent = "授权链接已生成";
     const message = document.createElement("p");
-    message.textContent = "浏览器阻止了弹窗，请使用下方链接继续授权。";
+    message.textContent = "如果授权页没有自动打开，请点击下方按钮继续。";
     const actions = document.createElement("div");
     actions.className = "composio-guidance-actions";
     const manualLink = document.createElement("a");
@@ -4269,9 +4269,9 @@ function renderComposioPanel(status, connections) {
     manualLink.textContent = "打开授权";
     actions.appendChild(manualLink);
     guidanceRegion.replaceChildren(title, message, actions);
-    guidanceRegion.classList.remove("success");
+    guidanceRegion.classList.add("success");
     guidanceRegion.classList.remove("hidden");
-    guidanceRegion.focus();
+    manualLink.focus();
   }
 
   function showAlreadyConnectedGuidance() {
@@ -4291,10 +4291,10 @@ function renderComposioPanel(status, connections) {
       typeof window.NomiAndroid.openExternalUrl === "function"
     ) {
       window.NomiAndroid.openExternalUrl(safeUrl);
-      return;
+    } else {
+      window.open(safeUrl, "_blank", "noopener,noreferrer");
     }
-    const opened = window.open(safeUrl, "_blank", "noopener,noreferrer");
-    if (opened === null) showManualConnectLink(safeUrl);
+    showAuthorizationLink(safeUrl);
   }
 
   function setConnectButtonsDisabled(disabled) {

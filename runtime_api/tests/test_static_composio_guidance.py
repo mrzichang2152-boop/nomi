@@ -108,7 +108,7 @@ def test_composio_connection_attempts_are_serialized_across_all_toolkits():
     assert "生成失败" not in panel
 
 
-def test_composio_connect_urls_use_android_bridge_or_popup_with_manual_fallback():
+def test_composio_connect_urls_always_offer_a_neutral_safe_authorization_link():
     app = read("app.js")
     panel = function_source(app, "renderComposioPanel", "renderToolCard")
 
@@ -116,13 +116,21 @@ def test_composio_connect_urls_use_android_bridge_or_popup_with_manual_fallback(
     assert 'throw new Error("授权服务返回了无效链接，请重试。");' in panel
     assert 'typeof window.NomiAndroid.openExternalUrl === "function"' in panel
     assert "window.NomiAndroid.openExternalUrl(safeUrl);" in panel
-    assert 'const opened = window.open(safeUrl, "_blank", "noopener,noreferrer");' in panel
-    assert "if (opened === null)" in panel
+    assert 'window.open(safeUrl, "_blank", "noopener,noreferrer");' in panel
+    assert "function showAuthorizationLink(safeUrl)" in panel
+    assert "showAuthorizationLink(safeUrl);" in panel
+    assert "opened === null" not in panel
+    assert "= window.open(safeUrl" not in panel
+    assert "浏览器阻止了弹窗" not in panel
+    assert 'title.textContent = "授权链接已生成";' in panel
+    assert 'message.textContent = "如果授权页没有自动打开，请点击下方按钮继续。";' in panel
     assert 'document.createElement("a")' in panel
     assert "manualLink.href = safeUrl;" in panel
     assert 'manualLink.target = "_blank";' in panel
     assert 'manualLink.rel = "noopener noreferrer";' in panel
     assert 'manualLink.textContent = "打开授权";' in panel
+    assert 'guidanceRegion.classList.add("success");' in panel
+    assert "manualLink.focus();" in panel
     assert "window.open(result.redirect_url" not in panel
     assert 'window.open("about:blank"' not in panel
 
