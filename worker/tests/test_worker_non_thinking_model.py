@@ -31,14 +31,17 @@ def test_worker_model_payload_uses_reasoning_effort_none(monkeypatch):
             }
 
     def fake_post(url, json, timeout):
+        captured["url"] = url
         captured.update(json)
         return FakeResponse()
 
     monkeypatch.setattr(worker.httpx, "post", fake_post)
     monkeypatch.setenv("MODEL_ROUTER_URL", "")
+    monkeypatch.setattr(worker, "MODEL_BASE_URL", "http://qwen.local/v1")
 
     content = worker.call_model([{"role": "user", "content": "test"}])
 
     assert "普通聊天" in content
+    assert captured["url"] == "http://qwen.local/v1/chat/completions"
     assert captured["reasoning_effort"] == "none"
     assert captured["enable_thinking"] is False

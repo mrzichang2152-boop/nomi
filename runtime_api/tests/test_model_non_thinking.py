@@ -96,10 +96,12 @@ def test_openclaw_context_model_uses_qwen_non_thinking_options(monkeypatch):
             return {"choices": [{"message": {"content": '{"include_keys":[],"exclude_keys":[]}'}}]}
 
     def fake_post(url, json, timeout):
+        captured["url"] = url
         captured.update(json)
         return FakeResponse()
 
     monkeypatch.setattr(main.httpx, "post", fake_post)
+    monkeypatch.setattr(main, "MODEL_BASE_URL", "http://qwen.local/v1")
 
     result = main.model_context_necessity_delta(
         "帮我处理",
@@ -109,6 +111,7 @@ def test_openclaw_context_model_uses_qwen_non_thinking_options(monkeypatch):
     )
 
     assert result == {"include_keys": [], "exclude_keys": []}
+    assert captured["url"] == "http://qwen.local/v1/chat/completions"
     assert captured["reasoning_effort"] == "none"
     assert captured["enable_thinking"] is False
     assert captured["chat_template_kwargs"] == {"enable_thinking": False}
@@ -127,10 +130,12 @@ def test_pipeline_slot_model_uses_qwen_non_thinking_options(monkeypatch):
             return {"choices": [{"message": {"content": '{"slots":{},"confidence":0.5,"reason":"ok"}'}}]}
 
     def fake_post(url, json, timeout):
+        captured["url"] = url
         captured.update(json)
         return FakeResponse()
 
     monkeypatch.setattr(main.httpx, "post", fake_post)
+    monkeypatch.setattr(main, "MODEL_BASE_URL", "http://qwen.local/v1")
 
     result = main.call_pipeline_slot_model(
         "帮我订车",
@@ -140,6 +145,7 @@ def test_pipeline_slot_model_uses_qwen_non_thinking_options(monkeypatch):
     )
 
     assert result["reason"] == "ok"
+    assert captured["url"] == "http://qwen.local/v1/chat/completions"
     assert captured["reasoning_effort"] == "none"
     assert captured["enable_thinking"] is False
     assert captured["chat_template_kwargs"] == {"enable_thinking": False}

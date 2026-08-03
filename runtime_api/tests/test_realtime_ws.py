@@ -194,7 +194,12 @@ def test_http_and_websocket_forward_same_ordered_attachments(monkeypatch):
 
     first = uuid4()
     second = uuid4()
+    conversation_id = uuid4()
+    user_turn_id = uuid4()
+    user_event_id = uuid4()
     captured = []
+    retrieved = []
+    packed_attachment_context = []
 
     class Submission:
         def submit_user_turn(self, **kwargs):
@@ -208,9 +213,9 @@ def test_http_and_websocket_forward_same_ordered_attachments(monkeypatch):
                 }
             )
             return {
-                "conversation_id": kwargs["conversation_id"] or "conversation-parity",
-                "turn_id": f"turn-{len(captured)}",
-                "event_id": f"event-{len(captured)}",
+                "conversation_id": kwargs["conversation_id"] or str(conversation_id),
+                "turn_id": str(user_turn_id),
+                "event_id": str(user_event_id),
                 "content": kwargs["message"],
                 "attachment_ids": [str(value) for value in kwargs["attachment_ids"]],
                 "duplicate": False,
@@ -231,7 +236,7 @@ def test_http_and_websocket_forward_same_ordered_attachments(monkeypatch):
         "find_cached_assistant_response",
         lambda conn, request_id: {
             "answer": "cached",
-            "conversation_id": "conversation-parity",
+            "conversation_id": str(conversation_id),
         },
     )
 
@@ -241,7 +246,7 @@ def test_http_and_websocket_forward_same_ordered_attachments(monkeypatch):
         json={
             "message": "比较附件",
             "attachment_ids": [str(second), str(first)],
-            "conversation_id": "conversation-parity",
+            "conversation_id": str(conversation_id),
             "client_type": "android",
             "client_request_id": "parity-1",
         },
@@ -252,7 +257,7 @@ def test_http_and_websocket_forward_same_ordered_attachments(monkeypatch):
         main,
         "persist_assistant_turn",
         lambda *args, **kwargs: {
-            "conversation_id": kwargs.get("conversation_id") or "conversation-parity",
+            "conversation_id": kwargs.get("conversation_id") or str(conversation_id),
             "turn_id": "assistant-turn",
             "event_id": "assistant-event",
         },
@@ -262,18 +267,45 @@ def test_http_and_websocket_forward_same_ordered_attachments(monkeypatch):
     monkeypatch.setattr(main, "retrieve_assistant_dialogue_context", lambda message, conversation_id=None, limit=64: [])
     monkeypatch.setattr(main, "retrieve_active_agenda_context", lambda message, conversation_id=None, limit=6: [])
     monkeypatch.setattr(main, "retrieve_active_task_context", lambda message, conversation_id=None, limit=8: [])
-    monkeypatch.setattr(
-        main,
-        "build_context_pack",
-        lambda *args, **kwargs: {
+
+    def fake_retrieve_attachment_context(message, **kwargs):
+        retrieved.append({"message": message, **kwargs})
+        return [
+            {
+                "layer": "attachment_evidence",
+                "source": "attachment",
+                "source_id": "attachment-evidence-1",
+                "attachment_id": str(second),
+                "filename": "brief.txt",
+                "content": "Project codename MossQuartz.",
+            }
+        ]
+
+    def fake_build_context_pack(*args, **kwargs):
+        packed_attachment_context.extend(kwargs.get("attachment_context") or [])
+        return {
             "included_event_ids": [],
+            "included_memory_ids": [],
+            "included_agenda_ids": [],
+            "included_web_source_ids": [],
             "assistant_dialogue": [],
             "agenda_context": [],
             "memory_context": [],
             "source_context": [],
+            "web_context": [],
+            "attachment_context": list(kwargs.get("attachment_context") or []),
             "task_context": [],
+            "sections": [],
+            "excluded": [],
+            "warnings": [],
             "reason": "attachment parity",
-        },
+        }
+
+    monkeypatch.setattr(main, "retrieve_attachment_context_for_chat", fake_retrieve_attachment_context)
+    monkeypatch.setattr(
+        main,
+        "build_context_pack",
+        fake_build_context_pack,
     )
     monkeypatch.setattr(main, "build_chat_messages", lambda message, context_pack: [{"role": "user", "content": message}])
     monkeypatch.setattr(main, "persist_context_snapshot", lambda *args, **kwargs: None, raising=False)
@@ -300,7 +332,7 @@ def test_http_and_websocket_forward_same_ordered_attachments(monkeypatch):
             websocket,
             "比较附件",
             12,
-            conversation_id="conversation-parity",
+            conversation_id=str(conversation_id),
             client_type="android",
             client_request_id="parity-1",
             attachment_ids=[second, first],
@@ -311,18 +343,25 @@ def test_http_and_websocket_forward_same_ordered_attachments(monkeypatch):
         {
             "message": "比较附件",
             "attachment_ids": [second, first],
-            "conversation_id": "conversation-parity",
+            "conversation_id": str(conversation_id),
             "client_type": "android",
             "client_request_id": "parity-1",
         },
         {
             "message": "比较附件",
             "attachment_ids": [second, first],
-            "conversation_id": "conversation-parity",
+            "conversation_id": str(conversation_id),
             "client_type": "android",
             "client_request_id": "parity-1",
         },
     ]
+    assert len(retrieved) == 1
+    assert retrieved[0]["message"] == "比较附件"
+    assert retrieved[0]["current_attachment_ids"] == [second, first]
+    assert retrieved[0]["conversation_id"] == conversation_id
+    assert retrieved[0]["current_turn_id"] == user_turn_id
+    assert retrieved[0]["route_requires_file_evidence"] is True
+    assert packed_attachment_context[0]["content"] == "Project codename MossQuartz."
     assert websocket.events[-1]["type"] == "chat_done"
 
 

@@ -336,12 +336,12 @@ def default_enable_thinking_for_model(model: str, env_name: str) -> bool | None:
 
 
 def default_model_providers() -> list[QwenHTTPProvider]:
-    primary_model = os.getenv("MODEL_NAME", "gpt-5.4-mini")
+    primary_model = os.getenv("MODEL_NAME", "qwen3.6-27b")
     primary = QwenHTTPProvider(
         ModelProviderConfig(
-            provider_id=os.getenv("MODEL_PROVIDER_ID", "4sapi_primary"),
-            display_name=os.getenv("MODEL_PROVIDER_NAME", "4sapi GPT-5.4 mini"),
-            base_url=os.getenv("MODEL_BASE_URL", "https://4sapi.com/v1").rstrip("/"),
+            provider_id=os.getenv("MODEL_PROVIDER_ID", "qwen36_27b_primary"),
+            display_name=os.getenv("MODEL_PROVIDER_NAME", "Qwen3.6 27B"),
+            base_url=os.getenv("MODEL_BASE_URL", "http://81.70.177.246:9151/v1").rstrip("/"),
             model=primary_model,
             provider_type=os.getenv("MODEL_PROVIDER_TYPE", "openai_compatible"),
             api_key=os.getenv("MODEL_API_KEY", "").strip(),
@@ -359,7 +359,7 @@ def default_model_providers() -> list[QwenHTTPProvider]:
     providers = [primary]
     fallback_url = os.getenv("MODEL_FALLBACK_BASE_URL", "").strip()
     if fallback_url:
-        fallback_model = os.getenv("MODEL_FALLBACK_NAME", os.getenv("MODEL_NAME", "gpt-5.4-mini"))
+        fallback_model = os.getenv("MODEL_FALLBACK_NAME", os.getenv("MODEL_NAME", "qwen3.6-27b"))
         providers.append(
             QwenHTTPProvider(
                 ModelProviderConfig(

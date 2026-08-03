@@ -70,6 +70,31 @@ def test_dialogue_memory_policy_immediately_enqueues_strong_signal():
     assert decision["reason"] == "explicit_memory"
 
 
+def test_dialogue_memory_policy_recognizes_natural_english_remember_request():
+    from app import main
+
+    decision = main.dialogue_memory_policy_for_turn(
+        "user",
+        "Read this attachment and remember its project codename and review date.",
+        explicit_policy="auto",
+    )
+
+    assert decision["policy"] == "immediate"
+    assert decision["reason"] == "explicit_memory"
+
+
+def test_attachment_answer_is_immediately_enqueued_for_explicit_memory_request():
+    from app import main
+
+    policy = main.attachment_answer_memory_enqueue_policy(
+        "Read this attachment and remember its project codename and review date.",
+        [{"layer": "attachment_evidence", "content": "MossQuartz, 2026-08-20"}],
+    )
+
+    assert policy == "immediate"
+    assert main.attachment_answer_memory_enqueue_policy("Summarize this attachment.", []) == "auto"
+
+
 def test_persist_assistant_turn_defers_ordinary_dialogue_without_redis_enqueue(monkeypatch):
     from app import main
 

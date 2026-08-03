@@ -101,6 +101,7 @@ fluxbox >/tmp/fluxbox.log 2>&1 &
   --window-position=0,0 \
   https://www.google.com \
   >/tmp/chromium.log 2>&1 &
+CHROMIUM_PID="$!"
 
 (
   for _ in $(seq 1 80); do
@@ -141,4 +142,8 @@ cleanup() {
 }
 trap cleanup EXIT
 
-python -m app.runtime
+python -m app.runtime &
+RUNTIME_PID="$!"
+
+wait -n "$CHROMIUM_PID" "$RUNTIME_PID"
+exit 1

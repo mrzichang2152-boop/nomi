@@ -350,6 +350,26 @@ def test_agenda_time_parser_handles_dianban_as_half_past():
     assert time_window["display"] == "2026-07-02 周四 15:30"
 
 
+def test_agenda_time_parser_does_not_treat_iso_date_tail_before_colon_as_hour():
+    from app.worker import extract_time_of_day, resolved_agenda_time_window
+
+    text = (
+        "NOMI_REAL_GMAIL_20260727_A CedarHarbor deadline 2026-08-14："
+        "Real regression marker. Deadline 2026-08-14."
+    )
+
+    assert extract_time_of_day(text) is None
+
+    time_window = resolved_agenda_time_window(
+        text,
+        "2026-07-27T14:01:15+00:00",
+    )
+
+    assert time_window["date"] == "2026-08-14"
+    assert "start" not in time_window
+    assert time_window["display"] == "2026-08-14 周五"
+
+
 def test_whatsapp_snapshot_is_low_value_and_not_an_agenda_candidate():
     from app import worker
 
@@ -3464,6 +3484,14 @@ def test_mask_value_redacts_codes_payment_orders_tokens_and_addresses_but_keeps_
     assert "支付宝付款" in rendered
     assert "订单号" in rendered
     assert "收货地址" in rendered
+
+
+def test_mask_value_does_not_treat_codename_as_a_verification_code():
+    from app.worker import mask_value
+
+    message = "NOMI_REAL_WA_20260727_B project codename CedarFalcon deadline 2026-08-11"
+
+    assert mask_value(message) == message
 
 
 def test_mask_value_redacts_identity_financial_and_oauth_fragment_values():

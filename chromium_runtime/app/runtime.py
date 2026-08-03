@@ -33,8 +33,11 @@ COLLECTORS = ["search", "whatsapp", "gmail", "calendar", "telegram", "linkedin",
 MANAGED_PAGE_CATALOG = {
     "gmail": {
         "host_fragment": "mail.google.com",
-        "url": "https://mail.google.com/mail/u/0/#inbox",
-        "alternate_url_fragments": ["workspace.google.com/intl/en-US/gmail"],
+        "url": (
+            "https://accounts.google.com/ServiceLogin?service=mail"
+            "&continue=https%3A%2F%2Fmail.google.com%2Fmail%2Fu%2F0%2F%23inbox"
+        ),
+        "alternate_url_fragments": ["accounts.google.com"],
     },
     "whatsapp": {
         "host_fragment": "web.whatsapp.com",
@@ -148,8 +151,35 @@ GMAIL_UI_LINES = {
     "在新窗口中打开",
     "显示详细信息",
 }
+GMAIL_THREAD_SUBJECT_CHROME_RE = re.compile(
+    r"^(?:"
+    r"第\s*\d+\s*个会话，共\s*\d+\s*个|"
+    r"全部打印|"
+    r"在新窗口中查看|"
+    r"搜索所有带.+标签的邮件|"
+    r"从此会话中移除.+标签"
+    r")$"
+)
+GMAIL_THREAD_LEADING_BODY_UI_LINES = {
+    "添加回应",
+    "更多",
+    "回复",
+    "转发",
+    "添加表情符号回应",
+}
+GMAIL_THREAD_BODY_TERMINATORS = {
+    "回复",
+    "转发",
+    "添加表情符号回应",
+}
 GMAIL_SECRET_LINK_RE = re.compile(r"https?://\S*(?:token|code|auth|verify|reset|password|login)\S*", re.I)
-GMAIL_VERIFICATION_RE = re.compile(r"((?:验证码|校验码|verification code|code)[^\dA-Za-z]{0,8})([A-Za-z0-9-]{4,12})", re.I)
+GMAIL_VERIFICATION_RE = re.compile(
+    r"("
+    r"(?:(?:验证码|校验码)[^\dA-Za-z]{0,8}|"
+    r"(?:verification\s+code|login\s+code|security\s+code|code)\b[^\dA-Za-z]{1,8})"
+    r")([A-Za-z0-9-]{4,12})",
+    re.I,
+)
 GMAIL_ORDER_RE = re.compile(r"((?:订单号|订单|order(?: id)?)[^\dA-Za-z]{0,8})([A-Za-z0-9-]{5,24})", re.I)
 GMAIL_AMOUNT_RE = re.compile(r"(?<![\dA-Za-z_])(?:¥|￥|RMB\s*)?\d{1,7}(?:\.\d{2})?\s*(?:元|CNY|USD|美元)?(?![\dA-Za-z_])", re.I)
 CALENDAR_UI_LINES = {
@@ -1512,8 +1542,28 @@ async def collect_whatsapp(client: httpx.AsyncClient, page) -> None:
             build_degraded_details("whatsapp", "too_little_visible_text", lines, url=page.url, title=title, min_lines=8),
         )
         return
-    chat_context = extract_whatsapp_chat_context(lines)
-    for message in normalize_whatsapp_observer_records(observer_records, chat_context=chat_context):
+    chat_list_lines = await whatsapp_region_lines(page, "#pane-side")
+    open_chat_lines = await whatsapp_region_lines(page, "#main")
+    chat_context = await extract_whatsapp_chat_context_from_page(page, lines)
+    visible_messages = normalize_whatsapp_visible_message_records(
+        await read_whatsapp_visible_message_records(page),
+        chat_context=chat_context,
+    )
+    visible_message_texts = {
+        str(message.get("message") or "").strip()
+        for message in visible_messages
+        if str(message.get("message") or "").strip()
+    }
+    observer_messages = [
+        message
+        for message in normalize_whatsapp_observer_records(observer_records, chat_context=chat_context)
+        if str(message.get("message") or "").strip() not in visible_message_texts
+    ]
+    emitted_message_texts = set(visible_message_texts)
+    for message in [*observer_messages, *visible_messages]:
+        message_text = str(message.get("message") or "").strip()
+        if message_text:
+            emitted_message_texts.add(message_text)
         await emit_event(
             client,
             "whatsapp",
@@ -1525,14 +1575,18 @@ async def collect_whatsapp(client: httpx.AsyncClient, page) -> None:
             },
         )
     chat_name = chat_context.get("chat_name")
-    if chat_name and is_probable_whatsapp_open_chat_transcript(lines):
-        for message in split_whatsapp_open_chat_transcript(
-            lines,
+    if chat_name and open_chat_lines and not visible_messages:
+        transcript_messages = split_whatsapp_open_chat_transcript(
+            open_chat_lines,
             captured_at=datetime.now(timezone.utc).isoformat(),
             chat_context=chat_context,
             capture_scope="history_scroll_sync",
             limit=120,
-        ):
+        )
+        for message in transcript_messages:
+            message_text = str(message.get("message") or "").strip()
+            if message_text:
+                emitted_message_texts.add(message_text)
             await emit_event(
                 client,
                 "whatsapp",
@@ -1547,6 +1601,11 @@ async def collect_whatsapp(client: httpx.AsyncClient, page) -> None:
         await inject_whatsapp_history_sync(page)
         history_records = normalize_whatsapp_history_records(await drain_whatsapp_history_records(page), chat_context=chat_context)
         for message in history_records:
+            message_text = str(message.get("message") or "").strip()
+            if message_text in emitted_message_texts:
+                continue
+            if message_text:
+                emitted_message_texts.add(message_text)
             await emit_event(
                 client,
                 "whatsapp",
@@ -1558,9 +1617,17 @@ async def collect_whatsapp(client: httpx.AsyncClient, page) -> None:
                 },
             )
 
-    await emit_whatsapp_list_previews(client, lines, page.url, title, chat_context=chat_context)
+    await emit_whatsapp_list_previews(
+        client,
+        chat_list_lines,
+        page.url,
+        title,
+        chat_context=chat_context,
+        excluded_messages=emitted_message_texts,
+        structured_records=await read_whatsapp_list_preview_records(page),
+    )
 
-    if WHATSAPP_HISTORY_SYNC and not chat_name and not is_probable_whatsapp_open_chat_transcript(lines):
+    if WHATSAPP_HISTORY_SYNC and not chat_name and chat_list_lines:
         auto_opened = await open_latest_whatsapp_chat_for_history(page)
         if auto_opened:
             await report_health(
@@ -1577,6 +1644,7 @@ async def collect_whatsapp(client: httpx.AsyncClient, page) -> None:
             )
             return
 
+    committed_open_chat_lines = whatsapp_committed_open_chat_lines(open_chat_lines)
     if chat_name:
         await emit_event(
             client,
@@ -1586,13 +1654,14 @@ async def collect_whatsapp(client: httpx.AsyncClient, page) -> None:
                 "chat_name": chat_name,
                 "source_kind": chat_context.get("source_kind"),
                 "participants": chat_context.get("participants", []),
-                "visible_text": body_text[:6000],
-                "line_count": len(lines),
+                "visible_text": "\n".join(committed_open_chat_lines)[:6000],
+                "line_count": len(committed_open_chat_lines),
                 "url": page.url,
                 "title": title,
             },
         )
 
+    snapshot_lines = committed_open_chat_lines if chat_name else chat_list_lines
     await emit_event(
         client,
         "whatsapp",
@@ -1601,8 +1670,8 @@ async def collect_whatsapp(client: httpx.AsyncClient, page) -> None:
             "chat_name": chat_name,
             "source_kind": chat_context.get("source_kind"),
             "participants": chat_context.get("participants", []),
-            "visible_text": body_text[:4000],
-            "line_count": len(lines),
+            "visible_text": "\n".join(snapshot_lines)[:4000],
+            "line_count": len(snapshot_lines),
             "url": page.url,
             "title": title,
         },
@@ -1796,25 +1865,109 @@ def extract_whatsapp_chat_context(lines: list[str]) -> dict[str, object]:
     }
 
 
+async def whatsapp_region_lines(page, selector: str) -> list[str]:
+    try:
+        text = await page.locator(selector).inner_text(timeout=2500)
+    except Exception:
+        return []
+    return [line.strip() for line in str(text or "").splitlines() if line.strip()]
+
+
+async def extract_whatsapp_chat_context_from_page(page, body_lines: list[str]) -> dict[str, object]:
+    context = extract_whatsapp_chat_context(body_lines)
+    title_lines = await whatsapp_region_lines(
+        page,
+        '#main header [data-testid="conversation-info-header-chat-title"]',
+    )
+    if title_lines:
+        participants = context.get("participants", [])
+        return {
+            "chat_name": title_lines[0][:80],
+            "source_kind": "group" if isinstance(participants, list) and len(participants) >= 2 else "direct",
+            "participants": participants if isinstance(participants, list) else [],
+        }
+    if context.get("chat_name"):
+        return context
+    header_lines = await whatsapp_region_lines(page, "#main header")
+    ignored_prefixes = (
+        "last seen",
+        "online",
+        "typing",
+        "click here for contact info",
+        "点击此处查看联系人信息",
+    )
+    for candidate in header_lines:
+        normalized = candidate.casefold()
+        if (
+            not candidate
+            or len(candidate) > 80
+            or candidate.isdigit()
+            or is_whatsapp_ui_noise_line(candidate)
+            or is_whatsapp_timestamp_label(candidate)
+            or normalized.startswith(ignored_prefixes)
+        ):
+            continue
+        return {
+            "chat_name": candidate,
+            "source_kind": "direct",
+            "participants": [],
+        }
+    return context
+
+
+def whatsapp_committed_open_chat_lines(lines: list[str]) -> list[str]:
+    last_timestamp_index = -1
+    for index, line in enumerate(lines):
+        if is_whatsapp_message_time_label(line):
+            last_timestamp_index = index
+    if last_timestamp_index < 0:
+        return []
+    return lines[: last_timestamp_index + 1]
+
+
 async def emit_whatsapp_list_previews(
     client: httpx.AsyncClient,
     lines: list[str],
     url: str,
     title: str,
     chat_context: Optional[dict[str, object]] = None,
+    excluded_messages: Optional[set[str]] = None,
+    structured_records: Optional[list[dict[str, str]]] = None,
 ) -> None:
     if is_probable_whatsapp_open_chat_transcript(lines):
         return
     excluded = WHATSAPP_UI_LINES
+    excluded_messages = excluded_messages or set()
     chat_context = chat_context or {}
+    active_chat_name = str(chat_context.get("chat_name") or "").strip()
+    if structured_records:
+        for preview in normalize_whatsapp_list_preview_records(structured_records):
+            message = str(preview.get("message") or "").strip()
+            if preview.get("chat_name") == active_chat_name or message in excluded_messages:
+                continue
+            await emit_event(
+                client,
+                "whatsapp",
+                "whatsapp_message",
+                {
+                    **preview,
+                    "url": url,
+                    "title": title,
+                },
+            )
+        return
     for index, line in enumerate(lines):
         if line in excluded or len(line) > 40:
+            continue
+        if active_chat_name and line == active_chat_name:
             continue
         if index + 2 >= len(lines):
             continue
         timestamp_label = lines[index + 1]
         message = lines[index + 2]
         if timestamp_label in excluded or message in excluded:
+            continue
+        if message.strip() in excluded_messages:
             continue
         if not is_whatsapp_timestamp_label(timestamp_label):
             continue
@@ -1826,8 +1979,8 @@ async def emit_whatsapp_list_previews(
             "whatsapp_message",
             {
                 "sender": line,
-                "chat_name": chat_context.get("chat_name"),
-                "source_kind": chat_context.get("source_kind", "unknown"),
+                "chat_name": line,
+                "source_kind": "direct",
                 "message_direction": "unknown",
                 "message": message,
                 "timestamp_label": timestamp_label,
@@ -1980,6 +2133,197 @@ def build_whatsapp_observer_script() -> str:
       return true;
     })();
     """
+
+
+def build_whatsapp_visible_message_script(max_records: int = 120) -> str:
+    script = r"""
+    (() => {
+      const containers = Array.from(
+        document.querySelectorAll('#main [data-testid="msg-container"]')
+      ).slice(-__MAX_RECORDS__);
+      return containers.map((container) => {
+        const copyable = container.querySelector('[data-pre-plain-text]');
+        const fallbackTextNodes = Array.from(
+          container.querySelectorAll('[data-testid="selectable-text"]')
+        ).filter((node) => !node.parentElement?.closest('[data-testid="selectable-text"]'));
+        const message = copyable
+          ? (copyable.innerText || '').trim()
+          : fallbackTextNodes
+              .map((node) => (node.innerText || '').trim())
+              .filter(Boolean)
+              .join('\n')
+              .trim();
+        const prePlainText = copyable
+          ? (copyable.getAttribute('data-pre-plain-text') || '')
+          : '';
+        const metaText = (
+          (container.querySelector('[data-testid="msg-meta"]') || {}).innerText || ''
+        ).trim();
+        const preTime = prePlainText.match(/^\[(\d{1,2}:\d{2})/);
+        const metaTime = metaText.match(/\b(\d{1,2}:\d{2})\b/);
+        const afterBracket = prePlainText.includes(']')
+          ? prePlainText.slice(prePlainText.indexOf(']') + 1).trim()
+          : '';
+        const senderDelimiter = afterBracket.lastIndexOf(':');
+        const sender = senderDelimiter >= 0
+          ? afterBracket.slice(0, senderDelimiter).trim()
+          : '';
+        const ariaLabels = Array.from(container.querySelectorAll('[aria-label]'))
+          .map((node) => (node.getAttribute('aria-label') || '').trim());
+        const hasOutgoingLabel = ariaLabels.some(
+          (label) => /^(?:你|You)\s*[：:]?$/.test(label)
+        );
+        const messageDirection = container.querySelector('[data-testid="tail-out"]') || hasOutgoingLabel
+          ? 'outgoing'
+          : container.querySelector('[data-testid="tail-in"]')
+            ? 'incoming'
+            : 'unknown';
+        return {
+          message,
+          sender,
+          timestamp_label: preTime ? preTime[1] : (metaTime ? metaTime[1] : ''),
+          message_direction: messageDirection
+        };
+      }).filter((record) => record.message && record.timestamp_label);
+    })();
+    """
+    return script.replace("__MAX_RECORDS__", str(max(1, int(max_records))))
+
+
+def build_whatsapp_list_preview_script(max_records: int = 100) -> str:
+    script = r"""
+    (() => {
+      return Array.from(document.querySelectorAll('#pane-side [role="row"]'))
+        .slice(0, __MAX_RECORDS__)
+        .map((row) => {
+          const chatName = (
+            (row.querySelector('[data-testid="cell-frame-title"]') || {}).innerText || ''
+          ).trim();
+          const timestampLabel = (
+            (row.querySelector('[data-testid="cell-frame-primary-detail"]') || {}).innerText || ''
+          ).trim();
+          const secondary = row.querySelector('[data-testid="cell-frame-secondary"]');
+          const outgoingStatus = row.querySelector('[data-testid="last-msg-status"]');
+          const message = (
+            (outgoingStatus || secondary || {}).innerText || ''
+          ).trim();
+          return {
+            chat_name: chatName,
+            timestamp_label: timestampLabel,
+            message,
+            message_direction: outgoingStatus ? 'outgoing' : 'incoming'
+          };
+        })
+        .filter((record) => record.chat_name && record.timestamp_label && record.message);
+    })();
+    """
+    return script.replace("__MAX_RECORDS__", str(max(1, int(max_records))))
+
+
+async def read_whatsapp_visible_message_records(page, max_records: int = 120) -> list[dict[str, str]]:
+    try:
+        records = await page.evaluate(build_whatsapp_visible_message_script(max_records=max_records))
+    except Exception:
+        return []
+    return records if isinstance(records, list) else []
+
+
+async def read_whatsapp_list_preview_records(page, max_records: int = 100) -> list[dict[str, str]]:
+    try:
+        records = await page.evaluate(build_whatsapp_list_preview_script(max_records=max_records))
+    except Exception:
+        return []
+    return records if isinstance(records, list) else []
+
+
+def normalize_whatsapp_visible_message_records(
+    records: list[dict[str, str]],
+    *,
+    chat_context: Optional[dict[str, object]] = None,
+    limit: int = 120,
+) -> list[dict[str, object]]:
+    chat_context = chat_context or {}
+    messages: list[dict[str, object]] = []
+    seen: set[tuple[str, str, str, str]] = set()
+    for record in records:
+        message = str(record.get("message") or "").strip()
+        timestamp_label = str(record.get("timestamp_label") or "").strip()
+        direction = str(record.get("message_direction") or "unknown").strip().lower()
+        if direction not in {"incoming", "outgoing"}:
+            direction = "unknown"
+        sender = str(record.get("sender") or "").strip()
+        if not sender:
+            sender = "self" if direction == "outgoing" else str(chat_context.get("chat_name") or "unknown").strip()
+        if (
+            not message
+            or len(message) > 1500
+            or not is_whatsapp_message_time_label(timestamp_label)
+            or len(sender) > 80
+        ):
+            continue
+        key = (sender, timestamp_label, message, direction)
+        if key in seen:
+            continue
+        seen.add(key)
+        messages.append(
+            {
+                "sender": sender,
+                "chat_name": chat_context.get("chat_name"),
+                "source_kind": chat_context.get("source_kind", "unknown"),
+                "participants": chat_context.get("participants", []),
+                "message_direction": direction,
+                "timestamp_label": timestamp_label,
+                "message": message,
+                "capture_scope": "visible_dom",
+            }
+        )
+        if len(messages) >= limit:
+            break
+    return messages
+
+
+def normalize_whatsapp_list_preview_records(
+    records: list[dict[str, str]],
+    *,
+    limit: int = 100,
+) -> list[dict[str, object]]:
+    messages: list[dict[str, object]] = []
+    seen: set[tuple[str, str, str, str]] = set()
+    for record in records:
+        chat_name = str(record.get("chat_name") or "").strip()
+        timestamp_label = str(record.get("timestamp_label") or "").strip()
+        message = str(record.get("message") or "").strip()
+        direction = str(record.get("message_direction") or "unknown").strip().lower()
+        if direction not in {"incoming", "outgoing"}:
+            direction = "unknown"
+        if (
+            not chat_name
+            or len(chat_name) > 80
+            or not is_whatsapp_timestamp_label(timestamp_label)
+            or not message
+            or len(message) > 1500
+            or re.fullmatch(r"\d+", message)
+        ):
+            continue
+        sender = "self" if direction == "outgoing" else chat_name
+        key = (chat_name, timestamp_label, message, direction)
+        if key in seen:
+            continue
+        seen.add(key)
+        messages.append(
+            {
+                "sender": sender,
+                "chat_name": chat_name,
+                "source_kind": "unknown",
+                "message_direction": direction,
+                "message": message,
+                "timestamp_label": timestamp_label,
+                "capture_scope": "chat_list_preview",
+            }
+        )
+        if len(messages) >= limit:
+            break
+    return messages
 
 
 async def inject_whatsapp_observer(page) -> None:
@@ -2233,8 +2577,8 @@ def parse_gmail_inbox_previews(lines: list[str], limit: int = 10) -> list[dict[s
 def is_gmail_open_thread_time(value: str) -> bool:
     return bool(
         re.match(r"^\d{1,2}:\d{2}(?:\s*\(.+\))?$", value)
-        or re.match(r"^\d{4}年\d{1,2}月\d{1,2}日.*\d{1,2}:\d{2}$", value)
-        or re.match(r"^\d{1,2}月\d{1,2}日.*\d{1,2}:\d{2}$", value)
+        or re.match(r"^\d{4}年\d{1,2}月\d{1,2}日.*\d{1,2}:\d{2}(?:\s*\(.+\))?$", value)
+        or re.match(r"^\d{1,2}月\d{1,2}日.*\d{1,2}:\d{2}(?:\s*\(.+\))?$", value)
     )
 
 
@@ -2301,8 +2645,15 @@ def parse_gmail_open_thread(lines: list[str]) -> Optional[dict[str, str]]:
             continue
 
         subject_index = index - 1
-        while subject_index >= 0 and cleaned[subject_index] in GMAIL_UI_LINES:
-            subject_index -= 1
+        while subject_index >= 0:
+            subject_candidate = cleaned[subject_index]
+            if (
+                subject_candidate in GMAIL_UI_LINES
+                or GMAIL_THREAD_SUBJECT_CHROME_RE.fullmatch(subject_candidate)
+            ):
+                subject_index -= 1
+                continue
+            break
         if subject_index < 0:
             continue
         subject = cleaned[subject_index]
@@ -2313,12 +2664,22 @@ def parse_gmail_open_thread(lines: list[str]) -> Optional[dict[str, str]]:
         attachments: list[str] = []
         labels: list[str] = []
         for candidate in cleaned[index + 2 :]:
-            if candidate in GMAIL_UI_LINES:
-                break
             if is_probable_gmail_sender_line(candidate) or is_gmail_open_thread_time(candidate):
                 break
             if candidate in {"附件", "Attachments"}:
                 continue
+            if not body_lines and (
+                candidate in GMAIL_UI_LINES
+                or candidate in GMAIL_THREAD_LEADING_BODY_UI_LINES
+                or candidate.startswith("发送至 ")
+                or candidate.startswith("To ")
+            ):
+                continue
+            if body_lines and (
+                candidate in GMAIL_UI_LINES
+                or candidate in GMAIL_THREAD_BODY_TERMINATORS
+            ):
+                break
             parsed_labels = parse_gmail_labels(candidate)
             if parsed_labels:
                 labels.extend(parsed_labels)
@@ -3705,6 +4066,17 @@ async def collect_gmail(client: httpx.AsyncClient, page) -> None:
             "gmail",
             "healthy",
             {"preview_count": len(previews), "latest_subject": previews[0]["subject"]},
+        )
+    elif open_thread:
+        await report_health(
+            client,
+            "gmail",
+            "healthy",
+            {
+                "preview_count": 0,
+                "thread_snapshot": True,
+                "latest_subject": open_thread["subject"],
+            },
         )
     else:
         await report_health(

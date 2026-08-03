@@ -55,6 +55,38 @@ def test_browser_open_queues_whatsapp_login_command(monkeypatch):
     assert events[2]["payload"]["live_result"]["external_side_effect"] is False
 
 
+def test_browser_open_queues_gmail_browser_fallback_login_command(monkeypatch):
+    monkeypatch.setenv("APP_PASSWORD", "secret")
+    from app import main
+    from app.long_tail_agent import LongTailEventStore
+
+    queued = []
+    main._LONG_TAIL_EVENT_STORE = LongTailEventStore()
+
+    class Redis:
+        def rpush(self, key, value):
+            queued.append((key, json.loads(value)))
+            return 1
+
+    monkeypatch.setattr(main, "redis_client", lambda: Redis())
+
+    response = TestClient(main.app).post(
+        "/api/browser/open",
+        json={"source": "gmail"},
+        headers={"x-par-password": "secret"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["target_url"] == (
+        "https://accounts.google.com/ServiceLogin?service=mail"
+        "&continue=https%3A%2F%2Fmail.google.com%2Fmail%2Fu%2F0%2F%23inbox"
+    )
+    assert queued[0][1]["action"] == "open_url"
+    assert queued[0][1]["source"] == "gmail"
+    assert queued[0][1]["host_fragment"] == "mail.google.com"
+    assert queued[0][1]["url"] == response.json()["target_url"]
+
+
 def test_browser_open_queues_linkedin_login_page_not_heavy_homepage(monkeypatch):
     monkeypatch.setenv("APP_PASSWORD", "secret")
     from app import main

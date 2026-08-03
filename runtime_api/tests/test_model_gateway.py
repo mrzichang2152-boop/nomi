@@ -147,7 +147,7 @@ def test_gateway_status_uses_configured_provider_order():
     assert "api_key" not in status["providers"][0]
 
 
-def test_default_model_provider_uses_4sapi_gpt54mini_without_env(monkeypatch):
+def test_default_model_provider_uses_qwen36_27b_without_env(monkeypatch):
     from app.model_gateway import default_model_providers
 
     for key in [
@@ -164,10 +164,10 @@ def test_default_model_provider_uses_4sapi_gpt54mini_without_env(monkeypatch):
     providers = default_model_providers()
     config = providers[0].config
 
-    assert config.provider_id == "4sapi_primary"
-    assert config.display_name == "4sapi GPT-5.4 mini"
+    assert config.provider_id == "qwen36_27b_primary"
+    assert config.display_name == "Qwen3.6 27B"
     assert config.provider_type == "openai_compatible"
-    assert config.base_url == "https://4sapi.com/v1"
-    assert config.model == "gpt-5.4-mini"
+    assert config.base_url == "http://81.70.177.246:9151/v1"
+    assert config.model == "qwen3.6-27b"
     assert config.api_key == ""
     assert config.privacy_tier == "external_api"

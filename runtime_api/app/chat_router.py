@@ -89,7 +89,9 @@ AGENDA_EVIDENCE_FALLBACK_RE = re.compile(
 )
 MEMORY_RE = re.compile(
     r"(之前|上次|谁说|说过|聊天记录|邮件|报价|PHONE_|客户|同事|朋友|记得|历史|"
-    r"请记住|帮我记住|记住的|暗号|测试暗号|口令|偏好|喜好|保险|保单|免赔|理赔)"
+    r"请记住|帮我记住|记住的|暗号|测试暗号|口令|偏好|喜好|保险|保单|免赔|理赔|"
+    r"\bremember(?:ed|ing)?\b|\bmemory\b|\bpreviously\b|\blast time\b|\bearlier\b)",
+    re.I,
 )
 SOURCE_CONTEXT_RE = re.compile(
     r"(Gmail|邮件|email|inbox|收件箱|WhatsApp|Telegram|LinkedIn|领英|Calendar|日历)",

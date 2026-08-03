@@ -689,6 +689,38 @@ def test_stable_collector_event_key_dedupes_whatsapp_chat_list_message_across_re
     assert first_key == second_key
 
 
+def test_stable_collector_event_key_dedupes_outgoing_whatsapp_list_and_visible_dom_sender_labels(monkeypatch):
+    monkeypatch.setenv("APP_PASSWORD", "secret")
+    from app import main
+
+    marker = "NOMI_REAL_WA_20260727_A codename AmberKite deadline 2026-08-09"
+    list_key = main.stable_collector_event_key(
+        "whatsapp",
+        "whatsapp_message",
+        {
+            "chat_name": "陈子扬",
+            "sender": "self",
+            "message": marker,
+            "message_direction": "outgoing",
+            "capture_scope": "chat_list_preview",
+        },
+    )
+    visible_key = main.stable_collector_event_key(
+        "whatsapp",
+        "whatsapp_message",
+        {
+            "chat_name": "陈子扬",
+            "sender": "子长",
+            "message": marker,
+            "message_direction": "outgoing",
+            "capture_scope": "visible_dom",
+        },
+    )
+
+    assert list_key
+    assert list_key == visible_key
+
+
 def test_stable_collector_event_key_dedupes_telegram_open_chat_rescans_but_keeps_chat_scope(monkeypatch):
     monkeypatch.setenv("APP_PASSWORD", "secret")
     from app import main

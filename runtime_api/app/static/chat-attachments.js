@@ -8,7 +8,7 @@
   const MAX_ATTACHMENTS = 8;
   const MAX_TOTAL_BYTES = 64 * 1024 * 1024;
   const TERMINAL_STATUSES = new Set(["ready", "failed", "rejected", "deleted", "expired"]);
-  const POLLABLE_STATUSES = new Set(["uploaded", "queued", "processing"]);
+  const POLLABLE_STATUSES = new Set(["stored", "uploaded", "queued", "processing"]);
 
   function defaultIdFactory() {
     if (globalThis.crypto && typeof globalThis.crypto.randomUUID === "function") {

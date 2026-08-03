@@ -133,7 +133,7 @@ from app.delegated_automation.policy import build_execution_trace, evaluate_dele
 from app.delegated_automation.schema import delegated_automation_schema_sql
 from app.delegated_automation.store import InMemoryDelegatedAutomationStore
 from app.model_gateway import ModelGatewayError, default_model_gateway
-from app.model_client import QwenClient, qwen_non_thinking_options
+from app.model_client import QwenClient, openai_compatible_chat_url, qwen_non_thinking_options
 from app.long_tail_agent import (
     ExecutorAdapterRegistry,
     ExternalEffectController,
@@ -195,8 +195,8 @@ from app.ios_live_activity import (
 
 DATABASE_URL = os.environ["DATABASE_URL"]
 REDIS_URL = os.environ["REDIS_URL"]
-MODEL_BASE_URL = os.getenv("MODEL_BASE_URL", "http://localhost:9161")
-MODEL_NAME = os.getenv("MODEL_NAME", "qwen3.6")
+MODEL_BASE_URL = os.getenv("MODEL_BASE_URL", "http://81.70.177.246:9151/v1")
+MODEL_NAME = os.getenv("MODEL_NAME", "qwen3.6-27b")
 COMPOSIO_API_KEY = os.getenv("COMPOSIO_API_KEY", "").strip()
 COMPOSIO_API_BASE_URL = os.getenv("COMPOSIO_API_BASE_URL", "https://backend.composio.dev").rstrip("/")
 COMPOSIO_USER_ID = os.getenv("COMPOSIO_USER_ID", "nomi_owner").strip() or "nomi_owner"
@@ -748,8 +748,8 @@ def assistant_turn_idempotency_key(client_request_id: Optional[str], role: str) 
 
 class UserModelConfigIn(BaseModel):
     provider_type: str = Field(default="openai_compatible", max_length=80)
-    base_url: str = Field(default="https://4sapi.com/v1", max_length=500)
-    model: str = Field(default="gpt-5.4-mini", max_length=200)
+    base_url: str = Field(default="http://81.70.177.246:9151/v1", max_length=500)
+    model: str = Field(default="qwen3.6-27b", max_length=200)
     api_key: str = Field(default="", max_length=4000)
     auth_header_format: str = Field(default="raw", max_length=40)
     display_name: str = Field(default="", max_length=200)
@@ -1583,10 +1583,10 @@ def load_user_model_config() -> dict[str, Any]:
     if not row:
         return public_model_config_payload(
             provider_id="user_primary",
-            display_name="4sapi GPT-5.4 mini",
+            display_name="Qwen3.6 27B",
             provider_type=os.getenv("MODEL_PROVIDER_TYPE", "openai_compatible"),
-            base_url=os.getenv("MODEL_BASE_URL", "https://4sapi.com/v1").rstrip("/"),
-            model=os.getenv("MODEL_NAME", "gpt-5.4-mini"),
+            base_url=os.getenv("MODEL_BASE_URL", "http://81.70.177.246:9151/v1").rstrip("/"),
+            model=os.getenv("MODEL_NAME", "qwen3.6-27b"),
             api_key=os.getenv("MODEL_API_KEY", ""),
             auth_header_format=os.getenv("MODEL_AUTH_HEADER_FORMAT", "raw"),
             max_output_tokens=int(os.getenv("MODEL_MAX_OUTPUT_TOKENS", "8192")),
@@ -1917,6 +1917,13 @@ BROWSER_COMMAND_STATUS_KEY_PREFIX = "browser:commands:status:"
 BROWSER_COMMAND_STATUS_TTL_SECONDS = 60 * 60 * 24
 LINKEDIN_JOB_SEARCH_DEDUPE_TTL_SECONDS = 60 * 10
 BROWSER_OPEN_TARGETS: dict[str, dict[str, str]] = {
+    "gmail": {
+        "host_fragment": "mail.google.com",
+        "url": (
+            "https://accounts.google.com/ServiceLogin?service=mail"
+            "&continue=https%3A%2F%2Fmail.google.com%2Fmail%2Fu%2F0%2F%23inbox"
+        ),
+    },
     "whatsapp": {
         "host_fragment": "web.whatsapp.com",
         "url": "https://web.whatsapp.com/",
@@ -3238,7 +3245,7 @@ def model_context_necessity_delta(
     }
     try:
         response = httpx.post(
-            f"{MODEL_BASE_URL.rstrip('/')}/v1/chat/completions",
+            openai_compatible_chat_url(MODEL_BASE_URL),
             json={
                 "model": MODEL_NAME,
                 "messages": [
@@ -4771,7 +4778,7 @@ def call_pipeline_slot_model(
     }
     try:
         response = httpx.post(
-            f"{MODEL_BASE_URL.rstrip('/')}/v1/chat/completions",
+            openai_compatible_chat_url(MODEL_BASE_URL),
             json={
                 "model": MODEL_NAME,
                 "messages": [
@@ -11559,7 +11566,13 @@ def parse_uuid_or_new(value: Optional[str]) -> uuid.UUID:
 
 DIALOGUE_MEMORY_BATCH_ROUNDS = 15
 DIALOGUE_MEMORY_IMMEDIATE_PATTERNS: list[tuple[re.Pattern[str], str]] = [
-    (re.compile(r"(记住|保存一下|以后提醒我|remember this|please remember)", re.I), "explicit_memory"),
+    (
+        re.compile(
+            r"(记住|保存一下|以后提醒我|(?:^|\b(?:and|please)\s+)remember\b|\bremember\s+(?:this|that|it|its)\b)",
+            re.I,
+        ),
+        "explicit_memory",
+    ),
     (
         re.compile(
             r"(日程|安排|会议|见面|面试|截止|提醒|待办|todo|deadline|meeting|interview|schedule|calendar)",
@@ -11589,6 +11602,21 @@ def dialogue_memory_policy_for_turn(
             if pattern.search(text):
                 return {"policy": "immediate", "reason": reason}
     return {"policy": "defer", "reason": "ordinary_dialogue"}
+
+
+def attachment_answer_memory_enqueue_policy(
+    message: str,
+    attachment_context: list[dict[str, Any]],
+) -> str:
+    has_attachment_evidence = any(
+        isinstance(item, dict)
+        and item.get("layer") in {"attachment_evidence", "attachment_visual_evidence"}
+        for item in attachment_context
+    )
+    if not has_attachment_evidence:
+        return "auto"
+    user_policy = dialogue_memory_policy_for_turn("user", message, explicit_policy="auto")
+    return "immediate" if user_policy["policy"] == "immediate" else "auto"
 
 
 def dialogue_memory_status(
@@ -11794,6 +11822,12 @@ def stable_social_message_event_key(source: str, event_type: str, raw_data: dict
     )
     if not message or re.fullmatch(r"\d+\+?", message):
         return ""
+    sender = normalized_collector_identity_text(
+        raw_data.get("sender") or raw_data.get("from") or raw_data.get("speaker"),
+        limit=160,
+    )
+    if source == "whatsapp" and str(raw_data.get("message_direction") or "").strip().lower() == "outgoing":
+        sender = "self"
     identity = {
         "source": source,
         "event_type": event_type,
@@ -11804,7 +11838,7 @@ def stable_social_message_event_key(source: str, event_type: str, raw_data: dict
             or raw_data.get("subject"),
             limit=160,
         ),
-        "sender": normalized_collector_identity_text(raw_data.get("sender") or raw_data.get("from") or raw_data.get("speaker"), limit=160),
+        "sender": sender,
         "message": message,
     }
     if not identity["conversation"] and not identity["sender"]:
@@ -13279,6 +13313,108 @@ def is_nomi_user_query_echo(item: dict[str, Any], query: str) -> bool:
     return normalized_dialogue_text(raw_content(item)) == normalized_dialogue_text(query)
 
 
+def vector_recall_row_identity(row: Any) -> str:
+    if len(row) > 8 and row[8]:
+        return f"event:{row[8]}"
+    raw_data = row[3] if len(row) > 3 and isinstance(row[3], dict) else {}
+    tool_call_id = str(raw_data.get("tool_call_id") or "")
+    if tool_call_id:
+        return f"tool:{tool_call_id}"
+    return "|".join(
+        [
+            str(row[0] if len(row) > 0 else ""),
+            str(row[1] if len(row) > 1 else ""),
+            str(row[2] if len(row) > 2 else ""),
+            normalized_dialogue_text(str(raw_data.get("content") or raw_data.get("text") or "")),
+        ]
+    )
+
+
+def merge_vector_recall_rows(limit: int, *row_groups: list[Any]) -> list[Any]:
+    merged: list[Any] = []
+    seen: set[str] = set()
+    capacity = max(int(limit or 0), 1) * max(len(row_groups), 1)
+    for rows in row_groups:
+        for row in rows:
+            identity = vector_recall_row_identity(row)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            merged.append(row)
+            if len(merged) >= capacity:
+                return merged
+    return merged
+
+
+def explicit_memory_pair_requests(rows: list[Any]) -> dict[str, str]:
+    requests: dict[str, str] = {}
+    for row in rows:
+        event_type = str(row[2] if len(row) > 2 else "")
+        raw_data = row[3] if len(row) > 3 and isinstance(row[3], dict) else {}
+        if event_type != "user_message" and str(raw_data.get("role") or "") != "user":
+            continue
+        content = str(raw_data.get("content") or raw_data.get("text") or "")
+        decision = dialogue_memory_policy_for_turn("user", content, explicit_policy="auto")
+        if decision.get("reason") != "explicit_memory":
+            continue
+        tool_call_id = str(raw_data.get("tool_call_id") or "")
+        if not tool_call_id.endswith(":user"):
+            continue
+        assistant_tool_call_id = f"{tool_call_id[:-5]}:assistant"
+        requests.setdefault(assistant_tool_call_id, content)
+    return requests
+
+
+def explicit_memory_pair_assistant_tool_call_ids(rows: list[Any]) -> list[str]:
+    return list(explicit_memory_pair_requests(rows))
+
+
+def mark_paired_dialogue_recall_row(row: Any, paired_memory_request: str = "") -> tuple[Any, ...]:
+    values = list(row)
+    while len(values) < 8:
+        values.append(None)
+    metadata = dict(values[7]) if isinstance(values[7], dict) else {}
+    metadata["paired_dialogue_recall"] = True
+    if paired_memory_request:
+        metadata["paired_memory_request"] = paired_memory_request
+    values[7] = metadata
+    return tuple(values)
+
+
+def retrieve_paired_dialogue_recall_rows(conn: Any, rows: list[Any], limit: int) -> list[Any]:
+    paired_requests = explicit_memory_pair_requests(rows)
+    assistant_tool_call_ids = list(paired_requests)
+    if not assistant_tool_call_ids:
+        return []
+    paired_rows = conn.execute(
+        """
+        /* paired_dialogue_recall */
+        SELECT e.timestamp, e.source, e.event_type, e.raw_data, s.summary, s.intent, s.importance,
+               COALESCE(v.metadata, '{}'::jsonb) AS metadata, e.event_id
+        FROM events e
+        LEFT JOIN semantic_events s ON s.event_id = e.event_id
+        LEFT JOIN memory_vectors v ON v.event_id = e.event_id
+        WHERE e.source = 'nomi_chat'
+          AND e.event_type = 'assistant_message'
+          AND e.raw_data ->> 'tool_call_id' = ANY(%s)
+        ORDER BY e.timestamp DESC
+        LIMIT %s
+        """,
+        (assistant_tool_call_ids, max(int(limit or 0), 1)),
+    ).fetchall()
+    marked_rows: list[Any] = []
+    for row in paired_rows:
+        raw_data = row[3] if len(row) > 3 and isinstance(row[3], dict) else {}
+        tool_call_id = str(raw_data.get("tool_call_id") or "")
+        marked_rows.append(
+            mark_paired_dialogue_recall_row(
+                row,
+                paired_requests.get(tool_call_id, ""),
+            )
+        )
+    return marked_rows
+
+
 def released_private_evidence_has_facts(item: dict[str, Any]) -> bool:
     release = item.get("released_private_evidence")
     if not isinstance(release, dict):
@@ -13339,7 +13475,11 @@ def rerank_context(query: str, context: list[dict[str, Any]]) -> list[dict[str, 
         if released_private_evidence_has_facts(item):
             source_bonus += 2.0
         if is_nomi_assistant_memory(item):
-            source_bonus -= 8.0
+            metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
+            if metadata.get("paired_dialogue_recall") is True:
+                source_bonus += 12.0
+            else:
+                source_bonus -= 8.0
         if is_nomi_user_query_echo(item, query):
             source_bonus -= 4.0
         return overlap + confidence + layer_bonus.get(item.get("layer"), 0) + source_bonus
@@ -15795,7 +15935,7 @@ def retrieve_context(query: str, limit: int, request_scope: Optional[dict[str, A
         vector_rows = conn.execute(
             """
             SELECT e.timestamp, e.source, e.event_type, e.raw_data, s.summary, s.intent, s.importance,
-                   COALESCE(v.metadata, '{}'::jsonb) AS metadata
+                   COALESCE(v.metadata, '{}'::jsonb) AS metadata, e.event_id
             FROM events e
             LEFT JOIN semantic_events s ON s.event_id = e.event_id
             LEFT JOIN memory_vectors v ON v.event_id = e.event_id
@@ -15808,22 +15948,37 @@ def retrieve_context(query: str, limit: int, request_scope: Optional[dict[str, A
             """,
             (pattern, pattern, query_vector, plan.vector_limit),
         ).fetchall()
-        if not vector_rows:
-            vector_rows = conn.execute(
-                """
-                SELECT e.timestamp, e.source, e.event_type, e.raw_data, s.summary, s.intent, s.importance,
-                       COALESCE(v.metadata, '{}'::jsonb) AS metadata
-                FROM events e
-                LEFT JOIN semantic_events s ON s.event_id = e.event_id
-                LEFT JOIN memory_vectors v ON v.event_id = e.event_id
-                ORDER BY
-                  CASE WHEN v.embedding IS NULL THEN 1 ELSE 0 END,
-                  v.embedding <=> %s::vector,
-                  e.timestamp DESC
-                LIMIT %s
-                """,
-                (query_vector, plan.vector_limit),
-            ).fetchall()
+        semantic_vector_rows = conn.execute(
+            """
+            SELECT e.timestamp, e.source, e.event_type, e.raw_data, s.summary, s.intent, s.importance,
+                   COALESCE(v.metadata, '{}'::jsonb) AS metadata, e.event_id
+            FROM events e
+            LEFT JOIN semantic_events s ON s.event_id = e.event_id
+            LEFT JOIN memory_vectors v ON v.event_id = e.event_id
+            ORDER BY
+              CASE WHEN v.embedding IS NULL THEN 1 ELSE 0 END,
+              v.embedding <=> %s::vector,
+              e.timestamp DESC
+            LIMIT %s
+            """,
+            (query_vector, plan.vector_limit),
+        ).fetchall()
+        merged_vector_rows = merge_vector_recall_rows(
+            plan.vector_limit,
+            vector_rows,
+            semantic_vector_rows,
+        )
+        paired_dialogue_rows = retrieve_paired_dialogue_recall_rows(
+            conn,
+            merged_vector_rows,
+            plan.vector_limit,
+        )
+        vector_rows = merge_vector_recall_rows(
+            plan.vector_limit,
+            vector_rows,
+            semantic_vector_rows,
+            paired_dialogue_rows,
+        )
         if literal_identifiers:
             literal_conditions = " OR ".join(
                 [
@@ -18215,6 +18370,9 @@ async def chat(
         None,
     )
     agenda_answer = deterministic_agenda_answer(body.message, context_pack)
+    paired_memory_answer = (
+        None if agenda_answer is not None else deterministic_paired_memory_answer(body.message, context_pack)
+    )
     career_application_answer = None if agenda_answer is not None else deterministic_career_application_answer(body.message, context_pack)
     career_answer = None if agenda_answer is not None or career_application_answer is not None else deterministic_career_answer(body.message, context_pack)
     full_inspection_answer = None
@@ -18228,6 +18386,7 @@ async def chat(
         full_inspection_answer
         or web_failure_answer
         or agenda_answer
+        or paired_memory_answer
         or career_application_answer
         or career_answer
     )
@@ -18240,6 +18399,8 @@ async def chat(
             deterministic_mode = "web_search_required_but_unavailable"
         elif agenda_answer is not None:
             deterministic_mode = "deterministic_agenda_answer"
+        elif paired_memory_answer is not None:
+            deterministic_mode = "deterministic_paired_memory_answer"
         elif career_application_answer is not None:
             deterministic_mode = "deterministic_career_application_answer"
         else:
@@ -18305,6 +18466,10 @@ async def chat(
             conversation_id=user_turn["conversation_id"],
             client_type=body.client_type,
             tool_call_id=assistant_turn_idempotency_key(body.client_request_id, "assistant"),
+            memory_enqueue_policy=attachment_answer_memory_enqueue_policy(
+                body.message,
+                attachment_context,
+            ),
         )
         context_pack["dialogue_memory_enqueue"] = assistant_turn.get("dialogue_memory_enqueue") or user_turn.get("dialogue_memory_enqueue")
         persist_claim_citations(
@@ -18878,6 +19043,33 @@ def context_pack_text_values(context_pack: dict[str, Any]) -> list[str]:
                     if isinstance(value, str) and value.strip():
                         texts.append(value.strip())
     return texts
+
+
+def deterministic_paired_memory_answer(message: str, context_pack: dict[str, Any]) -> Optional[str]:
+    route = context_pack.get("chat_route") if isinstance(context_pack.get("chat_route"), dict) else {}
+    if str(route.get("intent") or "") != "memory_query":
+        return None
+    query_terms = set(query_tokens(message))
+    candidates: list[tuple[int, int, str]] = []
+    for index, item in enumerate(context_pack.get("memory_context") or []):
+        if not isinstance(item, dict):
+            continue
+        metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
+        if metadata.get("paired_dialogue_recall") is not True:
+            continue
+        paired_request = str(metadata.get("paired_memory_request") or "").strip()
+        answer = raw_content(item).strip()
+        if not paired_request or not answer:
+            continue
+        if re.search(r"(?:不确定|无法|不能确定|cannot|can't|unable|not sure)", answer, re.IGNORECASE):
+            continue
+        overlap = len(query_terms.intersection(query_tokens(paired_request)))
+        if overlap <= 0:
+            continue
+        candidates.append((overlap, -index, answer))
+    if not candidates:
+        return None
+    return max(candidates)[2]
 
 
 def linkedin_context_company_location(window_text: str, label: str) -> tuple[str, str]:
@@ -19981,6 +20173,8 @@ async def stream_chat_to_websocket(
     request_scope = infer_request_scope(message, {})
     deterministic_route = route_chat_context(message, {})
     chat_route = await apply_semantic_context_router(message, {}, deterministic_route)
+    current_attachment_ids = [uuid.UUID(str(value)) for value in (user_turn.get("attachment_ids") or [])]
+    chat_route = route_with_attachment_evidence(chat_route, message, current_attachment_ids)
     context_limits = context_fetch_limits(chat_route, limit)
     context_candidate_limit = context_limits.get("memory") or chat_context_candidate_limit(limit)
     fetchers = {
@@ -20013,6 +20207,15 @@ async def stream_chat_to_websocket(
                 "intent": chat_route.intent,
             },
         ),
+        "attachments": lambda: retrieve_attachment_context_for_chat(
+            message,
+            current_attachment_ids=current_attachment_ids,
+            conversation_id=uuid.UUID(str(user_turn["conversation_id"])),
+            current_turn_id=uuid.UUID(str(user_turn["turn_id"])),
+            route_requires_file_evidence=chat_route.needs_attachments,
+            request_id=str(user_turn["event_id"]),
+            client_request_id=normalize_client_request_id(client_request_id),
+        ),
     }
     if any(context_limits.get(key, 0) > 0 for key in ("memory_kv", "memory_graph", "memory_rag", "timeline")):
         fetchers.update(
@@ -20033,6 +20236,7 @@ async def stream_chat_to_websocket(
     agenda_context = parallel_context["agenda"]
     task_context = parallel_context["tasks"]
     web_context = parallel_context["web"]
+    attachment_context = parallel_context["attachments"]
     career_context = retrieve_career_chat_context(limit=8) if chat_route.intent == "job_query" else {}
     if career_context:
         linkedin_job_search = maybe_queue_linkedin_job_search_for_chat(message, career_context)
@@ -20046,6 +20250,7 @@ async def stream_chat_to_websocket(
         agenda_context=agenda_context,
         source_context=source_context,
         web_context=web_context,
+        attachment_context=attachment_context,
         task_context=task_context,
         career_context=career_context,
         request_scope=request_scope,
@@ -20079,23 +20284,51 @@ async def stream_chat_to_websocket(
     context_pack["fusion_summary"] = context_fusion_summary(context_pack)
     messages = build_chat_messages(message, context_pack)
     context_retrieval_ms = elapsed_ms(context_start_ms)
+    full_inspection_task = next(
+        (
+            item
+            for item in attachment_context
+            if isinstance(item, dict) and item.get("layer") == "attachment_full_inspection_task"
+        ),
+        None,
+    )
     answer_parts: list[str] = []
     model_start_ms = monotonic_ms()
     stream_first_token_ms: Optional[int] = None
     model_first_token_ms: Optional[int] = None
     agenda_answer = deterministic_agenda_answer(message, context_pack)
+    paired_memory_answer = (
+        None if agenda_answer is not None else deterministic_paired_memory_answer(message, context_pack)
+    )
     career_application_answer = None if agenda_answer is not None else deterministic_career_application_answer(message, context_pack)
     career_answer = None if agenda_answer is not None or career_application_answer is not None else deterministic_career_answer(message, context_pack)
+    full_inspection_answer = None
+    if full_inspection_task is not None:
+        full_inspection_answer = (
+            f"已创建逐页附件检查任务，共 {int(full_inspection_task.get('total_locators') or 0)} 个位置。"
+            "我会分批检查并记录覆盖范围，完成后把结果发给你；在任务完成前不会声称已经读完全部内容。"
+        )
     web_failure_answer = required_web_evidence_failure_answer(chat_route, web_context)
-    deterministic_answer = web_failure_answer or agenda_answer or career_application_answer or career_answer
+    deterministic_answer = (
+        full_inspection_answer
+        or web_failure_answer
+        or agenda_answer
+        or paired_memory_answer
+        or career_application_answer
+        or career_answer
+    )
     if deterministic_answer is not None:
         stream_first_token_ms = elapsed_ms(total_start_ms)
         model_first_token_ms = 0
         answer_parts.append(deterministic_answer)
-        if web_failure_answer is not None:
+        if full_inspection_answer is not None:
+            deterministic_mode = "attachment_full_inspection_queued"
+        elif web_failure_answer is not None:
             deterministic_mode = "web_search_required_but_unavailable"
         elif agenda_answer is not None:
             deterministic_mode = "deterministic_agenda_answer"
+        elif paired_memory_answer is not None:
+            deterministic_mode = "deterministic_paired_memory_answer"
         elif career_application_answer is not None:
             deterministic_mode = "deterministic_career_application_answer"
         else:
@@ -20193,6 +20426,12 @@ async def stream_chat_to_websocket(
         )
     answer = finalized_answer
     context_pack["citation_validation"] = citation_validation
+    attachment_citation_validation = validate_attachment_answer_citations(answer, attachment_context)
+    if not attachment_citation_validation["valid"]:
+        for invalid_label in attachment_citation_validation["unknown_labels"]:
+            answer = answer.replace(str(invalid_label), "[附件引用未通过证据校验]")
+        answer = f"{answer}\n\n部分附件引用未通过本次证据范围校验，已移除；请以已标注的附件位置为准。"
+    context_pack["attachment_citation_validation"] = attachment_citation_validation
     model_ms = elapsed_ms(model_start_ms)
     latency_trace: dict[str, Any] = {
         "total_ms": elapsed_ms(total_start_ms),
@@ -20223,6 +20462,10 @@ async def stream_chat_to_websocket(
                 conversation_id=user_turn["conversation_id"],
                 client_type=client_type,
                 tool_call_id=assistant_turn_idempotency_key(client_request_id, "assistant"),
+                memory_enqueue_policy=attachment_answer_memory_enqueue_policy(
+                    message,
+                    attachment_context,
+                ),
             )
             context_pack["final_model_answer_event_id"] = assistant_turn["event_id"]
             context_pack["final_model_answer_turn_id"] = assistant_turn["turn_id"]
@@ -20274,7 +20517,7 @@ async def stream_chat_to_websocket(
             "client_request_id": normalize_client_request_id(client_request_id),
             "sources": decorate_context_sources(context) + [
                 item for item in web_context if item.get("layer") == "web_evidence"
-            ],
+            ] + [item for item in attachment_context if item.get("layer") == "attachment_evidence"],
             "context_pack": {
                 "included_event_ids": context_pack["included_event_ids"],
                 "included_memory_ids": context_pack.get("included_memory_ids", []),
@@ -20285,6 +20528,7 @@ async def stream_chat_to_websocket(
                 "memory_context_count": len(context_pack.get("memory_context", [])),
                 "source_context_count": len(context_pack.get("source_context", [])),
                 "web_context_count": len(context_pack.get("web_context", [])),
+                "attachment_context_count": len(context_pack.get("attachment_context", [])),
                 "task_context_count": len(context_pack.get("task_context", [])),
                 "dialogue_memory_enqueue": context_pack.get("dialogue_memory_enqueue") or {},
                 "token_budget": context_pack.get("token_budget", {}),
@@ -20304,6 +20548,7 @@ async def stream_chat_to_websocket(
                 "fusion_summary": context_pack.get("fusion_summary", {}),
                 "scope_filters_applied": context_pack.get("scope_filters_applied", {}),
                 "chat_route": context_pack.get("chat_route", {}),
+                "attachment_citation_validation": context_pack.get("attachment_citation_validation", {}),
                 "latency_trace": latency_trace,
                 "reason": context_pack["reason"],
             },

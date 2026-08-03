@@ -56,6 +56,9 @@ test("polling runs only for visible non-terminal uploaded drafts", () => {
   const item = draft.items[0];
   assert.equal(attachments.shouldPoll(item, true), false);
 
+  attachments.markUploaded(draft, 0, { attachment_id: "a-1", status: "stored" });
+  assert.equal(attachments.shouldPoll(item, true), true);
+
   attachments.markUploaded(draft, 0, { attachment_id: "a-1", status: "processing" });
   assert.equal(attachments.shouldPoll(item, true), true);
   assert.equal(attachments.shouldPoll(item, false), false);

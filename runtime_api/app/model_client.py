@@ -29,8 +29,8 @@ def qwen_non_thinking_options(model: str) -> dict[str, Any]:
 @dataclass(frozen=True)
 class ModelClientConfig:
     provider_type: str = "openai_compatible"
-    base_url: str = "https://4sapi.com/v1"
-    model: str = "gpt-5.4-mini"
+    base_url: str = "http://81.70.177.246:9151/v1"
+    model: str = "qwen3.6-27b"
     api_key: str = ""
     auth_header_format: str = "raw"
     max_output_tokens: int = 8192
@@ -166,7 +166,7 @@ class ChatCompletionClient:
 
 
 class QwenClient:
-    def __init__(self, base_url: str, model: str = "qwen3.6", api_key: str = "", auth_header_format: str = "bearer") -> None:
+    def __init__(self, base_url: str, model: str = "qwen3.6-27b", api_key: str = "", auth_header_format: str = "bearer") -> None:
         self._client = ChatCompletionClient(
             ModelClientConfig(
                 provider_type="openai_compatible",

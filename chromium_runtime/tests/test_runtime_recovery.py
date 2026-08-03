@@ -24,6 +24,8 @@ def test_managed_page_targets_respect_collector_settings_and_auto_open_list():
 
     assert [target["source"] for target in targets] == ["gmail", "whatsapp", "search"]
     assert targets[0]["host_fragment"] == "mail.google.com"
+    assert targets[0]["url"].startswith("https://accounts.google.com/ServiceLogin?service=mail")
+    assert "accounts.google.com" in targets[0]["alternate_url_fragments"]
     assert targets[1]["url"] == "https://web.whatsapp.com/"
     assert targets[2]["url"] == "https://www.google.com/"
 
@@ -390,7 +392,7 @@ def test_missing_managed_page_targets_detects_closed_pages_by_host_fragment():
     assert [target["source"] for target in missing] == ["whatsapp", "calendar"]
 
 
-def test_missing_managed_page_targets_accepts_google_workspace_marketing_redirects():
+def test_missing_managed_page_targets_reopens_gmail_after_workspace_marketing_redirect():
     from app.runtime import managed_page_targets, missing_managed_page_targets
 
     targets = managed_page_targets(
@@ -409,7 +411,7 @@ def test_missing_managed_page_targets_accepts_google_workspace_marketing_redirec
         ],
     )
 
-    assert missing == []
+    assert [target["source"] for target in missing] == ["gmail"]
 
 
 def test_detects_google_gsi_blank_popup_with_self_opener():
@@ -514,6 +516,15 @@ def test_filter_managed_targets_keeps_only_manual_login_source_during_user_login
 def test_browser_command_target_returns_remote_login_pages():
     from app.runtime import browser_command_target
 
+    assert browser_command_target("gmail") == {
+        "source": "gmail",
+        "host_fragment": "mail.google.com",
+        "url": (
+            "https://accounts.google.com/ServiceLogin?service=mail"
+            "&continue=https%3A%2F%2Fmail.google.com%2Fmail%2Fu%2F0%2F%23inbox"
+        ),
+        "alternate_url_fragments": ["accounts.google.com"],
+    }
     assert browser_command_target("whatsapp") == {
         "source": "whatsapp",
         "host_fragment": "web.whatsapp.com",

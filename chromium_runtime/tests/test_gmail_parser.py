@@ -1,4 +1,5 @@
 import sys
+import asyncio
 from pathlib import Path
 
 
@@ -165,6 +166,131 @@ def test_parse_gmail_open_thread_extracts_visible_attachments_and_labels():
     assert "这里是本周项目资料" in thread["body"]
 
 
+def test_parse_gmail_open_thread_skips_real_gmail_thread_chrome_before_subject_and_body():
+    from app.runtime import parse_gmail_open_thread
+
+    lines = [
+        "标签",
+        "第 1 个会话，共 1 个",
+        "全部打印",
+        "在新窗口中查看",
+        "NOMI_REAL_GMAIL_20260727_A CedarHarbor deadline 2026-08-14",
+        "收件箱",
+        "搜索所有带“收件箱”标签的邮件",
+        "从此会话中移除“收件箱”标签",
+        "张子长 <self@example.com>",
+        "13:51 (6分钟前)",
+        "添加回应",
+        "回复",
+        "更多",
+        "发送至 我",
+        "Real regression marker: NOMI_REAL_GMAIL_20260727_A. Project codename CedarHarbor. Deadline 2026-08-14.",
+        "回复",
+        "转发",
+        "添加表情符号回应",
+    ]
+
+    thread = parse_gmail_open_thread(lines)
+
+    assert thread == {
+        "subject": "NOMI_REAL_GMAIL_20260727_A CedarHarbor deadline 2026-08-14",
+        "sender": "张子长 <self@example.com>",
+        "timestamp_label": "13:51 (6分钟前)",
+        "body": (
+            "Real regression marker: NOMI_REAL_GMAIL_20260727_A. "
+            "Project codename CedarHarbor. Deadline 2026-08-14."
+        ),
+        "capture_scope": "open_thread_visible_body",
+    }
+
+
+def test_parse_gmail_open_thread_accepts_full_chinese_datetime_with_relative_suffix():
+    from app.runtime import parse_gmail_open_thread
+
+    lines = [
+        "NOMI_REAL_GMAIL_20260727_A CedarHarbor deadline 2026-08-14",
+        "收件箱",
+        "搜索所有带“收件箱”标签的邮件",
+        "从此会话中移除“收件箱”标签",
+        "张子长 <self@example.com>",
+        "2026年7月27日 13:51 (16小时前)",
+        "添加回应",
+        "回复",
+        "更多",
+        "发送至 我",
+        "Real regression marker: NOMI_REAL_GMAIL_20260727_A. Project codename CedarHarbor. Deadline 2026-08-14.",
+        "回复",
+        "转发",
+        "添加表情符号回应",
+    ]
+
+    thread = parse_gmail_open_thread(lines)
+
+    assert thread is not None
+    assert thread["subject"] == "NOMI_REAL_GMAIL_20260727_A CedarHarbor deadline 2026-08-14"
+    assert thread["timestamp_label"] == "2026年7月27日 13:51 (16小时前)"
+    assert thread["body"] == (
+        "Real regression marker: NOMI_REAL_GMAIL_20260727_A. "
+        "Project codename CedarHarbor. Deadline 2026-08-14."
+    )
+
+
+def test_collect_gmail_reports_healthy_when_open_thread_is_valid_without_inbox_previews(monkeypatch):
+    from app import runtime
+
+    body_text = "\n".join(
+        [
+            "NOMI_REAL_GMAIL_20260727_A CedarHarbor deadline 2026-08-14",
+            "张子长 <self@example.com>",
+            "13:51 (6分钟前)",
+            "Real regression marker: NOMI_REAL_GMAIL_20260727_A. Project codename CedarHarbor. Deadline 2026-08-14.",
+            "回复",
+        ]
+    )
+
+    class Body:
+        async def inner_text(self, timeout):
+            assert timeout == 8000
+            return body_text
+
+    class Page:
+        url = "https://mail.google.com/mail/u/0/#search/test/thread-id"
+
+        def locator(self, selector):
+            assert selector == "body"
+            return Body()
+
+        async def title(self):
+            return "NOMI_REAL_GMAIL_20260727_A CedarHarbor deadline 2026-08-14 - Gmail"
+
+    events = []
+    health = []
+
+    async def capture_event(client, source, event_type, payload):
+        events.append((source, event_type, payload))
+
+    async def capture_health(client, source, status, details):
+        health.append((source, status, details))
+
+    monkeypatch.setattr(runtime, "emit_event", capture_event)
+    monkeypatch.setattr(runtime, "report_health", capture_health)
+
+    asyncio.run(runtime.collect_gmail(object(), Page()))
+
+    assert [event_type for _, event_type, _ in events] == ["gmail_thread_snapshot"]
+    assert health == [
+        (
+            "gmail",
+            "healthy",
+            {
+                "preview_count": 0,
+                "thread_snapshot": True,
+                "latest_subject": "NOMI_REAL_GMAIL_20260727_A CedarHarbor deadline 2026-08-14",
+            },
+        )
+    ]
+
+
 def test_protect_gmail_payload_redacts_sensitive_body_values_and_flags_reason():
     from app.runtime import protect_gmail_payload
 
@@ -189,3 +315,22 @@ def test_protect_gmail_payload_redacts_sensitive_body_values_and_flags_reason():
     assert "199.00" not in rendered
     assert "验证码" in rendered
     assert "订单号" in rendered
+
+
+def test_protect_gmail_payload_does_not_treat_codename_as_verification_code():
+    from app.runtime import protect_gmail_payload
+
+    body = "Project codename CedarHarbor. Deadline 2026-08-14."
+
+    protected = protect_gmail_payload(
+        {
+            "subject": "NOMI_REAL_GMAIL_20260727_A",
+            "sender": "self@example.com",
+            "timestamp_label": "13:51",
+            "body": body,
+            "capture_scope": "open_thread_visible_body",
+        }
+    )
+
+    assert protected["body"] == body
+    assert "verification_code" not in protected.get("sensitive_reasons", [])

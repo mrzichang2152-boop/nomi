@@ -53,3 +53,13 @@ def test_chromium_startup_uses_page_zoom_without_scaling_the_x11_window():
     assert 'math.log(zoom_factor) / math.log(1.2)' in text
     assert 'partition["default_zoom_level"] = {"x": zoom_level}' in text
     assert "--force-device-scale-factor" not in text
+
+
+def test_chromium_startup_exits_when_browser_or_collector_process_dies():
+    script = Path(__file__).resolve().parents[1] / "start-runtime.sh"
+    text = script.read_text(encoding="utf-8")
+
+    assert 'CHROMIUM_PID="$!"' in text
+    assert "python -m app.runtime &" in text
+    assert 'RUNTIME_PID="$!"' in text
+    assert 'wait -n "$CHROMIUM_PID" "$RUNTIME_PID"' in text

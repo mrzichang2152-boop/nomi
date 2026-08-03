@@ -6,8 +6,8 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
 
-MODEL_BASE_URL = os.getenv("MODEL_BASE_URL", "http://localhost:9161").rstrip("/")
-MODEL_NAME = os.getenv("MODEL_NAME", "qwen3.6")
+MODEL_BASE_URL = os.getenv("MODEL_BASE_URL", "http://81.70.177.246:9151/v1").rstrip("/")
+MODEL_NAME = os.getenv("MODEL_NAME", "qwen3.6-27b")
 CHAT_COMPLETIONS_SUFFIX = "/chat/completions"
 
 

@@ -314,6 +314,21 @@ def test_memory_question_needs_scoped_memory_and_source():
     assert route.needs_source is True
 
 
+def test_english_remembered_attachment_question_routes_to_memory():
+    from app.chat_router import context_fetch_limits, route_chat_context
+
+    route = route_chat_context(
+        "Tell me the project codename and review date I asked you to remember from the attachment.",
+        ui_state=None,
+    )
+    limits = context_fetch_limits(route, requested_limit=12)
+
+    assert route.intent == "memory_query"
+    assert route.needs_memory is True
+    assert route.needs_memory_rag is True
+    assert limits["memory_rag"] > 0
+
+
 def test_family_relationship_question_needs_memory_graph_and_rag():
     from app.chat_router import context_fetch_limits, route_chat_context
 

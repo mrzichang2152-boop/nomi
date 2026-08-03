@@ -102,8 +102,10 @@ services:
       DATABASE_URL: postgresql://par:par_dev_password@postgres:5432/par
       REDIS_URL: redis://redis:6379/0
       MODEL_MODE: standard
-      MODEL_BASE_URL: ${MODEL_BASE_URL:-http://81.70.177.246:9161/v1}
-      MODEL_NAME: ${MODEL_NAME:-qwen3.6}
+      MODEL_BASE_URL: ${MODEL_BASE_URL:-http://81.70.177.246:9151/v1}
+      MODEL_NAME: ${MODEL_NAME:-qwen3.6-27b}
+      MODEL_PROVIDER_ID: ${MODEL_PROVIDER_ID:-qwen36_27b_primary}
+      MODEL_PROVIDER_NAME: ${MODEL_PROVIDER_NAME:-Qwen3.6 27B}
       APP_PASSWORD: ${APP_PASSWORD:-par-dev}
       NOMI_ATTACHMENT_ROOT: ${NOMI_ATTACHMENT_ROOT:-/app/data/attachments}
       ATTACHMENT_MAX_FILE_BYTES: ${ATTACHMENT_MAX_FILE_BYTES:-26214400}
@@ -119,7 +121,7 @@ services:
       OPENCODE_ARTIFACT_TIMEOUT_SECONDS: ${OPENCODE_ARTIFACT_TIMEOUT_SECONDS:-600}
       OPENCODE_ARTIFACT_FALLBACK_COMMAND: ${OPENCODE_ARTIFACT_FALLBACK_COMMAND:-python /app/scripts/nomi_opencode_artifact_command.py}
       NOMI_CAPABILITY_PACKS_DIR: ${NOMI_CAPABILITY_PACKS_DIR:-/app/opencode_capabilities}
-      NOMI_OPENCODE_MODEL_BASE_URL: ${NOMI_OPENCODE_MODEL_BASE_URL:-http://81.70.177.246:9161/v1}
+      NOMI_OPENCODE_MODEL_BASE_URL: ${NOMI_OPENCODE_MODEL_BASE_URL:-http://81.70.177.246:9151/v1}
       NOMI_OPENCODE_MODEL: ${NOMI_OPENCODE_MODEL:-qwen/qwen3.6-27b}
       NOMI_OPENCODE_MODEL_API_KEY: ${NOMI_OPENCODE_MODEL_API_KEY:-nomi-local}
       ENABLE_OPENCODE_ARTIFACT_INLINE_RUN: ${ENABLE_OPENCODE_ARTIFACT_INLINE_RUN:-false}
@@ -216,8 +218,8 @@ services:
       DATABASE_URL: postgresql://par:par_dev_password@postgres:5432/par
       REDIS_URL: redis://redis:6379/0
       MODEL_MODE: standard
-      MODEL_BASE_URL: ${MODEL_BASE_URL:-http://81.70.177.246:9161/v1}
-      MODEL_NAME: ${MODEL_NAME:-qwen3.6}
+      MODEL_BASE_URL: ${MODEL_BASE_URL:-http://81.70.177.246:9151/v1}
+      MODEL_NAME: ${MODEL_NAME:-qwen3.6-27b}
       APP_PASSWORD: ${APP_PASSWORD:-par-dev}
       ARTIFACT_STORAGE_DIR: ${ARTIFACT_STORAGE_DIR:-/app/artifacts}
       ARTIFACT_PUBLIC_BASE_URL: ${ARTIFACT_PUBLIC_BASE_URL:-}
@@ -225,7 +227,7 @@ services:
       OPENCODE_ARTIFACT_TIMEOUT_SECONDS: ${OPENCODE_ARTIFACT_TIMEOUT_SECONDS:-600}
       OPENCODE_ARTIFACT_FALLBACK_COMMAND: ${OPENCODE_ARTIFACT_FALLBACK_COMMAND:-python /app/scripts/nomi_opencode_artifact_command.py}
       NOMI_CAPABILITY_PACKS_DIR: ${NOMI_CAPABILITY_PACKS_DIR:-/app/opencode_capabilities}
-      NOMI_OPENCODE_MODEL_BASE_URL: ${NOMI_OPENCODE_MODEL_BASE_URL:-http://81.70.177.246:9161/v1}
+      NOMI_OPENCODE_MODEL_BASE_URL: ${NOMI_OPENCODE_MODEL_BASE_URL:-http://81.70.177.246:9151/v1}
       NOMI_OPENCODE_MODEL: ${NOMI_OPENCODE_MODEL:-qwen/qwen3.6-27b}
       NOMI_OPENCODE_MODEL_API_KEY: ${NOMI_OPENCODE_MODEL_API_KEY:-nomi-local}
       RUNTIME_API_URL: http://runtime-api:8080
@@ -350,8 +352,8 @@ services:
       REDIS_URL: redis://redis:6379/0
       MODEL_MODE: standard
       MODEL_ROUTER_URL: http://model-router:8090
-      MODEL_BASE_URL: ${MODEL_BASE_URL:-http://81.70.177.246:9161/v1}
-      MODEL_NAME: ${MODEL_NAME:-qwen3.6}
+      MODEL_BASE_URL: ${MODEL_BASE_URL:-http://81.70.177.246:9151/v1}
+      MODEL_NAME: ${MODEL_NAME:-qwen3.6-27b}
       APP_PASSWORD: ${APP_PASSWORD:-par-dev}
       RAW_DATA_ENCRYPTION_KEY: ${RAW_DATA_ENCRYPTION_KEY:-}
       REDIS_START_ID: ${REDIS_START_ID:-0-0}
@@ -376,8 +378,8 @@ services:
     mem_limit: 256m
     logging: *default-logging
     environment:
-      MODEL_BASE_URL: ${MODEL_BASE_URL:-http://81.70.177.246:9161/v1}
-      MODEL_NAME: ${MODEL_NAME:-qwen3.6}
+      MODEL_BASE_URL: ${MODEL_BASE_URL:-http://81.70.177.246:9151/v1}
+      MODEL_NAME: ${MODEL_NAME:-qwen3.6-27b}
       FASTEMBED_MODEL: ${FASTEMBED_MODEL:-sentence-transformers/all-MiniLM-L6-v2}
     healthcheck:
       test: ["CMD-SHELL", "python - <<'PY'\nimport urllib.request\nurllib.request.urlopen('http://127.0.0.1:8090/health', timeout=2).read()\nPY"]

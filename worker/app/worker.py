@@ -27,8 +27,8 @@ from app.worker_concurrency import DedupeLockRegistry, process_entries_with_lock
 DATABASE_URL = os.environ["DATABASE_URL"]
 REDIS_URL = os.environ["REDIS_URL"]
 MODEL_MODE = os.getenv("MODEL_MODE", "standard")
-MODEL_BASE_URL = os.getenv("MODEL_BASE_URL", "http://localhost:9161").rstrip("/")
-MODEL_NAME = os.getenv("MODEL_NAME", "qwen3.6")
+MODEL_BASE_URL = os.getenv("MODEL_BASE_URL", "http://81.70.177.246:9151/v1").rstrip("/")
+MODEL_NAME = os.getenv("MODEL_NAME", "qwen3.6-27b")
 MODEL_ROUTER_URL = os.getenv("MODEL_ROUTER_URL", "").rstrip("/")
 REDIS_START_ID = os.getenv("REDIS_START_ID", "$")
 REALTIME_CHANNEL = os.getenv("REALTIME_CHANNEL", "par:realtime")
@@ -71,7 +71,13 @@ SENSITIVE_KEY_RE = re.compile(r"(token|secret|cookie|session|password|passwd|aut
 INLINE_SECRET_RE = re.compile(r"\b(token|secret|sessionid|session|password|passwd|auth|code)=([^,\s&;]+)", re.I)
 OAUTH_FRAGMENT_RE = re.compile(r"([#&])(access_token|id_token|refresh_token|state|token|code)=([^&#]+)", re.I)
 BEARER_RE = re.compile(r"\bBearer\s+[A-Za-z0-9._~+/=-]+", re.I)
-VERIFICATION_CODE_RE = re.compile(r"((?:验证码|校验码|verification code|code)[^\dA-Za-z]{0,8})([A-Za-z0-9-]{4,12})", re.I)
+VERIFICATION_CODE_RE = re.compile(
+    r"("
+    r"(?:(?:验证码|校验码)[^\dA-Za-z]{0,8}|"
+    r"(?:verification\s+code|login\s+code|security\s+code|code)\b[^\dA-Za-z]{1,8})"
+    r")([A-Za-z0-9-]{4,12})",
+    re.I,
+)
 ORDER_ID_RE = re.compile(r"((?:订单号|订单|order(?: id)?)[^\dA-Za-z]{0,8})([A-Za-z0-9-]{5,24})", re.I)
 ID_CARD_RE = re.compile(r"((?:身份证号?|id card)[^\dA-Za-z]{0,8})(\d{17}[\dXx])", re.I)
 PASSPORT_RE = re.compile(r"((?:护照|passport)[^\dA-Za-z]{0,8})([A-Z]{1,2}\d{6,9})", re.I)
@@ -103,7 +109,7 @@ LOW_VALUE_PRIVATE_SIGNAL_RE = re.compile(
     r")",
     re.I,
 )
-TIME_OF_DAY_RE = re.compile(r"(?<![A-Za-z0-9_])(上午|下午|晚上|中午|早上)?\s*([0-2]?\d|[一二三四五六七八九十两]{1,3})\s*(?:点|[:：])\s*([0-5]?\d|半)?")
+TIME_OF_DAY_RE = re.compile(r"(?<![A-Za-z0-9_/-])(上午|下午|晚上|中午|早上)?\s*([0-2]?\d|[一二三四五六七八九十两]{1,3})\s*(?:点|[:：])\s*([0-5]?\d|半)?")
 EN_TIME_OF_DAY_RE = re.compile(r"\b([01]?\d|2[0-3])(?::([0-5]\d))?\s*(am|pm)\b", re.I)
 EXPLICIT_DATE_RE = re.compile(r"(20\d{2})[-年/](\d{1,2})[-月/](\d{1,2})日?")
 WEEKDAY_RE = re.compile(r"(下周)?(?:周|星期|礼拜)([一二三四五六日天])")
@@ -187,6 +193,13 @@ EVENT_IMPORTANCE_FLOORS = {
     "important_fact": 0.7,
     "user_instruction": 0.68,
 }
+
+
+def openai_compatible_chat_url(base_url: str) -> str:
+    clean = str(base_url or "").rstrip("/")
+    if clean.endswith("/v1"):
+        return f"{clean}/chat/completions"
+    return f"{clean}/v1/chat/completions"
 RULES_FIRST_EVENT_LABELS = {
     "appointment",
     "reschedule",
@@ -910,7 +923,11 @@ def call_model(messages: list[dict[str, str]]) -> str:
         "enable_thinking": False,
         "stream": False,
     }
-    response = httpx.post(f"{MODEL_BASE_URL}/v1/chat/completions", json=payload, timeout=worker_online_model_timeout_seconds())
+    response = httpx.post(
+        openai_compatible_chat_url(MODEL_BASE_URL),
+        json=payload,
+        timeout=worker_online_model_timeout_seconds(),
+    )
     response.raise_for_status()
     data = response.json()
     if "choices" in data:
