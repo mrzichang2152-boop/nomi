@@ -6,7 +6,15 @@
   "use strict";
 
   const DASHBOARD_URL = "https://dashboard.composio.dev";
+  const DASHBOARD_ORIGIN = new URL(DASHBOARD_URL).origin;
   const FALLBACK_MESSAGE = "请求失败，请稍后重试。";
+  const PUBLIC_MESSAGES = Object.freeze({
+    composio_api_key_insufficient_permissions: "Composio API Key 权限不足，无法创建账号授权会话。",
+    composio_api_key_invalid: "Composio API Key 无效或已失效。",
+    composio_connect_failed: "Composio 暂时无法创建授权链接，请稍后重试。",
+    composio_rate_limited: "Composio 服务请求频率受限，请稍后重试。",
+    composio_upstream_unavailable: "Composio 上游服务暂时不可用。",
+  });
 
   function isObjectRecord(value) {
     return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -16,8 +24,7 @@
     try {
       const candidate = new URL(value);
       if (
-        candidate.protocol !== "https:" ||
-        candidate.hostname !== "dashboard.composio.dev" ||
+        candidate.origin !== DASHBOARD_ORIGIN ||
         candidate.username ||
         candidate.password
       ) {
@@ -28,6 +35,21 @@
         : candidate.toString();
     } catch (_error) {
       return DASHBOARD_URL;
+    }
+  }
+
+  function publicMessageForCode(code) {
+    return Object.prototype.hasOwnProperty.call(PUBLIC_MESSAGES, code)
+      ? PUBLIC_MESSAGES[code]
+      : FALLBACK_MESSAGE;
+  }
+
+  function normalizedStatus(value) {
+    try {
+      const status = Number(value);
+      return Number.isInteger(status) && status >= 100 && status <= 599 ? status : 0;
+    } catch (_error) {
+      return 0;
     }
   }
 
@@ -42,33 +64,19 @@
     const source = isObjectRecord(payload && payload.detail)
       ? payload.detail
       : (isObjectRecord(payload) ? payload : {});
-    const message = typeof source.message === "string" && source.message
-      ? source.message
-      : FALLBACK_MESSAGE;
-    const error = new Error(message);
-    error.status = Number(status);
-    error.code = typeof source.code === "string" ? source.code : null;
+    const code = typeof source.code === "string" && source.code.trim()
+      ? source.code
+      : "request_failed";
+    const error = new Error(publicMessageForCode(code));
+    error.status = normalizedStatus(status);
+    error.code = code;
     error.settingsUrl = safeSettingsUrl(source.settings_url);
     error.requiredPermissions = Array.isArray(source.required_permissions)
       ? source.required_permissions.slice()
       : [];
-    error.retryable = source.retryable === true;
+    // Provider/automatic retry semantics; guidance keeps manual retry available.
+    error.retryable = source.retryable !== false;
     return error;
-  }
-
-  function safeErrorMessage(error, fallback) {
-    if (!error || typeof error.message !== "string") return fallback;
-    const normalized = error.message.trim();
-    if (
-      !normalized ||
-      normalized.startsWith("{") ||
-      normalized.startsWith("[") ||
-      normalized.includes("<") ||
-      normalized.includes(">")
-    ) {
-      return fallback;
-    }
-    return error.message;
   }
 
   function guidanceForError(error) {
@@ -84,7 +92,7 @@
     if (error && error.code === "composio_api_key_invalid") {
       return {
         title: "Composio API Key 无效",
-        message: safeErrorMessage(error, "Composio API Key 无效，请更新配置。"),
+        message: publicMessageForCode(error.code),
         settingsUrl: safeSettingsUrl(error.settingsUrl),
         showSettings: true,
         showRetry: true,
@@ -92,7 +100,7 @@
     }
     return {
       title: "Composio 连接失败",
-      message: safeErrorMessage(error, FALLBACK_MESSAGE),
+      message: publicMessageForCode(error && error.code),
       settingsUrl: safeSettingsUrl(error && error.settingsUrl),
       showSettings: false,
       showRetry: true,
