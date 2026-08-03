@@ -1520,6 +1520,35 @@ button.secondary:hover {
   flex-shrink: 0;
 }
 
+.composio-guidance {
+  width: 100%;
+  max-width: 100%;
+  padding: 12px;
+  border: 1px solid #fda29b;
+  border-radius: 8px;
+  background: #fff1f3;
+  color: #7a271a;
+  overflow-wrap: anywhere;
+}
+
+.composio-guidance p {
+  margin: 0;
+  color: #912018;
+}
+
+.composio-guidance-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.composio-guidance-actions button {
+  min-height: 40px;
+  max-width: 100%;
+  white-space: normal;
+}
+
 .tool-card p span,
 .pill-row span,
 .tool-note {

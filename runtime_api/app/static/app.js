@@ -811,7 +811,13 @@ async function api(path, options = {}) {
       ...(options.headers || {}),
     },
   });
-  if (!response.ok) throw new Error(await response.text());
+  if (!response.ok) {
+    const rawError = await response.text();
+    if (window.NomiComposioGuidance) {
+      throw window.NomiComposioGuidance.createApiError(response.status, rawError);
+    }
+    throw new Error("请求失败，请稍后重试。");
+  }
   return response.json();
 }
 
@@ -4203,6 +4209,41 @@ function renderComposioPanel(status, connections) {
   `;
   const grid = document.createElement("div");
   grid.className = "connection-grid";
+  const guidanceRegion = document.createElement("section");
+  guidanceRegion.className = "composio-guidance hidden";
+  guidanceRegion.setAttribute("aria-live", "polite");
+  guidanceRegion.setAttribute("role", "status");
+
+  function clearGuidance() {
+    guidanceRegion.replaceChildren();
+    guidanceRegion.classList.add("hidden");
+  }
+
+  function showGuidance(error, retry) {
+    const model = window.NomiComposioGuidance.guidanceForError(error);
+    const title = document.createElement("strong");
+    title.textContent = model.title;
+    const message = document.createElement("p");
+    message.textContent = model.message;
+    const actions = document.createElement("div");
+    actions.className = "composio-guidance-actions";
+    if (model.showSettings) {
+      const settingsButton = button("打开 Composio API Key 设置");
+      settingsButton.className = "secondary";
+      settingsButton.addEventListener("click", () => {
+        window.open(model.settingsUrl, "_blank", "noopener,noreferrer");
+      });
+      actions.appendChild(settingsButton);
+    }
+    if (model.showRetry) {
+      const retryButton = button("重试");
+      retryButton.addEventListener("click", retry);
+      actions.appendChild(retryButton);
+    }
+    guidanceRegion.replaceChildren(title, message, actions);
+    guidanceRegion.classList.remove("hidden");
+  }
+
   for (const slug of primaryToolkits) {
     const connection = connectedBySlug.get(slug);
     const row = document.createElement("div");
@@ -4211,26 +4252,30 @@ function renderComposioPanel(status, connections) {
     label.innerHTML = `<strong>${connection?.name || slug}</strong><span>${connection?.connected ? "已连接" : "未连接"}</span>`;
     const connect = button(connection?.connected ? "重新连接" : "连接");
     connect.disabled = !status.configured;
-    connect.addEventListener("click", async () => {
+    const attemptConnect = async () => {
+      clearGuidance();
       connect.disabled = true;
       connect.textContent = "生成链接...";
       try {
         const result = await api(`/api/integrations/composio/connect/${encodeURIComponent(slug)}`, { method: "POST" });
-        connect.textContent = "打开授权";
-        if (result.redirect_url) window.open(result.redirect_url, "_blank", "noopener,noreferrer");
-      } catch {
-        connect.textContent = "生成失败";
+        if (result.redirect_url) {
+          window.open(result.redirect_url, "_blank", "noopener,noreferrer");
+          return;
+        }
+        if (result.status === "already_connected") return;
+        throw new Error("授权服务未返回链接，请重试。");
+      } catch (error) {
+        showGuidance(error, attemptConnect);
       } finally {
-        setTimeout(() => {
-          connect.disabled = !status.configured;
-          if (connect.textContent !== "生成失败") connect.textContent = connection?.connected ? "重新连接" : "连接";
-        }, 1800);
+        connect.disabled = !status.configured;
+        connect.textContent = connection?.connected ? "重新连接" : "连接";
       }
-    });
+    };
+    connect.addEventListener("click", attemptConnect);
     row.append(label, connect);
     grid.appendChild(row);
   }
-  node.appendChild(grid);
+  node.append(grid, guidanceRegion);
   if (status.error || connections.error) {
     const note = document.createElement("p");
     note.className = "muted";

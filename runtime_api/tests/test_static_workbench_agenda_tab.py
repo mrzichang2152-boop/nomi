@@ -252,7 +252,7 @@ def test_workbench_versions_core_stylesheet_to_avoid_stale_layout():
     html = read_static("index.html")
 
     assert 'href="/static/styles.css?v=20260724-settings-back-navigation"' in html
-    assert 'src="/static/app.js?v=20260724-settings-back-navigation"' in html
+    assert 'src="/static/app.js?v=20260803-composio-permission-guidance"' in html
 
 
 def test_settings_detail_exposes_accessible_back_button():
