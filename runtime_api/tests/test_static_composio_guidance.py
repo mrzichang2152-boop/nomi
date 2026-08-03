@@ -17,11 +17,13 @@ def function_source(source: str, name: str, next_name: str) -> str:
 def test_composio_guidance_loads_after_shared_helpers_and_before_versioned_app():
     html = read("index.html")
 
+    styles = 'href="/static/styles.css?v=20260803-composio-permission-guidance"'
     chat = 'src="/static/chat-attachments.js"'
     viewer = 'src="/static/file-viewer-links.js"'
     guidance = 'src="/static/composio-guidance.js?v=20260803-permission-guidance"'
     app = 'src="/static/app.js?v=20260803-composio-permission-guidance"'
 
+    assert styles in html
     assert guidance in html
     assert app in html
     assert html.index(chat) < html.index(guidance)

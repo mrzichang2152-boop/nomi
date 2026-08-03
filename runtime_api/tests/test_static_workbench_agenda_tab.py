@@ -251,7 +251,7 @@ def test_desktop_sidebar_keeps_navigation_compact_and_top_aligned():
 def test_workbench_versions_core_stylesheet_to_avoid_stale_layout():
     html = read_static("index.html")
 
-    assert 'href="/static/styles.css?v=20260724-settings-back-navigation"' in html
+    assert 'href="/static/styles.css?v=20260803-composio-permission-guidance"' in html
     assert 'src="/static/app.js?v=20260803-composio-permission-guidance"' in html
 
 
