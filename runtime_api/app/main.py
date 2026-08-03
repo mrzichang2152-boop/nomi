@@ -72,6 +72,7 @@ from app.assistant_identity.tool_gateway import (
     AssistantScopedToolExecutor,
     AssistantToolGateway,
 )
+from app.composio_provider_errors import classify_composio_provider_error
 from app.attachments.router import create_attachment_router
 from app.attachments.repository import (
     delete_conversation_with_attachment_cleanup,
@@ -7424,11 +7425,14 @@ def create_composio_connect_link(toolkit_slug: str, requested_kind: str = "", fo
             },
         )
     if live_result.get("status") == "failed":
+        raise_classified_composio_error(live_result)
         raise HTTPException(
             status_code=502,
             detail={
                 "code": "composio_connect_failed",
-                "message": live_result.get("summary") or "Composio connect link creation failed.",
+                "message": "Composio 暂时无法创建授权链接，请稍后重试。",
+                "provider": "composio",
+                "retryable": True,
             },
         )
     fields = dict(authorized.get("fields") or {})
@@ -11401,6 +11405,15 @@ def composio_integration_status(x_par_password: Optional[str] = Header(default=N
     return payload
 
 
+def raise_classified_composio_error(error: object) -> None:
+    classified = classify_composio_provider_error(error)
+    if classified is not None:
+        raise HTTPException(
+            status_code=classified["status_code"],
+            detail=classified["detail"],
+        )
+
+
 @app.post("/api/integrations/composio/connect/{toolkit_slug}")
 def composio_connect_toolkit(
     toolkit_slug: str,
@@ -11409,7 +11422,13 @@ def composio_connect_toolkit(
     x_par_password: Optional[str] = Header(default=None),
 ) -> dict[str, Any]:
     require_password(x_par_password)
-    return create_composio_connect_link(toolkit_slug, requested_kind=session_kind, force=force)
+    try:
+        return create_composio_connect_link(toolkit_slug, requested_kind=session_kind, force=force)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise_classified_composio_error(exc)
+        raise
 
 
 @app.get("/api/integrations/composio/callback", response_class=HTMLResponse)

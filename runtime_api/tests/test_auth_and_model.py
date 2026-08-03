@@ -3068,6 +3068,190 @@ def test_composio_connect_requires_api_key_without_calling_sdk(monkeypatch):
     assert response.json()["detail"]["code"] == "composio_api_key_missing"
 
 
+def test_composio_connect_maps_provider_permission_error_without_leaking_secrets(monkeypatch):
+    monkeypatch.setenv("APP_PASSWORD", "secret")
+    from fastapi.testclient import TestClient
+    from app import main
+
+    api_key = "ak_test_route_secret"
+    authorization_header = "Bearer route-header-secret"
+    request_id = "req-route-secret-123"
+    raw_provider_message = (
+        "This route requires sessions write access for " + api_key
+    )
+
+    class FakeResponse:
+        status_code = 403
+        headers = {
+            "x-api-key": api_key,
+            "authorization": authorization_header,
+        }
+
+        def json(self):
+            return {
+                "error": {
+                    "slug": "APIKey_InsufficientPermissions",
+                    "message": raw_provider_message,
+                    "request_id": request_id,
+                }
+            }
+
+    class FakePermissionDeniedError(Exception):
+        status_code = 403
+        body = {
+            "error": {
+                "slug": "APIKey_InsufficientPermissions",
+                "message": raw_provider_message,
+                "request_id": request_id,
+            }
+        }
+        response = FakeResponse()
+        headers = {"x-api-key": api_key}
+
+    def fail_connect(*args, **kwargs):
+        raise FakePermissionDeniedError(raw_provider_message)
+
+    monkeypatch.setattr(main, "create_composio_connect_link", fail_connect)
+
+    response = TestClient(main.app, raise_server_exceptions=False).post(
+        "/api/integrations/composio/connect/gmail",
+        headers={"x-par-password": "secret"},
+    )
+
+    assert response.status_code == 403
+    assert response.json()["detail"] == {
+        "code": "composio_api_key_insufficient_permissions",
+        "message": "Composio API Key 权限不足，无法创建账号授权会话。",
+        "provider": "composio",
+        "required_permissions": [
+            {"area": "sessions", "access": "read_and_write"}
+        ],
+        "settings_url": "https://dashboard.composio.dev",
+        "retryable": False,
+    }
+    rendered_response = response.text
+    assert "provider_request_id" not in rendered_response
+    for secret_value in (
+        api_key,
+        authorization_header,
+        request_id,
+        raw_provider_message,
+    ):
+        assert secret_value not in rendered_response
+
+
+def test_composio_connect_maps_permission_error_swallowed_by_live_executor(monkeypatch):
+    monkeypatch.setenv("APP_PASSWORD", "secret")
+    from fastapi.testclient import TestClient
+    from app import main
+    from app.long_tail_agent import LongTailEventStore
+
+    api_key = "ak_test_live_secret"
+    request_id = "req-live-secret-456"
+    raw_provider_message = (
+        "Error code: 403 - APIKey_InsufficientPermissions; "
+        f"this route requires sessions write access; api_key={api_key}; "
+        f"request_id={request_id}"
+    )
+    event_store = LongTailEventStore()
+
+    class PermissionDeniedError(Exception):
+        pass
+
+    class FakeSession:
+        def authorize(self, toolkit_slug, callback_url=None):
+            raise PermissionDeniedError(raw_provider_message)
+
+    monkeypatch.setattr(
+        main,
+        "get_or_create_composio_session",
+        lambda user_id, session_kind: (
+            FakeSession(),
+            {"session_kind": session_kind},
+        ),
+    )
+    monkeypatch.setattr(main, "long_tail_event_store", lambda: event_store)
+
+    response = TestClient(main.app).post(
+        "/api/integrations/composio/connect/gmail",
+        headers={"x-par-password": "secret"},
+    )
+
+    assert response.status_code == 403
+    assert response.json()["detail"] == {
+        "code": "composio_api_key_insufficient_permissions",
+        "message": "Composio API Key 权限不足，无法创建账号授权会话。",
+        "provider": "composio",
+        "required_permissions": [
+            {"area": "sessions", "access": "read_and_write"}
+        ],
+        "settings_url": "https://dashboard.composio.dev",
+        "retryable": False,
+    }
+    rendered_response = response.text
+    assert "provider_request_id" not in rendered_response
+    for secret_value in (api_key, request_id, raw_provider_message):
+        assert secret_value not in rendered_response
+
+
+def test_composio_connect_sanitizes_unrecognized_live_authorize_failure(monkeypatch):
+    monkeypatch.setenv("APP_PASSWORD", "secret")
+    from fastapi.testclient import TestClient
+    from app import main
+    from app.long_tail_agent import LongTailEventStore
+
+    raw_exception_text = "authorize database invariant failed near live-secret"
+    event_store = LongTailEventStore()
+
+    class FakeSession:
+        def authorize(self, toolkit_slug, callback_url=None):
+            raise RuntimeError(raw_exception_text)
+
+    monkeypatch.setattr(
+        main,
+        "get_or_create_composio_session",
+        lambda user_id, session_kind: (
+            FakeSession(),
+            {"session_kind": session_kind},
+        ),
+    )
+    monkeypatch.setattr(main, "long_tail_event_store", lambda: event_store)
+
+    response = TestClient(main.app).post(
+        "/api/integrations/composio/connect/gmail",
+        headers={"x-par-password": "secret"},
+    )
+
+    assert response.status_code == 502
+    assert response.json()["detail"] == {
+        "code": "composio_connect_failed",
+        "message": "Composio 暂时无法创建授权链接，请稍后重试。",
+        "provider": "composio",
+        "retryable": True,
+    }
+    assert raw_exception_text not in response.text
+
+
+def test_composio_connect_preserves_unknown_internal_failure_as_500(monkeypatch):
+    monkeypatch.setenv("APP_PASSWORD", "secret")
+    from fastapi.testclient import TestClient
+    from app import main
+
+    def fail_connect(*args, **kwargs):
+        raise RuntimeError("database invariant failed")
+
+    monkeypatch.setattr(main, "create_composio_connect_link", fail_connect)
+
+    response = TestClient(main.app, raise_server_exceptions=False).post(
+        "/api/integrations/composio/connect/gmail",
+        headers={"x-par-password": "secret"},
+    )
+
+    assert response.status_code == 500
+    assert "composio_api_key_insufficient_permissions" not in response.text
+    assert "required_permissions" not in response.text
+
+
 def test_composio_connect_creates_manual_authorization_link_and_persists_without_exposing_headers(monkeypatch):
     monkeypatch.setenv("APP_PASSWORD", "secret")
     monkeypatch.setenv("COMPOSIO_API_KEY", "test-key")
