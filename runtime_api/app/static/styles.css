@@ -1514,6 +1514,12 @@ button.secondary:hover {
   font-size: 12px;
 }
 
+.connection-row span:focus {
+  outline: 3px solid rgba(15, 118, 110, 0.24);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
 .connection-row button {
   min-width: 104px;
   white-space: nowrap;
@@ -1547,6 +1553,36 @@ button.secondary:hover {
   min-height: 40px;
   max-width: 100%;
   white-space: normal;
+}
+
+.composio-guidance-manual-link {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 40px;
+  max-width: 100%;
+  padding: 9px 12px;
+  border-radius: 8px;
+  background: #e8edf3;
+  color: #172033;
+  text-decoration: none;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
+.composio-guidance:focus {
+  outline: 3px solid rgba(180, 35, 24, 0.2);
+  outline-offset: 2px;
+}
+
+.composio-guidance.success {
+  border-color: #6ce9a6;
+  background: #ecfdf3;
+  color: #05603a;
+}
+
+.composio-guidance.success p {
+  color: #05603a;
 }
 
 .tool-card p span,

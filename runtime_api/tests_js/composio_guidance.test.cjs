@@ -61,6 +61,36 @@ test("safeSettingsUrl rejects insecure and deceptive URLs", () => {
   }
 });
 
+test("safeConnectUrl accepts only the exact Composio Connect HTTPS origin", () => {
+  assert.equal(
+    guidance.safeConnectUrl("https://connect.composio.dev/link/ln_123?source=nomi#authorize"),
+    "https://connect.composio.dev/link/ln_123?source=nomi#authorize"
+  );
+  assert.equal(
+    guidance.safeConnectUrl("https://connect.composio.dev:443/link/ln_123"),
+    "https://connect.composio.dev/link/ln_123"
+  );
+});
+
+test("safeConnectUrl rejects insecure, deceptive, and non-Connect URLs without fallback", () => {
+  const unsafeValues = [
+    "http://connect.composio.dev/link/ln_123",
+    "https://attacker.example@connect.composio.dev/link/ln_123",
+    "https://connect.composio.dev@attacker.example/link/ln_123",
+    "https://sub.connect.composio.dev/link/ln_123",
+    "https://connect.composio.dev.attacker.example/link/ln_123",
+    "https://connect.composio.dev:444/link/ln_123",
+    "https://dashboard.composio.dev/link/ln_123",
+    "javascript:alert(1)",
+    "not a URL",
+    "",
+  ];
+
+  for (const value of unsafeValues) {
+    assert.equal(guidance.safeConnectUrl(value), "", value);
+  }
+});
+
 test("createApiError parses a structured permission failure into a real Error", () => {
   const error = guidance.createApiError("403", JSON.stringify({
     detail: {

@@ -31,17 +31,18 @@ def test_composio_guidance_loads_after_shared_helpers_and_before_versioned_app()
     assert html.index(guidance) < html.index(app)
 
 
-def test_global_api_uses_safe_structured_errors_without_echoing_raw_responses():
+def test_global_api_only_uses_structured_errors_for_composio_integration_paths():
     app = read("app.js")
     api = function_source(app, "api", "applyWorkbenchRoute")
 
     assert "const rawError = await response.text();" in api
-    assert "window.NomiComposioGuidance" in api
+    assert 'path.startsWith("/api/integrations/composio/")' in api
+    assert 'typeof window.NomiComposioGuidance?.createApiError === "function"' in api
     assert "createApiError(response.status, rawError)" in api
-    assert 'throw new Error("请求失败，请稍后重试。");' in api
+    assert "throw new Error(rawError);" in api
     assert "return response.json();" in api
     assert "throw new Error(await response.text())" not in api
-    assert "throw new Error(rawError)" not in api
+    assert 'throw new Error("请求失败，请稍后重试。");' not in api
 
 
 def test_composio_panel_renders_one_accessible_shared_guidance_region():
@@ -56,6 +57,8 @@ def test_composio_panel_renders_one_accessible_shared_guidance_region():
     assert 'guidanceRegion.classList.add("hidden");' in panel
     assert "function showGuidance(error, retry)" in panel
     assert "NomiComposioGuidance.guidanceForError(error)" in panel
+    assert "guidanceRegion.tabIndex = -1;" in panel
+    assert "guidanceRegion.focus();" in panel
 
     guidance = panel[panel.index("function showGuidance"):panel.index("for (const slug", panel.index("function showGuidance"))]
     assert "title.textContent = model.title;" in guidance
@@ -78,20 +81,68 @@ def test_composio_guidance_actions_open_safe_settings_externally_and_retry():
     assert "location.assign" not in panel
 
 
-def test_each_composio_connection_attempt_clears_guidance_and_can_retry():
+def test_composio_connection_attempts_are_serialized_across_all_toolkits():
     app = read("app.js")
     panel = function_source(app, "renderComposioPanel", "renderToolCard")
 
+    assert "const connectButtons = [];" in panel
+    assert "let connectBusy = false;" in panel
+    assert "let connectRequestSequence = 0;" in panel
+    assert "function setConnectButtonsDisabled(disabled)" in panel
+    assert "for (const buttonNode of connectButtons)" in panel
+    assert "connectButtons.push(connect);" in panel
     assert "const attemptConnect = async () => {" in panel
+    assert "if (connectBusy) return;" in panel
+    assert "connectBusy = true;" in panel
+    assert "const requestId = ++connectRequestSequence;" in panel
     assert "clearGuidance();" in panel
+    assert "const guidanceHadFocus = guidanceRegion.contains(document.activeElement);" in panel
+    assert "if (guidanceHadFocus) connectionStatus.focus();" in panel
+    assert "setConnectButtonsDisabled(true);" in panel
     assert 'connect.textContent = "生成链接...";' in panel
-    assert 'window.open(result.redirect_url, "_blank", "noopener,noreferrer")' in panel
-    assert 'result.status === "already_connected"' in panel
-    assert 'throw new Error("授权服务未返回链接，请重试。");' in panel
+    assert "if (requestId !== connectRequestSequence) return;" in panel
+    assert "connectBusy = false;" in panel
+    assert "setConnectButtonsDisabled(false);" in panel
     assert "showGuidance(error, attemptConnect);" in panel
-    assert 'connect.textContent = connection?.connected ? "重新连接" : "连接";' in panel
     assert 'connect.addEventListener("click", attemptConnect);' in panel
     assert "生成失败" not in panel
+
+
+def test_composio_connect_urls_use_android_bridge_or_popup_with_manual_fallback():
+    app = read("app.js")
+    panel = function_source(app, "renderComposioPanel", "renderToolCard")
+
+    assert "NomiComposioGuidance.safeConnectUrl(result.redirect_url)" in panel
+    assert 'throw new Error("授权服务返回了无效链接，请重试。");' in panel
+    assert 'typeof window.NomiAndroid.openExternalUrl === "function"' in panel
+    assert "window.NomiAndroid.openExternalUrl(safeUrl);" in panel
+    assert 'const opened = window.open(safeUrl, "_blank", "noopener,noreferrer");' in panel
+    assert "if (opened === null)" in panel
+    assert 'document.createElement("a")' in panel
+    assert "manualLink.href = safeUrl;" in panel
+    assert 'manualLink.target = "_blank";' in panel
+    assert 'manualLink.rel = "noopener noreferrer";' in panel
+    assert 'manualLink.textContent = "打开授权";' in panel
+    assert "window.open(result.redirect_url" not in panel
+    assert 'window.open("about:blank"' not in panel
+
+
+def test_composio_connection_rows_are_safe_and_track_real_connection_state():
+    app = read("app.js")
+    panel = function_source(app, "renderComposioPanel", "renderToolCard")
+
+    assert "label.innerHTML" not in panel
+    assert "labelName.textContent = connection?.name || slug;" in panel
+    assert 'connectionStatus.textContent = isConnected ? "已连接" : "未连接";' in panel
+    assert "connectionStatus.tabIndex = -1;" in panel
+    assert "let isConnected = connection?.connected === true;" in panel
+    assert 'isConnected ? "?force=true" : ""' in panel
+    assert 'result.status === "already_connected"' in panel
+    assert "isConnected = true;" in panel
+    assert 'connectionStatus.textContent = "已连接";' in panel
+    assert "showAlreadyConnectedGuidance();" in panel
+    assert 'throw new Error("授权服务未返回链接，请重试。");' in panel
+    assert 'connect.textContent = isConnected ? "重新连接" : "连接";' in panel
 
 
 def test_composio_guidance_card_is_readable_accessible_and_mobile_safe():
@@ -109,4 +160,9 @@ def test_composio_guidance_card_is_readable_accessible_and_mobile_safe():
     buttons = css[css.index(".composio-guidance-actions button {") :]
     assert "min-height: 40px;" in buttons
     assert "max-width: 100%;" in buttons
+    assert ".composio-guidance-manual-link" in css
+    assert ".connection-row span:focus" in css
+    assert ".composio-guidance.success" in css
+    assert "background: #ecfdf3;" in css
+    assert "text-decoration: none;" in css
     assert "overflow-wrap: anywhere;" in css

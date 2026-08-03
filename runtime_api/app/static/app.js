@@ -813,10 +813,13 @@ async function api(path, options = {}) {
   });
   if (!response.ok) {
     const rawError = await response.text();
-    if (window.NomiComposioGuidance) {
+    if (
+      path.startsWith("/api/integrations/composio/") &&
+      typeof window.NomiComposioGuidance?.createApiError === "function"
+    ) {
       throw window.NomiComposioGuidance.createApiError(response.status, rawError);
     }
-    throw new Error("请求失败，请稍后重试。");
+    throw new Error(rawError);
   }
   return response.json();
 }
@@ -4213,10 +4216,15 @@ function renderComposioPanel(status, connections) {
   guidanceRegion.className = "composio-guidance hidden";
   guidanceRegion.setAttribute("aria-live", "polite");
   guidanceRegion.setAttribute("role", "status");
+  guidanceRegion.tabIndex = -1;
+  const connectButtons = [];
+  let connectBusy = false;
+  let connectRequestSequence = 0;
 
   function clearGuidance() {
     guidanceRegion.replaceChildren();
     guidanceRegion.classList.add("hidden");
+    guidanceRegion.classList.remove("success");
   }
 
   function showGuidance(error, retry) {
@@ -4241,34 +4249,109 @@ function renderComposioPanel(status, connections) {
       actions.appendChild(retryButton);
     }
     guidanceRegion.replaceChildren(title, message, actions);
+    guidanceRegion.classList.remove("success");
     guidanceRegion.classList.remove("hidden");
+    guidanceRegion.focus();
+  }
+
+  function showManualConnectLink(safeUrl) {
+    const title = document.createElement("strong");
+    title.textContent = "授权窗口未打开";
+    const message = document.createElement("p");
+    message.textContent = "浏览器阻止了弹窗，请使用下方链接继续授权。";
+    const actions = document.createElement("div");
+    actions.className = "composio-guidance-actions";
+    const manualLink = document.createElement("a");
+    manualLink.className = "composio-guidance-manual-link";
+    manualLink.href = safeUrl;
+    manualLink.target = "_blank";
+    manualLink.rel = "noopener noreferrer";
+    manualLink.textContent = "打开授权";
+    actions.appendChild(manualLink);
+    guidanceRegion.replaceChildren(title, message, actions);
+    guidanceRegion.classList.remove("success");
+    guidanceRegion.classList.remove("hidden");
+    guidanceRegion.focus();
+  }
+
+  function showAlreadyConnectedGuidance() {
+    const title = document.createElement("strong");
+    title.textContent = "账号已连接";
+    const message = document.createElement("p");
+    message.textContent = "Composio 已确认该账号连接有效。";
+    guidanceRegion.replaceChildren(title, message);
+    guidanceRegion.classList.add("success");
+    guidanceRegion.classList.remove("hidden");
+    guidanceRegion.focus();
+  }
+
+  function openComposioConnectUrl(safeUrl) {
+    if (
+      window.NomiAndroid &&
+      typeof window.NomiAndroid.openExternalUrl === "function"
+    ) {
+      window.NomiAndroid.openExternalUrl(safeUrl);
+      return;
+    }
+    const opened = window.open(safeUrl, "_blank", "noopener,noreferrer");
+    if (opened === null) showManualConnectLink(safeUrl);
+  }
+
+  function setConnectButtonsDisabled(disabled) {
+    for (const buttonNode of connectButtons) {
+      buttonNode.disabled = disabled || !status.configured;
+    }
   }
 
   for (const slug of primaryToolkits) {
     const connection = connectedBySlug.get(slug);
+    let isConnected = connection?.connected === true;
     const row = document.createElement("div");
     row.className = "connection-row";
     const label = document.createElement("div");
-    label.innerHTML = `<strong>${connection?.name || slug}</strong><span>${connection?.connected ? "已连接" : "未连接"}</span>`;
-    const connect = button(connection?.connected ? "重新连接" : "连接");
+    const labelName = document.createElement("strong");
+    labelName.textContent = connection?.name || slug;
+    const connectionStatus = document.createElement("span");
+    connectionStatus.textContent = isConnected ? "已连接" : "未连接";
+    connectionStatus.tabIndex = -1;
+    label.append(labelName, connectionStatus);
+    const connect = button(isConnected ? "重新连接" : "连接");
     connect.disabled = !status.configured;
+    connectButtons.push(connect);
     const attemptConnect = async () => {
+      if (connectBusy) return;
+      connectBusy = true;
+      const requestId = ++connectRequestSequence;
+      const guidanceHadFocus = guidanceRegion.contains(document.activeElement);
       clearGuidance();
-      connect.disabled = true;
+      if (guidanceHadFocus) connectionStatus.focus();
+      setConnectButtonsDisabled(true);
       connect.textContent = "生成链接...";
       try {
-        const result = await api(`/api/integrations/composio/connect/${encodeURIComponent(slug)}`, { method: "POST" });
+        const forceQuery = isConnected ? "?force=true" : "";
+        const result = await api(`/api/integrations/composio/connect/${encodeURIComponent(slug)}${forceQuery}`, { method: "POST" });
+        if (requestId !== connectRequestSequence) return;
         if (result.redirect_url) {
-          window.open(result.redirect_url, "_blank", "noopener,noreferrer");
+          const safeUrl = window.NomiComposioGuidance.safeConnectUrl(result.redirect_url);
+          if (!safeUrl) throw new Error("授权服务返回了无效链接，请重试。");
+          openComposioConnectUrl(safeUrl);
           return;
         }
-        if (result.status === "already_connected") return;
+        if (result.status === "already_connected") {
+          isConnected = true;
+          connectionStatus.textContent = "已连接";
+          showAlreadyConnectedGuidance();
+          return;
+        }
         throw new Error("授权服务未返回链接，请重试。");
       } catch (error) {
+        if (requestId !== connectRequestSequence) return;
         showGuidance(error, attemptConnect);
       } finally {
-        connect.disabled = !status.configured;
-        connect.textContent = connection?.connected ? "重新连接" : "连接";
+        if (requestId !== connectRequestSequence) return;
+        connectBusy = false;
+        connect.textContent = isConnected ? "重新连接" : "连接";
+        setConnectButtonsDisabled(false);
       }
     };
     connect.addEventListener("click", attemptConnect);

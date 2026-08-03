@@ -7,6 +7,7 @@
 
   const DASHBOARD_URL = "https://dashboard.composio.dev";
   const DASHBOARD_ORIGIN = new URL(DASHBOARD_URL).origin;
+  const CONNECT_ORIGIN = new URL("https://connect.composio.dev").origin;
   const FALLBACK_MESSAGE = "请求失败，请稍后重试。";
   const PUBLIC_MESSAGES = Object.freeze({
     composio_api_key_insufficient_permissions: "Composio API Key 权限不足，无法创建账号授权会话。",
@@ -35,6 +36,22 @@
         : candidate.toString();
     } catch (_error) {
       return DASHBOARD_URL;
+    }
+  }
+
+  function safeConnectUrl(value) {
+    try {
+      const candidate = new URL(value);
+      if (
+        candidate.origin !== CONNECT_ORIGIN ||
+        candidate.username ||
+        candidate.password
+      ) {
+        return "";
+      }
+      return candidate.toString();
+    } catch (_error) {
+      return "";
     }
   }
 
@@ -111,6 +128,7 @@
     DASHBOARD_URL,
     createApiError,
     guidanceForError,
+    safeConnectUrl,
     safeSettingsUrl,
   };
 });
